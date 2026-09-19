@@ -38,7 +38,7 @@ pub mod frame;
 pub mod types;
 
 pub use codec::{DecodeError, Reader, Writer};
-pub use frame::{Frame, FrameHeader, FRAME_HEADER_LEN};
+pub use frame::{encode_frame, Frame, FrameHeader, FRAME_HEADER_LEN};
 pub use types::*;
 
 /// A fixed-layout message that can cross the wire.

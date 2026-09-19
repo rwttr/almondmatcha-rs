@@ -41,14 +41,15 @@
 //! is healthy.
 use defmt::warn;
 use embassy_futures::select::{select, Either};
+use embassy_stm32::peripherals::IWDG;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
-use portable_atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use rover_msgs::ChassisCommand;
 
-use crate::config::{CMD_EPSILON, CMD_TIMEOUT_MS, IWDG_TIMEOUT_US, RAMP_STEPS, RAMP_TIME_MS};
+use crate::config::{CMD_EPSILON, CMD_TIMEOUT_MS, RAMP_STEPS, RAMP_TIME_MS};
 use crate::motor::Motors;
 
 /// The one mailbox from the UDP receive task to the control task. A
@@ -80,9 +81,16 @@ impl SharedStatus {
 pub static STATUS: SharedStatus = SharedStatus::new();
 
 /// Runs forever. Owns the motors, the command mailbox, and the IWDG.
-pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog) -> ! {
+pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'static, IWDG>) -> ! {
     let cmd_timeout = Duration::from_millis(CMD_TIMEOUT_MS);
     let mut tripped = false;
+    // Last throttle actually applied to the drivetrain, signed. The ramp
+    // needs this to decelerate *through* zero along the direction the
+    // vehicle was already moving, not to snap the H-bridge direction pins
+    // to "forward" the instant the ramp starts (which is what a ramp that
+    // only ever counted down from a positive magnitude would do to a
+    // vehicle that was last commanded to reverse).
+    let mut last_throttle: f32 = 0.0;
 
     iwdg.unleash();
 
@@ -91,6 +99,7 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog) -> 
             Either::First(cmd) => {
                 if !tripped {
                     motors.apply(cmd.steer, cmd.throttle);
+                    last_throttle = cmd.throttle;
                     STATUS.seq_echo.store(cmd.seq, Ordering::Relaxed);
                 } else if cmd.throttle.abs() < CMD_EPSILON {
                     // Explicit zero-throttle command: re-arm. Note this
@@ -112,10 +121,12 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog) -> 
                 tripped = true;
                 // Centre first (see module doc comment for why this order
                 // differs from the plan's sketch), then ramp throttle down
-                // over RAMP_TIME so the drivetrain decelerates smoothly
-                // rather than stepping to zero.
+                // over RAMP_TIME so the drivetrain decelerates smoothly,
+                // along whichever direction it was already moving, rather
+                // than stepping to zero.
                 motors.set_steering(0.0);
-                ramp_throttle_to_zero(&mut motors, &mut iwdg).await;
+                ramp_throttle_to_zero(&mut motors, &mut iwdg, last_throttle).await;
+                last_throttle = 0.0;
             }
         }
 
@@ -125,36 +136,18 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog) -> 
     }
 }
 
-/// Linearly ramp throttle from whatever the drivetrain was last commanded to
-/// zero, over `RAMP_TIME_MS`, in `RAMP_STEPS` steps. Petting the IWDG partway
-/// through matters here: on a real trip this coroutine itself runs for the
-/// entire 300 ms ramp without yielding to the outer `select`, and 300 ms is
-/// more than half the 500 ms IWDG window.
-async fn ramp_throttle_to_zero(motors: &mut Motors<'static>, iwdg: &mut IndependentWatchdog) {
-    // We do not track "current" throttle anywhere outside the PWM hardware
-    // itself, so the ramp targets a fixed schedule from full authority down
-    // to zero rather than interpolating from the exact last value. This is
-    // at least as safe as interpolating from the last known throttle - it
-    // can only decelerate faster than a from-value ramp would, never slower
-    // - and it needs no extra shared state to reconstruct "what was the
-    // drivetrain doing" from inside a safety path.
+/// Linearly ramp throttle from `from` (whatever the drivetrain was last
+/// commanded, signed) to zero, over `RAMP_TIME_MS`, in `RAMP_STEPS` steps.
+/// Petting the IWDG partway through matters here: on a real trip this
+/// coroutine runs for the entire 300 ms ramp without yielding to the outer
+/// `select`, and 300 ms is more than half the 500 ms IWDG window.
+async fn ramp_throttle_to_zero(motors: &mut Motors<'static>, iwdg: &mut IndependentWatchdog<'static, IWDG>, from: f32) {
     let step_delay = Duration::from_millis(RAMP_TIME_MS / RAMP_STEPS as u64);
     for step in 0..RAMP_STEPS {
         let remaining = 1.0 - (step as f32 / RAMP_STEPS as f32);
-        motors.set_drive(remaining * signed_hint());
+        motors.set_drive(from * remaining);
         iwdg.pet();
         Timer::after(step_delay).await;
     }
     motors.set_drive(0.0);
-}
-
-/// The ramp above decelerates a *magnitude*; forward/backward direction is
-/// preserved by `Motors::set_drive`'s own sign handling as the magnitude
-/// shrinks towards zero, so the "direction" of the ramp does not actually
-/// matter once the last applied direction pins are already latched in
-/// hardware - only the shrinking duty cycle does the work. Returning `1.0`
-/// keeps the ramp monotonically decreasing without needing to remember which
-/// way the drivetrain was pointed.
-fn signed_hint() -> f32 {
-    1.0
 }

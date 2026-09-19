@@ -43,7 +43,7 @@ pub type Device = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 /// board sends or receives is one datagram stream on one bound port
 /// (`config::SELF_PORT`); `[routes]` in `config/rover.toml` is unicast
 /// fan-out from the RPi's side, not multiple sockets on ours.
-const SOCKET_COUNT: usize = 2;
+const SOCKET_COUNT: usize = 3;
 
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {
@@ -109,7 +109,7 @@ pub fn init(
     static RESOURCES: StaticCell<StackResources<SOCKET_COUNT>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(device, net_config, RESOURCES.init(StackResources::new()), seed);
 
-    unwrap!(spawner.spawn(net_task(runner)));
+    spawner.spawn(unwrap!(net_task(runner)));
     stack
 }
 
@@ -121,11 +121,14 @@ pub async fn wait_up(stack: Stack<'static>) {
     info!("net: link up, ip={}", SELF_IP.octets());
 }
 
+/// The one socket bound to `config::SELF_PORT` — inbound commands.
+/// Transmit-only tasks use [`tx_socket!`] instead.
+///
 /// Allocate one UDP socket bound to `config::SELF_PORT`, backed by
 /// `'static` buffers (required because embassy-net sockets borrow their
 /// packet buffers for their whole lifetime, and this socket lives for the
 /// life of the program).
-pub fn make_socket(stack: Stack<'static>) -> UdpSocket<'static> {
+pub fn make_rx_socket(stack: Stack<'static>) -> UdpSocket<'static> {
     const BUF_LEN: usize = 512;
     const META_LEN: usize = 8;
 
@@ -143,6 +146,48 @@ pub fn make_socket(stack: Stack<'static>) -> UdpSocket<'static> {
     );
     unwrap!(socket.bind(crate::config::SELF_PORT));
     socket
+}
+
+/// Allocate a transmit-only UDP socket, bound to an ephemeral port.
+///
+/// A macro rather than a function because each socket needs its own
+/// `StaticCell` buffers: a function would hold exactly one set of statics
+/// and panic on `StaticCell::init` the second time it was called — at boot,
+/// on hardware, with no obvious cause. Expanding at the call site gives
+/// every caller its own storage, so adding a transmit task is a one-line
+/// change that cannot collide with an existing one.
+///
+/// `embassy_net::UdpSocket` is not `Sync`, so tasks cannot share one without
+/// a mutex on the path that would least tolerate waiting. Port 0 lets the
+/// stack choose: nothing ever originates a datagram *to* these sockets, so
+/// their port numbers are irrelevant, and a fixed one would be another
+/// value to keep in step with `config/rover.toml` for no benefit.
+///
+/// Each use costs one slot in [`SOCKET_COUNT`] — raise it when you add one.
+#[macro_export]
+macro_rules! tx_socket {
+    ($stack:expr) => {{
+        use ::embassy_net::udp::{PacketMetadata, UdpSocket};
+        use ::static_cell::StaticCell;
+
+        const BUF_LEN: usize = 128;
+        const META_LEN: usize = 4;
+
+        static RX_META: StaticCell<[PacketMetadata; META_LEN]> = StaticCell::new();
+        static RX_BUF: StaticCell<[u8; BUF_LEN]> = StaticCell::new();
+        static TX_META: StaticCell<[PacketMetadata; META_LEN]> = StaticCell::new();
+        static TX_BUF: StaticCell<[u8; BUF_LEN]> = StaticCell::new();
+
+        let mut socket = UdpSocket::new(
+            $stack,
+            RX_META.init([PacketMetadata::EMPTY; META_LEN]),
+            RX_BUF.init([0; BUF_LEN]),
+            TX_META.init([PacketMetadata::EMPTY; META_LEN]),
+            TX_BUF.init([0; BUF_LEN]),
+        );
+        ::defmt::unwrap!(socket.bind(0));
+        socket
+    }};
 }
 
 /// RCC configuration for 216 MHz sysclk from the Nucleo's 8 MHz HSE (fed by

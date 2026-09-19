@@ -1,3 +1,8 @@
+# Deliberately not a member of the root workspace: this crate builds for
+# thumbv7em-none-eabihf while the workspace builds for the host, and cargo
+# supports only one default target per workspace. The empty table opts out.
+[workspace]
+
 [package]
 name        = "chassis-fw"
 description = "STM32F767ZI firmware: motor PWM, steering servo, LSM6DSV16X IMU, command watchdog."
@@ -76,6 +81,10 @@ embedded-io-async = { version = "=0.7.0" }
 # Confirmed by hand against the v1.0.0 tag source on GitHub. If ST re-yanks
 # or fixes `bisync`, revisit.
 lsm6dsv16x-rs = { version = "=1.0.0" }
+# Needed only to name `I2cBus<_>` in the `Imu` type alias. It arrives anyway
+# as a transitive dependency of the driver; declaring it directly is what
+# makes the path spellable.
+st-mems-bus   = { version = "=1.0.1" }
 lis2mdl-rs    = { version = "=1.0.0", optional = true }
 
 [features]
