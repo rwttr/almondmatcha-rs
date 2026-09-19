@@ -7,6 +7,8 @@ the routing table lookups.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import socket
 
 import pytest
@@ -278,3 +280,156 @@ def test_unrouted_type_still_reaches_the_mirror():
     finally:
         bus.close()
         mirror_sock.close()
+
+
+# ===========================================================================
+# Route failures are loud, mirror failures are not
+#
+# A mirror has a deliberately absent operator most of the time; a route
+# carries this process's entire output. Logging both at DEBUG made a totally
+# undelivered LaneMeasurement stream invisible at any normal log level, while
+# the process went on reporting detected frames and a healthy FPS. See
+# bus.py's module docstring.
+# ===========================================================================
+
+
+@contextlib.contextmanager
+def _capture_logs():
+    """Collect every record `rover_perception.bus` emits inside the block.
+
+    A plain handler rather than pytest's `caplog` fixture so these tests say
+    what they capture: the module sets no level of its own, and a root-logger
+    configuration elsewhere in the suite must not be able to change what a
+    test about log levels observes.
+    """
+    records = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Collector()
+    logger = logging.getLogger("rover_perception.bus")
+    previous_level, previous_propagate = logger.level, logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+
+class _FailingSocket:
+    """Stands in for a socket whose `sendto` always fails, the way an
+    unreachable peer or a downed interface presents (`ENETUNREACH`,
+    `EHOSTUNREACH`). Raising from `sendto` is the real failure mode -- a UDP
+    `sendto` to a black hole succeeds silently, so this models the errors
+    that *do* surface, which are exactly the ones worth reporting."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def sendto(self, _frame, _addr):
+        self.attempts += 1
+        raise OSError(51, "Network is unreachable")
+
+    def close(self):
+        pass
+
+
+def test_route_send_failure_warns():
+    cfg = BusConfig.parse(
+        """
+        [services]
+        control = "192.0.2.1:7001"
+
+        [routes]
+        LaneMeasurement = ["control"]
+        """
+    )
+    sock = _FailingSocket()
+    bus = Bus(cfg, sock)
+    with _capture_logs() as records:
+        bus.publish(_lane_measurement())  # must still not raise
+
+    assert sock.attempts == 1
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one WARNING, got {records}"
+    assert "control" in warnings[0].getMessage()
+
+
+def test_mirror_send_failure_does_not_warn():
+    cfg = BusConfig.parse(
+        """
+        [services]
+        control = "192.0.2.1:7001"
+
+        [debug]
+        mirror = "192.0.2.2:7099"
+        """
+    )
+    bus = Bus(cfg, _FailingSocket())
+    with _capture_logs() as records:
+        bus.publish(_lane_measurement())
+
+    assert not [r for r in records if r.levelno >= logging.WARNING], (
+        "a mirror with nobody listening is the normal case, not a warning"
+    )
+
+
+def test_repeated_route_failures_are_throttled():
+    """At ~30 FPS an unreachable peer would otherwise emit 30 WARNINGs a
+    second and bury every other message -- which hides the failure just as
+    effectively as logging it at DEBUG did."""
+    cfg = BusConfig.parse(
+        """
+        [services]
+        control = "192.0.2.1:7001"
+
+        [routes]
+        LaneMeasurement = ["control"]
+        """
+    )
+    bus = Bus(cfg, _FailingSocket())
+    with _capture_logs() as records:
+        for _ in range(100):
+            bus.publish(_lane_measurement())
+
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"100 failed sends should warn once, got {len(warnings)}"
+
+
+def test_route_recovery_is_reported():
+    """The operator who saw the failure warning needs to be told it cleared;
+    otherwise the only way to know is that the warnings stopped, which is
+    indistinguishable from the process having died."""
+    route_sock = _bound_udp_socket()
+    cfg = BusConfig.parse(
+        f"""
+        [services]
+        control = "127.0.0.1:{route_sock.getsockname()[1]}"
+
+        [routes]
+        LaneMeasurement = ["control"]
+        """
+    )
+    failing = _FailingSocket()
+    bus = Bus(cfg, failing)
+    try:
+        with _capture_logs() as records:
+            bus.publish(_lane_measurement())          # fails -> warns
+            bus._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            bus.publish(_lane_measurement())          # succeeds -> recovery
+
+        messages = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        assert len(messages) == 2, messages
+        assert "failed" in messages[0]
+        assert "recovered" in messages[1]
+        assert "1 datagram lost" in messages[1], messages[1]
+        assert route_sock.recvfrom(1024)[0], "the recovered send must actually arrive"
+    finally:
+        bus.close()
+        route_sock.close()

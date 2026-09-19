@@ -42,7 +42,21 @@ what needs fixing.
   delivery confirmation, this process has nothing useful to do with a
   `sendto` failure besides log it, and a `LaneMeasurement` producer racing
   ahead every ~33 ms should not stall or raise over one unreachable peer.
-  Failures are logged, not silently swallowed.
+
+  **But a route failure and a mirror failure are not the same event, and
+  they are not logged at the same level.** A mirror has a deliberately
+  absent operator most of the time, so its failures are `DEBUG` noise. A
+  *route* failure means this process's entire reason for running is not
+  arriving: `LaneMeasurement -> control` is the only thing perception
+  publishes. Logged at `DEBUG`, that is invisible at any normal log level,
+  and the process goes on looking perfectly healthy -- frames detected,
+  FPS nominal, CSV filling -- while the rover drives with no lane data at
+  all. Downstream does notice (the EKF's `lane_age_ms` grows and it coasts
+  on gyro + odometry), so this is not a safety hole; it is a
+  *diagnosability* hole, and the operator staring at the Jetson is exactly
+  the person who needs to be told. Route failures are therefore `WARNING`,
+  throttled per destination so a dead peer cannot spam the log 30 times a
+  second, with a matching message when delivery resumes.
 """
 
 from __future__ import annotations
@@ -50,6 +64,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -62,6 +77,12 @@ except ImportError:  # Python < 3.11 -- the Jetson runs 3.10.
 from .wire import encode_frame
 
 logger = logging.getLogger(__name__)
+
+# How often a route destination that keeps failing is re-reported. A
+# LaneMeasurement publisher runs at ~30 Hz, so an unreachable peer without
+# this would emit 30 identical WARNING lines a second -- burying every other
+# message in the log, which is its own way of hiding a failure.
+ROUTE_WARN_INTERVAL_S = 10.0
 
 # Overrides `find_config_path`'s walk-up-from-the-package search entirely.
 # Set this to point at a specific file -- a bench rig's own config, or a
@@ -234,6 +255,12 @@ class Bus:
         # Per-TYPE_ID sequence counter -- see this module's docstring on why
         # per-type, not one counter for the whole bus.
         self._send_seq: Dict[int, int] = {}
+        # Route destinations currently failing: addr -> (first failure
+        # monotonic time, datagrams dropped since). Non-empty means this
+        # process's output is not arriving somewhere it is supposed to.
+        self._failing_routes: Dict[Address, Tuple[float, int]] = {}
+        # addr -> monotonic time of the last WARNING emitted for it.
+        self._route_warned_at: Dict[Address, float] = {}
 
     def publish(self, msg) -> None:
         """Encode `msg` and send it to every service `[routes]` names for
@@ -256,20 +283,72 @@ class Bus:
                     "route for %s names unconfigured service %r; dropping", msg.NAME, service
                 )
                 continue
-            self._send(frame, addr, f"route to {service} ({addr[0]}:{addr[1]})")
+            self._send(
+                frame, addr, f"route to {service} ({addr[0]}:{addr[1]})", is_route=True
+            )
 
         mirror = self._config.mirror()
         if mirror is not None:
-            self._send(frame, mirror, f"mirror ({mirror[0]}:{mirror[1]})")
+            self._send(
+                frame, mirror, f"mirror ({mirror[0]}:{mirror[1]})", is_route=False
+            )
 
-    def _send(self, frame: bytes, addr: Address, description: str) -> None:
+    def _send(
+        self, frame: bytes, addr: Address, description: str, *, is_route: bool
+    ) -> None:
+        """Send one frame, never raising. See this module's docstring for why
+        a route failure is louder than a mirror failure."""
         try:
             self._sock.sendto(frame, addr)
         except OSError as exc:
-            # Best-effort by design -- see this module's docstring. A
-            # laptop that has been closed, or a board that hasn't booted
-            # yet, must not be allowed to affect the rest of this process.
-            logger.debug("send to %s failed: %s", description, exc)
+            # Best-effort by design. A laptop that has been closed, or a
+            # board that hasn't booted yet, must not affect this process.
+            if is_route:
+                self._warn_route_failure(addr, description, exc)
+            else:
+                logger.debug("send to %s failed: %s", description, exc)
+            return
+
+        if is_route and addr in self._failing_routes:
+            first_failed_at, dropped = self._failing_routes.pop(addr)
+            logger.warning(
+                "send to %s recovered after %.1f s (%d datagram%s lost)",
+                description,
+                time.monotonic() - first_failed_at,
+                dropped,
+                "" if dropped == 1 else "s",
+            )
+
+    def _warn_route_failure(
+        self, addr: Address, description: str, exc: OSError
+    ) -> None:
+        """Warn on the first failure to a route destination, then at most once
+        every `ROUTE_WARN_INTERVAL_S` while it stays down.
+
+        Throttled because a `LaneMeasurement` publisher runs at ~30 Hz: an
+        unreachable peer would otherwise produce 30 identical WARNING lines a
+        second and bury everything else in the log, which is its own way of
+        making a failure invisible.
+        """
+        now = time.monotonic()
+        state = self._failing_routes.get(addr)
+        if state is None:
+            self._failing_routes[addr] = (now, 1)
+            self._route_warned_at[addr] = now
+            logger.warning("send to %s failed: %s", description, exc)
+            return
+
+        first_failed_at, dropped = state
+        self._failing_routes[addr] = (first_failed_at, dropped + 1)
+        if now - self._route_warned_at.get(addr, 0.0) >= ROUTE_WARN_INTERVAL_S:
+            self._route_warned_at[addr] = now
+            logger.warning(
+                "send to %s still failing after %.0f s (%d datagrams dropped): %s",
+                description,
+                now - first_failed_at,
+                dropped + 1,
+                exc,
+            )
 
     def close(self) -> None:
         self._sock.close()
