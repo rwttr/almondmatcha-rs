@@ -921,7 +921,7 @@ tolerance. No motor turns until that passes.
 
 ## 13. Implementation status — branch `rs`
 
-Updated 2026-09-19. **This section is the truth; everything above it is the
+Updated 2026-09-20. **This section is the truth; everything above it is the
 plan.** Where they disagree, believe this.
 
 ### 13.1 What exists and is verified
@@ -935,23 +935,64 @@ plan.** Where they disagree, believe this.
 | `rover-tap` | **done** | per-type rate and seq-gap loss; `--mirror` sees the whole bus. |
 | `rover-model` | **done** | shared `A(v)`/`B(v)`, Euler discretisation. 6 tests. |
 | `rover-estimator` | **done** | 5-state EKF, Joseph form, chi-square gate, coast-on-dropout, zero-rate bias update. 10 behavioural tests. |
-| `perception/wire.py` + `lane.py` | **done** | 51 Python tests green against the Rust fixtures — the two languages provably agree on the wire. |
+| `rover-control` | **done** | lib + thin bin so `tools/replay` drives production code. `LateralController` trait; `StaticGain` is the bit-exact port. `actuate.rs` owns every guard rail. |
+| `rover-navigation` | **done** | two GNSS receivers, mission state machine, RTCM injection point. |
+| `rover-telemetry` | **done** | CSV at native rates, health bits, base feed. |
+| `ground-station` | **done** | mission goals, speed limit, E-stop, live display. |
+| `tools/replay` | **done** | **the §12 gate.** Synthetic trace + `legacy.rs` oracle. PASS at the 3.0° tolerance (rmse 1.349°, 267 rows compared); deliberately verified to FAIL at 0.5°, so the harness demonstrably has teeth. |
+| `perception/wire.py` | **done** | 51 tests green against the Rust fixtures — the two languages provably agree on every byte. |
+| `perception/lane.py` | **done** | behaviour-preserving port, **parity proven** — see 13.1b. |
+| `perception/{camera,bus,main}.py` | **done** | one process replacing `camera_stream_node` + `lane_detection_node`. End-to-end verified: 20 frames in, 20 `LaneMeasurement` out, seq monotonic, decoded by `wire.py`, clean exit. |
 | `firmware/chassis` | **builds** | 65,048 B flash (3.1%), 17,724 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
 | `firmware/sensors` | **builds** | 54,316 B flash (2.6%), 17,844 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
 
-Host workspace: **66 tests**, clippy and `fmt` clean.
+Host workspace: **290 tests**, clippy and `fmt` clean. Perception: **82 tests**.
+
+### 13.1b The lane parity test, and why it is believable
+
+`perception/tests/test_lane_parity.py` compares `process_frame` against the
+**real ROS 2 original**, not a description of it: `lane_detector.py` and
+`config.py` are vendored verbatim at `perception/tests/oracle/` (diffed at
+vendoring time — the only edit is one import line), the same way
+`tools/replay/legacy.rs` freezes the old control law. That is what let the
+ROS 2 tree be deleted without taking the evidence with it.
+
+Comparison is **exact** `==`, no tolerance, over six deterministic synthetic
+scenarios plus a `search_center` tracking case. Four of the six exercise the
+*detected* path with materially different geometry, so the test is not
+passing vacuously on "NaN equals NaN"; the other two (blank, pure noise) are
+the negative controls, and one is additionally asserted not-detected outright.
+
+Checked by mutation, not by reading: perturbing the port's polyfit
+coefficients by **one part in 10⁷** fails 5 of the 9 tests. A real
+algorithmic divergence cannot slip through this.
 
 ### 13.2 What does not exist yet
 
 | Component | State |
 |---|---|
-| `rover-control` | skeleton only — estimate/guide/actuate, `StaticGain`, speed PID |
-| `rover-navigation` | skeleton only — GNSS, mission state machine |
-| `rover-telemetry` | skeleton only — CSV, health bits, base feed |
-| `ground-station` | skeleton only |
-| `tools/replay` | skeleton only — **the §12 gate; nothing may drive a motor until this passes** |
-| `perception/` camera, bus, main | not started |
-| lane parity test | **not written** — the port reads faithful, which is not evidence |
+| Firmware on real silicon | **nothing has been flashed.** See 13.4. |
+| Drivetrain calibration | `ticks_per_rev`, `metres_per_tick`, `track_width_m` are all `0.0`. No metric speed exists until they are measured — §2.6, and **against the 4× decoder**, not the old 2× firmware. |
+| Parity against real field data | impossible here. No recorded ROS 2 run exists in this repository and none ever did (re-verified at tree-removal time). `replay` proves internal consistency and regression-catching, not field parity. §12 criterion 2 stays open. |
+| LoRa link layer | deliberately deferred — §6. Both ESP32s are out of scope by instruction. |
+| LQR / MPC control laws | phase 2 and 3. The `LateralController` trait exists so they are a new file, not a rewrite. |
+
+### 13.2b The ROS 2 tree has been removed
+
+Removed on 2026-09-20 (`chore(rs)!: remove the ROS 2, mROS 2 and embeddedRTPS
+tree`): 919 files, ~137k lines — `ws_rpi`, `ws_jetson`, `ws_base`,
+`common_ifaces`, both `mros2-mbed-*` trees, ten DDS/RTPS/mbed docs, and the
+ROS 2 launch tooling.
+
+This was held until the replay gate passed **and** the lane parity oracle was
+vendored, because until then that tree was the only thing the port could be
+checked against. What it still holds is recoverable: everything deleted was
+tracked and committed, so `git show main:<path>` and this branch's history
+both return it, and it was verified beforehand that no untracked or ignored
+file — and no `runs/`, CSV, bag or video — lived anywhere under it.
+
+Durable knowledge was harvested first, into `docs/HARDWARE.md`. `ws_spresense`
+was left untouched by instruction.
 
 ### 13.3 Deviations from the plan, and why
 
@@ -1100,13 +1141,27 @@ Nothing in `firmware/` has met silicon. In rough order of risk:
   dividing by zero, and the speed PID works in ticks/sec so it is unaffected —
   but nothing can report m/s until §2.6 is done. Twenty minutes with a tape
   measure.
-- **`tools/replay` does not exist**, so no parity with the ROS 2 system has
-  been demonstrated for either the estimator or the control law. Until it
-  does, §12 criterion 2 is unmet and no motor should turn.
+- **Nothing has been flashed.** Every firmware claim in 13.1 is a claim about
+  a binary that builds, not one that has run. The LAN8742A PHY against
+  Embassy's `GenericPhy` is the gate that decides whether any of it is real.
+  See 13.4 for the full list.
+- **Replay parity is against a synthetic trace and a hand-rolled oracle, not
+  against the rover's past behaviour.** No recorded ROS 2 run exists in this
+  repository and none ever did. The harness prints this caveat itself. §12
+  criterion 2 stays open until a real run is recorded on the new stack and
+  compared against a real ROS 2 run recorded on `main` — which now requires
+  checking out `main` to produce one, since the ROS 2 tree is gone from this
+  branch.
 
 ## Appendix A — LSM6DSV16X register fallback
 
-From `libs/X-Nucleo-IKS4A1_mbedOS/plt_lsm6dsv16x/registers.h`:
+Transcribed from `libs/X-Nucleo-IKS4A1_mbedOS/plt_lsm6dsv16x/registers.h` in
+the mbed firmware. That path no longer exists on this branch — it lived under
+`mros2-mbed-chassis-dynamics`, removed in `chore(rs)!: remove the ROS 2,
+mROS 2 and embeddedRTPS tree`. The table below is the reason it did not need
+to survive; if more of it is ever wanted, `git show main:<path>` still has
+the header. This is the fallback for talking to the part directly, should
+`lsm6dsv16x-rs` prove unusable on hardware:
 
 | Register | Addr | Use |
 |---|---|---|
