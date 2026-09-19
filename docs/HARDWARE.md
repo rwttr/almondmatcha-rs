@@ -192,10 +192,24 @@ Kept as the number the rewrite is measured against, not as a spec:
 | Motor actuation | 50 ms |
 | **End to end** | **100–150 ms** |
 
+The stages above sum to roughly 153–163 ms, higher than the stated 100–150 ms
+end-to-end figure; the two were measured independently and the gap is
+presumed pipeline overlap (e.g. the next camera frame capturing while the
+current one is still being steered on), not an arithmetic error — neither
+figure has been re-measured to confirm the overlap.
+
 Two of those hops no longer exist. Camera capture and lane detection were two
 ROS processes joined by a ~2.7 MB serialize + localhost UDP hop + decode, 30
-times a second; they are now one loop iteration in one process. Motor actuation
-ran at 20 Hz and now runs against a 50 Hz command stream.
+times a second; they are now one loop iteration in one process.
+
+**"20 Hz" here and "50 Hz" in `CONTROL_LAW.md` describe different things, not
+a contradiction.** The 20 Hz above is the old chassis firmware's own motor
+control *polling loop* — `MOTOR_RESPONSE_PERIOD_MS = 50` in
+`motor_control.cpp`, i.e. it re-applied its held command at ~20 Hz regardless
+of how often a new one arrived. `CONTROL_LAW.md`'s 50 Hz is the *topic* rate
+at which the RPi published `tpc_chassis_cmd` — a firmware update rate versus
+a publish rate, on the same old system. The Rust firmware now runs actuation
+against a 50 Hz command stream, unifying the two.
 
 ---
 
