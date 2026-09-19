@@ -1051,11 +1051,16 @@ was left untouched by instruction.
 
 ### 13.3b Open design defects found during implementation
 
-Four real flaws in this plan, surfaced by building against it. Recorded here
-with their decisions; **all four are implemented** — D1 as `[services]` in
+Five real flaws, surfaced by building against this plan and then by auditing
+what was built. **D1-D4 are implemented** — D1 as `[services]` in
 `config/rover.toml`, D2 as `GnssSource` / `GnssFix.source`, D3 as
 `select_navigation_fix` in `crates/rover-navigation/src/mission.rs` (with
-passing tests), D4 as perception's `--csv` flag, off by default.
+passing tests), D4 as perception's `--csv` flag, off by default (the base
+station only half-follows that decision — see D4).
+
+**D5 is open and is the only one that can make the rover steer the wrong way.**
+It was found by measurement rather than review, is not fixed, and should be
+settled before anything is flashed.
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
 
@@ -1135,6 +1140,105 @@ station logs CSVs on every run with no flag to turn it off.
 `CSV_LOGGING.md`'s "No CSV logging on base station" line) and resolves it the
 other way, citing the crate's own task brief. So: perception is off by
 default as decided; the base station is on unconditionally, undecided-in-code.
+
+#### D5 — `heading_err_rad`'s sign disagrees with the model that consumes it
+
+**Found 2026-09-20 by measurement, not review. Unresolved — decide before
+flashing anything.** This is the only defect in this list that can make the
+rover steer the wrong way.
+
+##### The claim that turned out to be half true
+
+`rover-msgs`'s crate docs, `guide.rs`, §10 and the README all state the same
+convention: `cross_track_m`, `heading_err_rad` and `steer` are *all* positive
+when the correct response is "steer right", so both feedback terms carry a
+plus sign. Tested against the real detector, **the `cross_track_m` half is
+right and the `heading_err_rad` half is backwards.**
+
+##### The measurement
+
+Bird's-eye canvas orientation confirmed first, since everything depends on it:
+a marker at the ROI's far edge lands at BEV row 26/340, one at the near edge at
+row 334/340 — **canvas top is ahead**. (Independently: the ROI trapezoid is
+550 px wide at its far edge and 1202 px at its near edge, which is what a
+ground plane in perspective looks like.)
+
+Feeding `process_frame` a lane that veers **right** as it recedes:
+
+```text
+detector theta = -11.662 deg      detector b = +0.1238 m
+
+lane offset at increasing lookahead s:
+  s=0.0 m -> 0.1238    s=0.4 m -> 0.2059    s=0.8 m -> 0.2869
+
+measured d(cross_track)/d(distance) = +0.2052
+tan(detector theta)                 = -0.2064
+```
+
+`theta` is the **negative** of `d(cross_track)/d(distance)`, to three decimals.
+
+This falls out of the fit's own algebra: `compute_lane_params` fits
+`x = A*y'^2 + B*y' + C` with `y' = y - height`, so `y'` increases *backwards*
+while forward is `-y'`. `theta = arctan(B) = arctan(-dx/d(forward))`.
+
+##### Why that is wrong
+
+Two consumers assume the opposite, both with a `+l_a`:
+
+- `RoverState::at_lookahead` — `cross + l_a * heading_err + 0.5*kappa*l_a^2`
+- `Ekf::correct_camera` — `h[(0, HEADING_ERR)] = l_a`
+
+Both encode `d(cross)/d(l) = +heading_err`. So does the error model the ROS 2
+node's own docstring states: `b_dot = v*theta`.
+
+##### Why the rover nevertheless drove
+
+`b` is measured 1.22 m ahead, so it already carries heading information and it
+dominates. For a straight path angled `psi` to the right:
+
+```text
+u = k_lat*(1.22*psi) + k_head*(-psi) = 3.857*psi - 2.024*psi = 1.833*psi  deg
+correct would be:                      3.857*psi + 2.024*psi = 5.881*psi  deg
+```
+
+Still positive, so it steers the right way — at **31 % of the intended
+authority**. The heading term cancels the lookahead's anticipation instead of
+reinforcing it. That is consistent with `k_lat = 181.17` being tuned unusually
+high: the gain was inflated to compensate for a term working against it.
+
+The clean failure case is `b ~ 0, theta != 0` — on the line but pointed wrong,
+which happens at every line crossing. There the `b` term contributes nothing
+and the heading term alone decides, so the rover steers **away** until `b`
+grows enough to overrule it. A weave, not a divergence.
+
+##### Two things that make it worse than it was
+
+1. **The EKF amplifies it.** The EMA passed `theta` through untouched. The EKF
+   explicitly cross-couples cross-track and heading through `l_a`, so it is now
+   fusing two measurement rows that contradict each other — inflated
+   innovations, a biased heading estimate, and more NIS gating than the data
+   deserves.
+2. **The tests cannot catch it.** `positive_heading_error_steers_right` asserts
+   that the law matches the assumption, which is circular. Nothing anywhere
+   tests the *detector's* convention against the *model's*.
+
+##### Decision: NOT TAKEN
+
+Deliberately left open. The fix is small — negate `heading_err_rad` where
+`LaneDetector.detect` converts it, leaving `cross_track_m` and `steer` alone —
+but it roughly triples heading authority, and `k_lat` was tuned around the
+cancellation, so it needs re-tuning and a field session, not a code review.
+
+Adopting ISO 8855 wholesale is **not** the answer and was considered and
+rejected: it is a relabelling that invalidates every field-tuned gain and buys
+nothing on a single vehicle with no external interop.
+
+**Before acting, confirm on hardware** (60 seconds, rover on blocks): show the
+camera a line clearly angled to the right and watch the servo. If it turns
+left, this is confirmed. The geometry above is certain, but it rests on a
+positive `steer` turning the wheels physically right — which must be true,
+since otherwise the dominant `b` term would be destabilising and the rover
+could never have driven at all.
 
 ### 13.4 Hardware-verification debt
 
