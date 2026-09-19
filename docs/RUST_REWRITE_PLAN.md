@@ -7,6 +7,10 @@ adding state estimation (EKF), a pluggable control law, a firmware command
 watchdog, metric speed, and a link layer that survives the base station leaving
 the LAN for LoRa. Big-bang rewrite on a branch; `main` is preserved untouched.
 
+**Rev 3 adds §13, an implementation status table.** Everything above it is the
+plan; §13 is what actually exists on branch `rs`. Where the two disagree, §13
+is right and the plan text is aspirational.
+
 **Rev 2 changes:** §2.5 metric speed calibration (encoder spec is *not* in the
 repo — measurement procedure supplied), §5.2 full watchdog specification, §6 new
 link-layer abstraction for the LoRa future, §4 base↔rover protocol changed from
@@ -894,6 +898,104 @@ tolerance. No motor turns until that passes.
 
 ---
 
+## 13. Implementation status — branch `rs`
+
+Updated 2026-09-19. **This section is the truth; everything above it is the
+plan.** Where they disagree, believe this.
+
+### 13.1 What exists and is verified
+
+| Component | State | Evidence |
+|---|---|---|
+| `rover-msgs` | **done** | 17 types, builds for host **and** `thumbv7em-none-eabihf`. 7 contract tests: round-trip, declared-vs-actual length, trailing bytes, truncation, frame budget, ID uniqueness, golden fixtures. |
+| `testdata/*.bin` | **done** | 17 fixtures. Regenerating them is a breaking protocol change. |
+| `rover-link` | **done** | `Link` trait, `UdpLink`, `send_to_addr` with an `Unsupported` default so a future LoRa link need not implement it. |
+| `rover-bus` | **done** | config loading, unicast fan-out, newest-wins receive, idempotent command handshake, debug mirror. |
+| `rover-tap` | **done** | per-type rate and seq-gap loss; `--mirror` sees the whole bus. |
+| `rover-model` | **done** | shared `A(v)`/`B(v)`, Euler discretisation. 6 tests. |
+| `rover-estimator` | **done** | 5-state EKF, Joseph form, chi-square gate, coast-on-dropout, zero-rate bias update. 10 behavioural tests. |
+| `perception/wire.py` + `lane.py` | **done** | 51 Python tests green against the Rust fixtures — the two languages provably agree on the wire. |
+| `firmware/chassis` | **builds** | 65,048 B flash (3.1%), 17,724 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
+
+Host workspace: **66 tests**, clippy and `fmt` clean.
+
+### 13.2 What does not exist yet
+
+| Component | State |
+|---|---|
+| `firmware/sensors` | **not started** — encoders, INA226, mirror watchdog |
+| `rover-control` | skeleton only — estimate/guide/actuate, `StaticGain`, speed PID |
+| `rover-navigation` | skeleton only — GNSS, mission state machine |
+| `rover-telemetry` | skeleton only — CSV, health bits, base feed |
+| `ground-station` | skeleton only |
+| `tools/replay` | skeleton only — **the §12 gate; nothing may drive a motor until this passes** |
+| `perception/` camera, bus, main | not started |
+| lane parity test | **not written** — the port reads faithful, which is not evidence |
+
+### 13.3 Deviations from the plan, and why
+
+1. **`lsm6dsv16x-rs` is pinned to v1.0.0, not the v2.1.0 named in §5.1.**
+   v2.x depends on `bisync`, and every published version of `bisync` is
+   yanked on crates.io, so v2.x cannot be resolved at all. v1.0.0 predates
+   the async/blocking split: same method names, register enums behind
+   `prelude` instead of the crate root, two type parameters instead of
+   three. Revisit if `bisync` is ever unyanked.
+
+2. **Firmware constants are a hand-transcribed `config.rs`, not a compile-time
+   parser.** §6 says firmware should `include_str!` `rover.toml` and parse it
+   in a `const fn`. That parser is a project in itself and getting it subtly
+   wrong is a worse failure than a small constants file a human can diff by
+   eye. Every constant cites its `rover.toml` key. **The manual sync step is
+   real and is the documented cost of not having the parser.**
+
+3. **The watchdog centres the steering *before* the ramp, not after.** §5.2's
+   code sketch ramps throttle and then centres, which leaves the servo
+   latched for the full 300 ms while the vehicle is still moving — against
+   the stated reason for centring at all ("a latched steering angle turns a
+   runaway into a circle"). The plan's sketch was wrong; the implementation
+   follows the plan's *rationale*.
+
+4. **Process noise is `P += Q*dt`, not `P += Q`.** Predict is driven by IMU
+   packet arrival, not a hardware timer, so `dt` jitters and a dropped packet
+   makes it several times nominal. Per-tick noise leaves the filter
+   overconfident exactly when it has least information. `[estimator.q]` values
+   are therefore per-second spectral densities.
+
+5. **`lane_age_ms` resets only on an *accepted* camera update.** Guidance reads
+   `RoverState` and never sees `EkfDebug`, so counting gated readings as fresh
+   would let a detector producing consistent garbage read as healthy while the
+   filter coasted with no corrections. Camera liveness is `HealthBits::LANE_STALE`.
+
+6. **`TelemetryLite` is not implemented.** The LoRa radios are deferred, and an
+   unused type rots. Add it with `LoraSerialLink`.
+
+### 13.4 Hardware-verification debt
+
+Nothing in `firmware/` has met silicon. In rough order of risk:
+
+1. **LAN8742A PHY against `GenericPhy`** — §9 step 4, still the hard gate.
+   Standard clause-22 part, but unproven here.
+2. **I2C1 on PB8/PB9** — inherited from the mbed target's generic
+   `I2C_SDA`/`I2C_SCL` names for `NUCLEO_F767ZI`. Standard Nucleo-144 Arduino
+   bus, not confirmed against the physical board.
+3. **TIM1 left-motor PWM** — the only channel on an advanced-control timer. If
+   the left motor alone produces no PWM while the right motor and servo work,
+   TIM1's break/MOE gate is the first place to look.
+4. **Watchdog end-to-end** — §12 criterion 3. Cannot be faked in a test.
+5. **Every timing constant** — 200 ms / 300 ms / 500 ms are reasoned, not measured.
+
+### 13.5 Standing blockers
+
+- **Drivetrain calibration is `0.0`.** `ticks_per_rev`, `metres_per_tick` and
+  `track_width_m` are all unmeasured, so there is still no metric speed
+  anywhere in the system. The estimator disables odometry loudly rather than
+  dividing by zero, and the speed PID works in ticks/sec so it is unaffected —
+  but nothing can report m/s until §2.6 is done. Twenty minutes with a tape
+  measure.
+- **`tools/replay` does not exist**, so no parity with the ROS 2 system has
+  been demonstrated for either the estimator or the control law. Until it
+  does, §12 criterion 2 is unmet and no motor should turn.
+
 ## Appendix A — LSM6DSV16X register fallback
 
 From `libs/X-Nucleo-IKS4A1_mbedOS/plt_lsm6dsv16x/registers.h`:
@@ -946,3 +1048,5 @@ vendored `libs/X-Nucleo-IKS4A1_mbedOS/README.md`:
   MQTT (five competing `no_std` crates, no dominant one),
   [canadensis](https://github.com/samcrow/canadensis) / Cyphal (UDP transport unspecified, reintroduces DSDL codegen),
   [dora-rs](https://dora-rs.ai/) / [Copper](https://www.copper-robotics.com/) (no MCU story)
+
+---
