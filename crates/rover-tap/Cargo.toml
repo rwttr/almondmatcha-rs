@@ -1,0 +1,11 @@
+[package]
+name        = "rover-tap"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+rover-msgs = { workspace = true }
+rover-link = { workspace = true }
+rover-bus  = { workspace = true }

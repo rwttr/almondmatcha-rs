@@ -6,12 +6,18 @@
 #
 # Firmware crates live in firmware/ and are NOT members of this workspace:
 # they build for thumbv7em-none-eabihf with their own profile and linker
-# settings. They depend on rover-msgs by path.
+# settings, and a workspace cannot hold two different default targets.
+# They depend on rover-msgs by path.
 
 [workspace]
 resolver = "2"
 members = [
     "crates/rover-msgs",
+    "crates/rover-link",
+    "crates/rover-bus",
+    "crates/rover-model",
+    "crates/rover-estimator",
+    "crates/rover-tap",
 ]
 
 [workspace.package]
@@ -21,7 +27,11 @@ license    = "Apache-2.0"
 repository = "https://github.com/RoboticsGG/almondmatcha"
 
 [workspace.dependencies]
-rover-msgs = { path = "crates/rover-msgs" }
+rover-msgs      = { path = "crates/rover-msgs" }
+rover-link      = { path = "crates/rover-link" }
+rover-bus       = { path = "crates/rover-bus" }
+rover-model     = { path = "crates/rover-model" }
+rover-estimator = { path = "crates/rover-estimator" }
 
 [profile.release]
 opt-level     = 3
