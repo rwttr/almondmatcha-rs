@@ -22,7 +22,8 @@ The rover implements a **dual-tier CSV logging system** to ensure data redundanc
 
 **Node**: `rover_monitoring_node` (rover_monitoring)
 **Domain**: 5 (rover control domain)
-**Location**: ws_rpi/runs/
+**Location (ROS 2)**: ws_rpi/runs/ — this directory never existed in this
+repository (`.gitignore` excluded it) and does not exist on branch `rs`.
 **Language**: C++
 
 This is the *only* RPi node that writes local CSVs. `mission_monitoring_node_rpi`
@@ -56,7 +57,7 @@ this was split apart — don't reintroduce CSV writing in
 - `mission_state.csv` (event-driven): Mission status, destination, steering, lane detection
 - `chassis_speed_pid.csv` (~4 Hz): Closed-loop speed PID internals (measured/target wheel speed, error, output)
 
-**Directory Structure**:
+**Directory Structure (ROS 2)** — never existed in this repository:
 ```
 ws_rpi/runs/
 ├── run_001_20250104_143052/
@@ -77,7 +78,8 @@ ws_rpi/runs/
 
 **Node**: `rover_local_monitoring_node` (rover_monitoring)  
 **Domain**: 4 (base telemetry domain)  
-**Location**: ws_jetson/runs/  
+**Location (ROS 2)**: ws_jetson/runs/ — this directory never existed in this
+repository (`.gitignore` excluded it) and does not exist on branch `rs`.  
 **Language**: Python
 
 **Characteristics**:
@@ -95,7 +97,7 @@ ws_rpi/runs/
 - `chassis_data.csv`: Combined sensors, IMU, commands (5 Hz)
 - `mission_state.csv`: Mission status, destination, steering, lane (5 Hz)
 
-**Directory Structure**:
+**Directory Structure (ROS 2)** — never existed in this repository:
 ```
 ws_jetson/runs/
 ├── run_001_20250104_143052/
@@ -306,7 +308,8 @@ Separate from the dual-tier system above — these files are written directly by
 the vision/control nodes themselves, not by `rover_monitoring`. They land as flat
 files inside the same `run_NNN_<stamp>/` directory as the Tier 2 telemetry
 CSVs — one launch produces exactly one directory per machine, containing
-everything that machine logged:
+everything that machine logged (ROS 2; this directory never existed in this
+repository):
 
 ```
 ws_jetson/runs/run_003_20260727_190426/
@@ -408,7 +411,15 @@ Both RPi and Jetson use synchronized run numbering:
 
 ---
 
-## Launch Integration
+## Launch Integration (ROS 2 — historical, not executable on branch `rs`)
+
+The banner at the top of this document covers the architecture below as
+ROS 2-era, but this section is worth flagging on its own: it is a
+copy-pasteable set of commands, and none of them run on branch `rs`.
+`ws_rpi/`, `ws_jetson/`, `ws_base/` and the launch scripts they reference were
+all removed in the ROS 2 tree deletion; recover them with, for example,
+`git show main:ws_rpi/launch_rover_tmux.sh`, or `git checkout main` to run
+them for real.
 
 ### RPi (ws_rpi)
 
