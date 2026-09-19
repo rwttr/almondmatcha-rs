@@ -1,9 +1,0 @@
-mission_command_node:
-  ros__parameters:
-    rover_spd: 15              # Speed limit 0-100%
-    des_lat: 8.007286          # Target latitude (Thailand)
-    des_long: 101.90203        # Target longitude (Thailand)
-    action_watchdog_timeout_sec: 20.0  # Cancel goal if no feedback received for this many seconds
-                                       # (guards against mid-mission Wi-Fi loss)
-                                       # Feedback arrives every 2 s from gnss_mission_monitor_node
-                                       # Minimum safe value: ~6 s (3x feedback period)

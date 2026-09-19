@@ -3,8 +3,9 @@
 //! driven from a CSV trace, no network, no hardware anywhere in the process.
 //!
 //! **Read `crate::trace`'s module docs first.** There is no recorded ROS2
-//! field data anywhere in this repository (`ws_jetson/runs/`,
-//! `ws_rpi/runs/` do not exist), so this tool validates the new pipeline
+//! field data anywhere in this repository — there never was, and the ROS 2
+//! tree that would have produced it has since been removed (see `git log`
+//! and `main`) — so this tool validates the new pipeline
 //! against a faithful Rust port of the *old* EMA-based law
 //! (`crate::legacy`) fed synthetic input (`crate::synthetic`) — not against
 //! a real recorded run. Treat a clean report from this tool as "the port is

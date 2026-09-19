@@ -1,6 +1,0 @@
-float64 des_lat
-float64 des_long
----
-string result_fser
----
-float64 dis_remain

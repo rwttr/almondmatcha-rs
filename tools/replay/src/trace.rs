@@ -4,12 +4,14 @@
 //!
 //! `docs/RUST_REWRITE_PLAN.md` §12 (criterion 2) and §10 both say `replay`
 //! must reproduce recorded ROS2 steering output from `runs/*/lane_detection.csv`
-//! and its neighbours. **Neither `ws_jetson/runs/` nor `ws_rpi/runs/` exists
-//! in this repository** — they are per-run output directories the ROS2 nodes
-//! create at record time (`resolve_run_dir()` in
-//! `ws_jetson/src/vision_navigation/vision_navigation/helpers.py`), never
-//! committed. There is no `runs/` directory, no `.csv` anywhere in this repo
-//! outside vendored third-party Python packages, and no `.bag` file either.
+//! and its neighbours. **No such recording exists in this repository, and
+//! none ever did.** Those were per-run output directories the ROS2 nodes
+//! created at record time and never committed; the ROS 2 tree itself has
+//! since been removed from this branch (it survives on `main` and in this
+//! branch's history). There is no `runs/` directory, no `.csv` anywhere in
+//! this repo outside vendored third-party Python packages, and no `.bag`
+//! file either — checked again at removal time, which is what made deleting
+//! the tree safe.
 //!
 //! **Consequently: parity against real recorded ROS2 field data is
 //! UNVALIDATED by this tool.** What it validates instead — see `crate::synthetic`

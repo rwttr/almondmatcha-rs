@@ -1,7 +1,0 @@
-# Speed safety cap for the chassis controller.
-# Unit: 0–100 (% PWM duty cycle). The STM32 motor driver converts: motor_duty = rover_spd / 100.0
-# Values above 100 are meaningless (exceed full throttle) and will be clamped in chassis_controller.
-# Safe startup default: 50 (50% duty). Set to 0 for a full stop override.
-uint8 rover_spd
----
-string spd_result

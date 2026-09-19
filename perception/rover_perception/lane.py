@@ -1,6 +1,12 @@
-"""Lane detection pipeline, ported from
-`ws_jetson/src/vision_navigation/vision_navigation/lane_detector.py` and the
-per-frame state that used to live in `lane_detection_node.py`.
+"""Lane detection pipeline, ported from the ROS 2 node's
+`lane_detector.py` and the per-frame state that used to live in
+`lane_detection_node.py`.
+
+The ROS 2 tree those came from has been removed from this branch, but the
+detector itself is vendored verbatim at `perception/tests/oracle/` as the
+frozen parity oracle — so every path this docstring cites is still readable,
+and `tests/test_lane_parity.py` still compares this file against the real
+original rather than against a description of it.
 
 # FIDELITY — read this before touching a constant or a line of algorithm code
 
