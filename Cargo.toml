@@ -18,6 +18,11 @@ members = [
     "crates/rover-model",
     "crates/rover-estimator",
     "crates/rover-tap",
+    "crates/rover-control",
+    "crates/rover-navigation",
+    "crates/rover-telemetry",
+    "crates/ground-station",
+    "tools/replay",
 ]
 
 [workspace.package]
@@ -32,6 +37,7 @@ rover-link      = { path = "crates/rover-link" }
 rover-bus       = { path = "crates/rover-bus" }
 rover-model     = { path = "crates/rover-model" }
 rover-estimator = { path = "crates/rover-estimator" }
+rover-control   = { path = "crates/rover-control" }
 
 [profile.release]
 opt-level     = 3
