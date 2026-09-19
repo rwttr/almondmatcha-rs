@@ -1,8 +1,15 @@
 # almondmatcha — single source of truth for the whole system.
 #
-# Every host binary reads this at startup. The two firmware images parse the
-# subset they need at COMPILE time (include_str! + a const parser), so a NUCLEO
-# cannot be running against a stale copy of the routing table.
+# Every host binary reads this at startup. The two firmware images do not:
+# that would need a const-fn TOML parser (include_str! + parse at compile
+# time), which was deliberately not built for this pass (see
+# docs/RUST_REWRITE_PLAN.md §13.3 item 2) — getting a hand-rolled parser
+# subtly wrong was judged worse than a small, obviously-named constants file
+# a human can diff by eye. Instead the firmware constants are HAND-TRANSCRIBED
+# into each crate's config.rs, with every constant citing the rover.toml key
+# it came from. If you change a value here, grep both firmware/*/src/config.rs
+# for the old value and update it there too — that manual step is real and is
+# the documented cost of not having the parser yet.
 #
 # Nothing here may be duplicated in code. If a constant appears in both a
 # source file and this file, this file is wrong or the source file is.
@@ -186,7 +193,9 @@ timeout_s          = 2.0
 #
 # Seed measurement noise from recorded data: park the rover facing a straight
 # line and take the variance of the lane parameters over a few hundred frames.
-# The ROS 2 runs/ CSVs already contain what you need.
+# No such recording exists yet -- no ROS 2 runs/ CSVs exist in this repository
+# and none ever did. A run must be produced first before R can be seeded this
+# way. See docs/RUST_REWRITE_PLAN.md §13.5.
 # ---------------------------------------------------------------------------
 [estimator]
 predict_hz            = 100.0
