@@ -292,7 +292,11 @@ fn frame_header_matches_committed_fixture() {
     } else {
         let fixture = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-        assert_eq!(&buf[..], fixture.as_slice(), "FrameHeader: bytes no longer match testdata/FrameHeader.bin");
+        assert_eq!(
+            &buf[..],
+            fixture.as_slice(),
+            "FrameHeader: bytes no longer match testdata/FrameHeader.bin"
+        );
         let decoded = FrameHeader::decode(&fixture).expect("FrameHeader fixture failed to decode");
         assert_eq!(decoded, header);
     }

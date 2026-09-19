@@ -61,7 +61,9 @@
 pub mod config;
 
 use nalgebra::{SMatrix, SVector};
-use rover_model::{discretize, process_derivative, process_jacobian, StateMatrix, StateVector, VehicleParams};
+use rover_model::{
+    discretize, process_derivative, process_jacobian, StateMatrix, StateVector, VehicleParams,
+};
 use rover_msgs::{state_idx, EkfDebug, LaneMeasurement, RoverState, WheelSensors, EKF_STATES};
 
 pub use config::{EstimatorConfig, LaneNoise, ProcessNoise};
@@ -158,7 +160,11 @@ impl Ekf {
     /// stop, no `EkfDebug` emitted (see the module docs). Returns
     /// `Some(EkfDebug)` for every measurement that *was* received, whether
     /// the chi-square gate then accepted it or rejected it as an outlier.
-    pub fn correct_camera(&mut self, meas: &LaneMeasurement, cfg: &EstimatorConfig) -> Option<EkfDebug> {
+    pub fn correct_camera(
+        &mut self,
+        meas: &LaneMeasurement,
+        cfg: &EstimatorConfig,
+    ) -> Option<EkfDebug> {
         if !meas.valid {
             return None;
         }
@@ -173,7 +179,11 @@ impl Ekf {
         h[(1, state_idx::CURVATURE)] = l_a;
         h[(2, state_idx::CURVATURE)] = 1.0;
 
-        let z = SVector::<f32, 3>::new(meas.cross_track_m, meas.heading_err_rad, meas.curvature_inv_m);
+        let z = SVector::<f32, 3>::new(
+            meas.cross_track_m,
+            meas.heading_err_rad,
+            meas.curvature_inv_m,
+        );
         let y = z - h * self.x;
 
         let r = SMatrix::<f32, 3, 3>::from_diagonal(&SVector::<f32, 3>::new(
@@ -268,9 +278,8 @@ impl Ekf {
 
         const THROTTLE_EPS: f32 = 1e-3;
         let tol = cfg.zero_rate_max_ticks;
-        let quiet = throttle.abs() < THROTTLE_EPS
-            && delta_left.abs() <= tol
-            && delta_right.abs() <= tol;
+        let quiet =
+            throttle.abs() < THROTTLE_EPS && delta_left.abs() <= tol && delta_right.abs() <= tol;
 
         if quiet {
             self.scalar_update(state_idx::GYRO_BIAS, gyro_radps, cfg.r_zero_rate_gyro);
@@ -279,7 +288,13 @@ impl Ekf {
         }
     }
 
-    fn correct_odometry(&mut self, delta_left: i32, delta_right: i32, dt_s: f32, cfg: &EstimatorConfig) {
+    fn correct_odometry(
+        &mut self,
+        delta_left: i32,
+        delta_right: i32,
+        dt_s: f32,
+        cfg: &EstimatorConfig,
+    ) {
         if !cfg.odometry_calibrated() {
             if !self.odometry_disabled_warned {
                 log::warn!(

@@ -11,15 +11,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     /// Buffer was shorter than the type's fixed wire length.
-    TooShort {
-        need: usize,
-        got: usize,
-    },
+    TooShort { need: usize, got: usize },
     /// A field held a value outside its defined set (bad enum discriminant).
-    BadDiscriminant {
-        field: &'static str,
-        value: u8,
-    },
+    BadDiscriminant { field: &'static str, value: u8 },
 }
 
 impl core::fmt::Display for DecodeError {
@@ -179,12 +173,6 @@ impl<'a> Reader<'a> {
         [self.f32(), self.f32(), self.f32()]
     }
     pub fn f32x5(&mut self) -> [f32; 5] {
-        [
-            self.f32(),
-            self.f32(),
-            self.f32(),
-            self.f32(),
-            self.f32(),
-        ]
+        [self.f32(), self.f32(), self.f32(), self.f32(), self.f32()]
     }
 }

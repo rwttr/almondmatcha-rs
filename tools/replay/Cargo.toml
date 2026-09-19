@@ -1,5 +1,6 @@
 [package]
 name        = "replay"
+description = "Offline replay harness: drives rover-estimator + rover-control's StaticGain from a CSV trace, no network, no hardware. The gate before anything drives a motor (plan §12)."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -9,3 +10,5 @@ repository.workspace = true
 rover-msgs      = { workspace = true }
 rover-model     = { workspace = true }
 rover-estimator = { workspace = true }
+rover-control   = { workspace = true }
+clap            = { version = "4", features = ["derive"] }

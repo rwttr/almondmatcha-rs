@@ -1,11 +1,18 @@
 [package]
 name        = "rover-control"
+description = "RPi binary: estimate (EKF) -> guide (pluggable law) -> actuate (guard rails), one process, plain threads."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-rover-msgs = { workspace = true }
-rover-link = { workspace = true }
-rover-bus  = { workspace = true }
+rover-msgs      = { workspace = true }
+rover-link      = { workspace = true }
+rover-bus       = { workspace = true }
+rover-model     = { workspace = true }
+rover-estimator = { workspace = true }
+serde           = { version = "1", features = ["derive"] }
+toml            = "1"
+log             = "0.4"
+env_logger      = "0.11"

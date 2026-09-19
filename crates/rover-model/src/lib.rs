@@ -253,9 +253,7 @@ mod tests {
         let expected = StateMatrix::identity() + f_c * dt;
         assert_eq!(f_d, expected);
         // Off the diagonal it should just be F_c * dt...
-        assert!(
-            (f_d[(state_idx::CROSS_TRACK, state_idx::HEADING_ERR)] - 0.2 * dt).abs() < 1e-9
-        );
+        assert!((f_d[(state_idx::CROSS_TRACK, state_idx::HEADING_ERR)] - 0.2 * dt).abs() < 1e-9);
         // ...and the diagonal must stay at 1 (identity contribution).
         for i in 0..EKF_STATES {
             assert!((f_d[(i, i)] - 1.0).abs() < 1e-9);

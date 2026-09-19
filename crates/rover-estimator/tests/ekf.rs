@@ -29,7 +29,12 @@ fn cfg(metres_per_tick: f32) -> EstimatorConfig {
     }
 }
 
-fn lane_measurement(cross_track_m: f32, heading_err_rad: f32, curvature_inv_m: f32, t_us: u32) -> LaneMeasurement {
+fn lane_measurement(
+    cross_track_m: f32,
+    heading_err_rad: f32,
+    curvature_inv_m: f32,
+    t_us: u32,
+) -> LaneMeasurement {
     LaneMeasurement {
         curvature_inv_m,
         heading_err_rad,
@@ -63,8 +68,16 @@ fn straight_line_converges_to_zero_and_holds() {
     }
 
     let s = ekf.state();
-    assert!(s.cross_track_m.abs() < 1e-3, "cross_track_m did not converge: {}", s.cross_track_m);
-    assert!(s.heading_err_rad.abs() < 1e-3, "heading_err_rad did not converge: {}", s.heading_err_rad);
+    assert!(
+        s.cross_track_m.abs() < 1e-3,
+        "cross_track_m did not converge: {}",
+        s.cross_track_m
+    );
+    assert!(
+        s.heading_err_rad.abs() < 1e-3,
+        "heading_err_rad did not converge: {}",
+        s.heading_err_rad
+    );
 
     // Run further and confirm it stays converged rather than drifting back off.
     for step in total_steps..(total_steps + 200) {
@@ -74,8 +87,16 @@ fn straight_line_converges_to_zero_and_holds() {
         }
     }
     let s2 = ekf.state();
-    assert!(s2.cross_track_m.abs() < 1e-3, "estimate drifted back off zero: {}", s2.cross_track_m);
-    assert!(s2.heading_err_rad.abs() < 1e-3, "estimate drifted back off zero: {}", s2.heading_err_rad);
+    assert!(
+        s2.cross_track_m.abs() < 1e-3,
+        "estimate drifted back off zero: {}",
+        s2.cross_track_m
+    );
+    assert!(
+        s2.heading_err_rad.abs() < 1e-3,
+        "estimate drifted back off zero: {}",
+        s2.heading_err_rad
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +137,16 @@ fn constant_curvature_arc_is_tracked() {
         "curvature did not converge: got {}, want {true_kappa}",
         s.curvature_inv_m
     );
-    assert!(s.cross_track_m.abs() < 0.05, "front-axle cross track should stay near zero: {}", s.cross_track_m);
-    assert!(s.heading_err_rad.abs() < 0.05, "front-axle heading error should stay near zero: {}", s.heading_err_rad);
+    assert!(
+        s.cross_track_m.abs() < 0.05,
+        "front-axle cross track should stay near zero: {}",
+        s.cross_track_m
+    );
+    assert!(
+        s.heading_err_rad.abs() < 0.05,
+        "front-axle heading error should stay near zero: {}",
+        s.heading_err_rad
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +171,17 @@ fn lane_dropout_coasts_without_diverging() {
             ..lane_measurement(0.0, 0.0, 0.0, 0)
         };
         let debug = ekf.correct_camera(&dropped, &cfg);
-        assert!(debug.is_none(), "an invalid measurement must produce no EkfDebug and no update");
+        assert!(
+            debug.is_none(),
+            "an invalid measurement must produce no EkfDebug and no update"
+        );
     }
 
     let s = ekf.state();
-    assert_eq!(s.lane_age_ms, 3000, "lane_age_ms must saturate-add up to exactly the elapsed dropout time");
+    assert_eq!(
+        s.lane_age_ms, 3000,
+        "lane_age_ms must saturate-add up to exactly the elapsed dropout time"
+    );
 
     // Bounded, not diverged: small residual bias over 3 s should only drift
     // the estimate by a small amount, never blow up or go NaN.
@@ -154,7 +189,10 @@ fn lane_dropout_coasts_without_diverging() {
     assert!(s.heading_err_rad.is_finite() && s.heading_err_rad.abs() < 0.5);
 
     for (i, (&before, &after)) in p0.iter().zip(s.p_diag.iter()).enumerate() {
-        assert!(after > before, "P[{i}] should grow through a dropout: {before} -> {after}");
+        assert!(
+            after > before,
+            "P[{i}] should grow through a dropout: {before} -> {after}"
+        );
     }
 }
 
@@ -169,12 +207,20 @@ fn zero_rate_update_converges_gyro_bias() {
 
     // Stationary: throttle is zero and neither encoder ticks between samples.
     let mut t_us = 0u32;
-    let mut wheel = WheelSensors { ticks_left: 0, ticks_right: 0, t_us };
+    let mut wheel = WheelSensors {
+        ticks_left: 0,
+        ticks_right: 0,
+        t_us,
+    };
     ekf.correct_wheel_sensors(&wheel, 0.0, true_bias, &cfg); // seeds last_wheel only
 
     for _ in 0..80 {
         t_us += 100_000; // 100 ms, 10 Hz
-        wheel = WheelSensors { ticks_left: 0, ticks_right: 0, t_us };
+        wheel = WheelSensors {
+            ticks_left: 0,
+            ticks_right: 0,
+            t_us,
+        };
         // gyro reads true yaw rate (0, stationary) + bias.
         ekf.correct_wheel_sensors(&wheel, 0.0, true_bias, &cfg);
     }
@@ -197,13 +243,25 @@ fn nis_gate_rejects_outlier_measurement() {
     let mut ekf = Ekf::at_rest(params(), [1e-4, 1e-4, 1e-4, 1e-4, 1e-6]);
 
     let outlier = lane_measurement(5.0, 0.0, 0.0, 0); // 5 m cross-track: nonsense
-    let debug = ekf.correct_camera(&outlier, &cfg).expect("a valid measurement always produces a debug frame");
+    let debug = ekf
+        .correct_camera(&outlier, &cfg)
+        .expect("a valid measurement always produces a debug frame");
 
-    assert!(debug.gated, "an outlier this far from the belief must be gated");
-    assert!(debug.nis > cfg.nis_gate, "NIS should exceed the gate: {}", debug.nis);
+    assert!(
+        debug.gated,
+        "an outlier this far from the belief must be gated"
+    );
+    assert!(
+        debug.nis > cfg.nis_gate,
+        "NIS should exceed the gate: {}",
+        debug.nis
+    );
 
     let s = ekf.state();
-    assert!(s.cross_track_m.abs() < 1e-6, "a gated measurement must not move the state");
+    assert!(
+        s.cross_track_m.abs() < 1e-6,
+        "a gated measurement must not move the state"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +305,10 @@ fn lookahead_reconstruction_round_trips_through_camera_model() {
 
     assert!(!debug.gated, "an exact match must not be gated");
     for (i, innov) in debug.innovation.iter().enumerate() {
-        assert!(innov.abs() < 1e-4, "innovation[{i}] should be ~0, got {innov}");
+        assert!(
+            innov.abs() < 1e-4,
+            "innovation[{i}] should be ~0, got {innov}"
+        );
     }
 }
 
@@ -266,7 +327,10 @@ fn sign_convention_left_offset_yields_positive_cross_track_and_right_steer() {
     ekf.correct_camera(&meas, &cfg);
 
     let s = ekf.state();
-    assert!(s.cross_track_m > 0.0, "a positive lane offset must move the estimate positive, not negative");
+    assert!(
+        s.cross_track_m > 0.0,
+        "a positive lane offset must move the estimate positive, not negative"
+    );
 
     // Mirrors the ported control law (plan §2.7, §10): both feedback terms
     // carry a PLUS sign, so a positive estimate must yield a positive
@@ -274,7 +338,10 @@ fn sign_convention_left_offset_yields_positive_cross_track_and_right_steer() {
     let k_lat = 181.17_f32;
     let k_head = 2.024_f32;
     let steer_deg = k_lat * s.cross_track_m + k_head * s.heading_err_rad;
-    assert!(steer_deg > 0.0, "steer must be positive (right) for a positive cross-track error, got {steer_deg}");
+    assert!(
+        steer_deg > 0.0,
+        "steer must be positive (right) for a positive cross-track error, got {steer_deg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -285,25 +352,51 @@ fn odometry_disabled_when_metres_per_tick_is_uncalibrated() {
     let cfg = cfg(0.0); // matches config/rover.toml's shipped, uncalibrated value
     let mut ekf = Ekf::at_rest(params(), [1e-2, 1e-2, 1e-2, 1e-2, 1e-4]);
 
-    let w1 = WheelSensors { ticks_left: 0, ticks_right: 0, t_us: 0 };
-    let w2 = WheelSensors { ticks_left: 50, ticks_right: 52, t_us: 100_000 }; // moving
+    let w1 = WheelSensors {
+        ticks_left: 0,
+        ticks_right: 0,
+        t_us: 0,
+    };
+    let w2 = WheelSensors {
+        ticks_left: 50,
+        ticks_right: 52,
+        t_us: 100_000,
+    }; // moving
 
     ekf.correct_wheel_sensors(&w1, 0.5, 0.0, &cfg);
     let speed_before = ekf.state().speed_mps;
     ekf.correct_wheel_sensors(&w2, 0.5, 0.0, &cfg);
     let speed_after = ekf.state().speed_mps;
 
-    assert!(ekf.odometry_disabled(), "odometry must self-disable when metres_per_tick == 0.0");
-    assert_eq!(speed_before, speed_after, "a disabled odometry update must not touch the speed estimate");
+    assert!(
+        ekf.odometry_disabled(),
+        "odometry must self-disable when metres_per_tick == 0.0"
+    );
+    assert_eq!(
+        speed_before, speed_after,
+        "a disabled odometry update must not touch the speed estimate"
+    );
 }
 
 #[test]
 fn odometry_updates_speed_once_calibrated() {
     let cfg = cfg(0.001); // pretend calibration: 1 mm/tick
-    let mut ekf = Ekf::new(params(), StateVector::zeros(), [1e-2, 1e-2, 1e-2, 1e-2, 1e-4]);
+    let mut ekf = Ekf::new(
+        params(),
+        StateVector::zeros(),
+        [1e-2, 1e-2, 1e-2, 1e-2, 1e-4],
+    );
 
-    let w1 = WheelSensors { ticks_left: 0, ticks_right: 0, t_us: 0 };
-    let w2 = WheelSensors { ticks_left: 200, ticks_right: 200, t_us: 100_000 }; // 100 ms, 200 ticks/wheel
+    let w1 = WheelSensors {
+        ticks_left: 0,
+        ticks_right: 0,
+        t_us: 0,
+    };
+    let w2 = WheelSensors {
+        ticks_left: 200,
+        ticks_right: 200,
+        t_us: 100_000,
+    }; // 100 ms, 200 ticks/wheel
 
     ekf.correct_wheel_sensors(&w1, 0.5, 0.0, &cfg);
     ekf.correct_wheel_sensors(&w2, 0.5, 0.0, &cfg);
@@ -356,7 +449,9 @@ fn gated_measurements_do_not_refresh_lane_age() {
         ekf.predict(0.0, DT, &cfg);
         if step % 3 == 0 {
             received += 1;
-            if let Some(dbg) = ekf.correct_camera(&lane_measurement(5.0, 1.5, 3.0, step * 10_000), &cfg) {
+            if let Some(dbg) =
+                ekf.correct_camera(&lane_measurement(5.0, 1.5, 3.0, step * 10_000), &cfg)
+            {
                 if dbg.gated {
                     gated += 1;
                 }
