@@ -46,7 +46,6 @@ use rover_msgs::{
     ChassisCommand, Command, CommandFrame, EkfDebug, ImuSample, LaneMeasurement, MissionStatus,
     RoverState, SpeedLoopDebug, WheelSensors,
 };
-use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -81,22 +80,15 @@ fn main() {
         std::process::exit(1);
     });
 
-    let bind_addr = bus_config.addr_of(PeerId::Rpi).unwrap_or_else(|| {
-        eprintln!("rover-control: config has no [hosts]/[ports] entry for `rpi`");
+    let bind_addr = bus_config.addr_of(PeerId::Control).unwrap_or_else(|| {
+        eprintln!("rover-control: config has no [services] entry for `control`");
         std::process::exit(1);
     });
-    let mut peers = HashMap::new();
-    for peer in PeerId::ALL {
-        if peer != PeerId::Rpi {
-            if let Some(addr) = bus_config.addr_of(peer) {
-                peers.insert(peer, addr);
-            }
-        }
-    }
-    let link = UdpLink::bind(PeerId::Rpi, bind_addr, peers).unwrap_or_else(|e| {
-        eprintln!("rover-control: binding as `rpi` on {bind_addr}: {e}");
-        std::process::exit(1);
-    });
+    let link = UdpLink::bind(PeerId::Control, bind_addr, bus_config.peers().clone())
+        .unwrap_or_else(|e| {
+            eprintln!("rover-control: binding as `control` on {bind_addr}: {e}");
+            std::process::exit(1);
+        });
 
     let (inbound_tx, inbound_rx) = mpsc::channel::<Inbound>();
     let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>();

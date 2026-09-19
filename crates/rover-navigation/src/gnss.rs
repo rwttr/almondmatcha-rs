@@ -16,7 +16,7 @@
 use crate::nmea;
 use crate::spresense_json;
 use crate::time_utils::civil_to_unix_ms;
-use rover_msgs::{FixQuality, GnssFix};
+use rover_msgs::{FixQuality, GnssFix, GnssSource};
 
 /// Horizontal accuracy placeholder for the Spresense.
 ///
@@ -89,7 +89,13 @@ impl Default for UbloxAssembler {
 impl UbloxAssembler {
     pub fn new() -> Self {
         Self {
-            fix: GnssFix::default(),
+            // Explicit rather than relying on `GnssSource::default()`
+            // happening to be `Rtk`: this is the field the RTK-vs-backup
+            // design defect (D2) exists to fix, so it must never be implicit.
+            fix: GnssFix {
+                source: GnssSource::Rtk,
+                ..Default::default()
+            },
             date: None,
         }
     }
@@ -186,6 +192,7 @@ impl SpresenseAssembler {
             speed_mps: 0.0,
             course_deg: 0.0,
             utc_ms: parse_spresense_datetime(&parsed.time_str).unwrap_or(0),
+            source: GnssSource::Backup,
         })
     }
 }
@@ -250,6 +257,11 @@ mod ublox_assembler_tests {
         let fix = a.ingest(&gga).unwrap();
         assert_eq!(fix.fix, FixQuality::Autonomous);
         assert_eq!(fix.utc_ms, 0, "no RMC seen yet, so no date to combine");
+        assert_eq!(
+            fix.source,
+            GnssSource::Rtk,
+            "the u-blox is always the RTK source, regardless of its current fix quality (D2)"
+        );
     }
 
     #[test]
@@ -326,6 +338,7 @@ mod spresense_assembler_tests {
         assert_eq!(fix.speed_mps, 0.0);
         assert_eq!(fix.course_deg, 0.0);
         assert!(fix.utc_ms > 0);
+        assert_eq!(fix.source, GnssSource::Backup);
     }
 
     #[test]

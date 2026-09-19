@@ -21,34 +21,30 @@ use std::time::{Duration, Instant};
 /// but `BusConfig` treats an unrouted type as "no destinations" rather than
 /// an error, so a minimal config is a legitimate one, not a stand-in.
 const CONFIG: &str = r#"
-    [hosts]
-    rpi  = "127.0.0.1"
-    base = "127.0.0.1"
-
-    [ports]
-    rpi  = 7001
-    base = 7005
+    [services]
+    control = "127.0.0.1:7001"
+    base    = "127.0.0.1:7030"
 
     [routes]
     ImuSample    = ["base"]
     Telemetry    = ["base"]
-    CommandFrame = ["rpi"]
+    CommandFrame = ["control"]
 "#;
 
 #[test]
 fn command_handshake_and_stream_complete_over_real_udp_sockets() {
     let config = BusConfig::parse(CONFIG).expect("test config must parse");
 
-    let mut rover_link = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+    let mut rover_link = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
     let mut base_link = UdpLink::bind(PeerId::Base, "127.0.0.1:0", HashMap::new()).unwrap();
     let rover_addr = rover_link.local_addr().unwrap();
     let base_addr = base_link.local_addr().unwrap();
-    // The config's own [ports] (7001/7005) are never dialled: peer addresses
-    // for a `Link` come from its own table, which is exactly what lets this
-    // test bind to ephemeral ports instead. See rover-link's own tests for
-    // the same pattern in isolation.
+    // The config's own [services] ports (7001/7030) are never dialled: peer
+    // addresses for a `Link` come from its own table, which is exactly what
+    // lets this test bind to ephemeral ports instead. See rover-link's own
+    // tests for the same pattern in isolation.
     rover_link.set_peer(PeerId::Base, base_addr);
-    base_link.set_peer(PeerId::Rpi, rover_addr);
+    base_link.set_peer(PeerId::Control, rover_addr);
 
     let mut rover_bus = Bus::new(rover_link, config.clone());
     let mut base_bus = Bus::new(base_link, config);

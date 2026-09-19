@@ -227,14 +227,11 @@ mod tests {
             .unwrap_or_default();
         let text = format!(
             r#"
-            [hosts]
-            rpi = "127.0.0.1"
-
-            [ports]
-            rpi = 7001
+            [services]
+            control = "127.0.0.1:7001"
 
             [routes]
-            ImuSample = ["rpi"]
+            ImuSample = ["control"]
 
             {mirror_line}
             "#
@@ -278,7 +275,7 @@ mod tests {
 
         let config = config_with_mirror(Some(&mirror_sock.local_addr().unwrap().to_string()));
         let mut peers = HashMap::new();
-        peers.insert(PeerId::Rpi, route_sock.local_addr().unwrap());
+        peers.insert(PeerId::Control, route_sock.local_addr().unwrap());
         let link = UdpLink::bind(PeerId::Base, "127.0.0.1:0", peers).unwrap();
         let mut bus = Bus::new(link, config);
 
@@ -311,7 +308,7 @@ mod tests {
 
         let config = config_with_mirror(Some(&dead_addr.to_string()));
         let mut peers = HashMap::new();
-        peers.insert(PeerId::Rpi, route_sock.local_addr().unwrap());
+        peers.insert(PeerId::Control, route_sock.local_addr().unwrap());
         let link = UdpLink::bind(PeerId::Base, "127.0.0.1:0", peers).unwrap();
         let mut bus = Bus::new(link, config);
 

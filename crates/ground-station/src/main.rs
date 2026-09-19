@@ -132,7 +132,7 @@ fn main() {
         "ground-station ready, bound {bind_addr}, logging to {}",
         args.log_file.display()
     );
-    println!("commands: estop | cancel | goal <lat> <lon> | speed <pct> | nop");
+    println!("commands: estop | clearestop | cancel | goal <lat> <lon> | speed <pct> | nop");
 
     let mut next_redraw = Instant::now();
 

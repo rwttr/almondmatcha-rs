@@ -25,42 +25,44 @@
 //! `HealthBits::LANE_STALE` comes from `RoverState::lane_age_ms`, which the
 //! estimator already computes — see `health.rs`.
 //!
-//! # Known cross-cutting gaps (see also `rover-navigation`'s `main.rs`)
+//! # Two cross-cutting gaps that used to live here, now fixed
 //!
-//! 1. **Same one-port-per-host issue.** This process binds `PeerId::Rpi`
-//!    exactly like `rover-navigation` and (presumably) `rover-control` do,
-//!    which collide under the current `config/rover.toml` schema. See
-//!    `rover-navigation`'s `main.rs` doc comment for the full explanation;
-//!    it is not repeated per-binary here.
-//! 2. **`GnssFix` cannot self-identify as rtk/backup on the wire.** This
-//!    process uses `gnss_source::classify` as a best-effort heuristic — sound
-//!    for a genuinely good RTK fix, ambiguous only while the u-blox itself
-//!    has nothing better than `Autonomous` to report. See `gnss_source.rs`.
-//! 3. **`last_cmd_seq` is computed independently, not shared via IPC.** This
-//!    process runs its own `rover_bus::CommandReceiver`, fed by whatever
-//!    `CommandFrame`s it itself receives. `CommandReceiver::apply` is a pure
-//!    function of the sequence of frames seen so far, so as long as this
-//!    process and `rover-navigation` observe the same frames, they agree on
-//!    `last_applied` without talking to each other — no shared state needed
-//!    for *this* value specifically. (Whether they mechanically *can* both
-//!    observe the same frames is gap 1, above.)
+//! `docs/RUST_REWRITE_PLAN.md` §13.3b, D1 and D2:
+//!
+//! 1. **One UDP port per host, three RPi processes.** This process now binds
+//!    `PeerId::Telemetry`'s own address from `[services]`, not a `"rpi"`
+//!    entry shared with `rover-control`/`rover-navigation` — see
+//!    `rover-link::PeerId`'s doc comment for the fix (D1).
+//! 2. **`GnssFix` could not self-identify as rtk/backup on the wire.** Fixed
+//!    by `GnssFix::source` (D2): this process reads it directly instead of
+//!    guessing from `FixQuality` (the old `gnss_source::classify` heuristic,
+//!    now deleted).
+//!
+//! # A remaining gap
+//!
+//! **`last_cmd_seq` is computed independently, not shared via IPC.** This
+//! process runs its own `rover_bus::CommandReceiver`, fed by whatever
+//! `CommandFrame`s it itself receives (routed to `telemetry` alongside
+//! `control` and `navigation` — see `config/rover.toml`). `CommandReceiver::
+//! apply` is a pure function of the sequence of frames seen so far, so as
+//! long as every process observes the same frames, they all agree on
+//! `last_applied` without talking to each other — no shared state needed for
+//! *this* value specifically.
 
 mod config;
 mod csv_fmt;
 mod csv_writer;
-mod gnss_source;
 mod health;
 mod runs;
 
 use csv_writer::CsvLogger;
-use gnss_source::{classify, GnssSource};
 use health::stall::StallDetector;
 use health::{compute_health, FeedAges};
 use rover_bus::{Bus, BusConfig, CommandReceiver};
 use rover_link::{PeerId, UdpLink};
 use rover_msgs::{
-    ChassisStatus, CommandFrame, GnssFix, MissionStatus, PowerSample, RoverState, SpeedLoopDebug,
-    Telemetry,
+    ChassisStatus, CommandFrame, GnssFix, GnssSource, MissionStatus, PowerSample, RoverState,
+    SpeedLoopDebug, Telemetry,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -136,15 +138,15 @@ fn main() {
         std::process::exit(1);
     });
 
-    let bind_addr = bus_config.addr_of(PeerId::Rpi).unwrap_or_else(|| {
+    let bind_addr = bus_config.addr_of(PeerId::Telemetry).unwrap_or_else(|| {
         log::error!(
-            "no [hosts]/[ports] entry for `rpi` in {}",
+            "no [services] entry for `telemetry` in {}",
             args.config.display()
         );
         std::process::exit(1);
     });
-    let link =
-        UdpLink::bind(PeerId::Rpi, bind_addr, bus_config.peers().clone()).unwrap_or_else(|e| {
+    let link = UdpLink::bind(PeerId::Telemetry, bind_addr, bus_config.peers().clone())
+        .unwrap_or_else(|e| {
             log::error!("binding {bind_addr}: {e}");
             std::process::exit(1);
         });
@@ -218,7 +220,9 @@ fn main() {
         let state = state.clone();
         bus.subscribe::<GnssFix>(move |fix| {
             let mut s = state.borrow_mut();
-            match classify(&fix) {
+            // Self-describing since D2 (plan §13.3b) — no more guessing from
+            // `FixQuality`. See `rover_msgs::GnssSource`'s doc comment.
+            match fix.source {
                 GnssSource::Rtk => {
                     s.rtk_fix = fix;
                     s.rtk_seen = Some(Instant::now());

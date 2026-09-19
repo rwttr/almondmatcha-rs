@@ -8,38 +8,49 @@
 # source file and this file, this file is wrong or the source file is.
 
 # ---------------------------------------------------------------------------
-# Hosts. Static IPs on a private wired LAN; there is no discovery anywhere in
-# this system, by design.
-# ---------------------------------------------------------------------------
-[hosts]
-rpi     = "192.168.1.1"
-chassis = "192.168.1.2"
-jetson  = "192.168.1.5"
-sensors = "192.168.1.6"
-base    = "192.168.1.10"
-
-[ports]
-# One UDP port per receiving host. Type IDs demultiplex within a port, so
-# adding a message type never needs a firewall or config change.
-rpi     = 7001
-chassis = 7002
-jetson  = 7003
-sensors = 7004
-base    = 7005
-
-# ---------------------------------------------------------------------------
-# Routing: which hosts receive each message type.
+# Services. Static IPs on a private wired LAN; there is no discovery anywhere
+# in this system, by design.
 #
-# Unicast fan-out from a static table, NOT multicast. With five hosts and
+# Design defect D1 (docs/RUST_REWRITE_PLAN.md §13.3b): this used to be
+# [hosts] (name -> IP) plus [ports] (name -> one UDP port), giving each
+# *host* exactly one port. The RPi runs three separate receiving processes —
+# rover-control, rover-navigation, rover-telemetry — which all bound the same
+# "rpi" port and collided (`EADDRINUSE`) on real hardware; nothing caught it
+# because nothing had run on hardware yet. The bus routes to *processes*, not
+# machines, so this table names one full `host:port` per process instead.
+# Three of these (control/navigation/telemetry) share the RPi's IP but have
+# distinct ports; the rest are one process per machine, same as before.
+# ---------------------------------------------------------------------------
+[services]
+control    = "192.168.1.1:7001"
+navigation = "192.168.1.1:7002"
+telemetry  = "192.168.1.1:7003"
+chassis    = "192.168.1.2:7010"
+sensors    = "192.168.1.6:7011"
+perception = "192.168.1.5:7020"
+base       = "192.168.1.10:7030"
+
+# ---------------------------------------------------------------------------
+# Routing: which services receive each message type.
+#
+# Unicast fan-out from a static table, NOT multicast. With seven services and
 # sub-200-byte messages the duplication costs nothing, and it removes the IGMP
 # dependency that forced a hand-maintained initialPeersList in the ROS 2 system.
+#
+# A type may name several destinations — worked out from what each binary
+# actually subscribes to (`rover-*/src/main.rs`), not guessed. A type absent
+# from this table (`MagSample`, `MotionSetpoint`, `EkfDebug`) has no current
+# subscriber; publishing it still costs nothing (`Bus::publish` treats an
+# unrouted type as "no destinations", not an error — see `rover-bus`), and it
+# still reaches `[debug] mirror` when that is set. Add a destination here the
+# day something actually consumes one of them.
 # ---------------------------------------------------------------------------
 # Optional firehose mirror for debugging.
 #
-# Unicast fan-out means a passive tap only sees traffic addressed to the host
-# it binds as: rover-tap bound as `rpi` cannot see ChassisCommand (routed to
-# chassis) or Telemetry (routed to base), and cannot co-bind with a real
-# listener on the same port. That is inherent to unicast, not a bug.
+# Unicast fan-out means a passive tap only sees traffic addressed to the
+# service it binds as, and cannot co-bind with a real listener on the same
+# port — see `rover-tap`'s own doc comment. That is inherent to unicast, not
+# a bug.
 #
 # When `mirror` is set, every published frame is additionally sent there, so
 # one rover-tap sees the whole bus from anywhere on the LAN. Costs one extra
@@ -49,25 +60,32 @@ base    = 7005
 mirror = ""                   # e.g. "192.168.1.100:7099"
 
 [routes]
-ImuSample       = ["rpi"]
-MagSample       = ["rpi"]
-ChassisStatus   = ["rpi"]
+# ImuSample/WheelSensors/LaneMeasurement feed the estimator and speed loop,
+# both in rover-control.
+ImuSample       = ["control"]
+ChassisStatus   = ["telemetry"]
 ChassisCommand  = ["chassis"]
-WheelSensors    = ["rpi"]
-PowerSample     = ["rpi"]
-GnssFix         = ["rpi"]
-LaneMeasurement = ["rpi"]
-RoverState      = ["rpi"]
-MotionSetpoint  = ["rpi"]
-MissionStatus   = ["rpi"]
+WheelSensors    = ["control"]
+PowerSample     = ["telemetry"]
+# rover-telemetry fills Telemetry::rtk/backup from this; rover-control does
+# not subscribe to it (navigation already resolved rtk-vs-backup upstream).
+GnssFix         = ["telemetry"]
+LaneMeasurement = ["control"]
+RoverState      = ["telemetry"]
+# rover-control gates driving on MissionStatus.active; rover-telemetry logs
+# and relays it in Telemetry::mission.
+MissionStatus   = ["control", "telemetry"]
 # Also to "sensors": that board publishes only, so it has no command stream
 # to time out on. Telemetry is its liveness heartbeat — without it its mirror
 # watchdog (plan §5.2) would read as permanently tripped, which is exactly the
 # false alarm that teaches people to ignore a warning LED.
 Telemetry       = ["base", "sensors"]
-CommandFrame    = ["rpi"]
-SpeedLoopDebug  = ["rpi"]
-EkfDebug        = ["rpi"]
+# Every process that runs its own rover_bus::CommandReceiver needs the same
+# CommandFrame stream: rover-control (applies Command to the safety gate /
+# speed limit), rover-navigation (mission state machine), and rover-telemetry
+# (its own last_cmd_seq bookkeeping — see its main.rs doc comment).
+CommandFrame    = ["control", "navigation", "telemetry"]
+SpeedLoopDebug  = ["telemetry"]
 
 # ---------------------------------------------------------------------------
 # Drivetrain

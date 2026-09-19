@@ -56,6 +56,7 @@ macro_rules! all_types {
             speed_mps: 0.185,
             course_deg: 271.5,
             utc_ms: 1_700_000_000_123,
+            source: GnssSource::Rtk,
         });
         $mac!(LaneMeasurement {
             curvature_inv_m: 0.0325,
@@ -132,6 +133,7 @@ macro_rules! all_types {
                 speed_mps: 0.185,
                 course_deg: 271.5,
                 utc_ms: 1_700_000_000_123,
+                source: GnssSource::Rtk,
             },
             backup: GnssFix {
                 lat_deg: 7.006_8,
@@ -143,6 +145,7 @@ macro_rules! all_types {
                 speed_mps: 0.19,
                 course_deg: 270.0,
                 utc_ms: 1_700_000_000_000,
+                source: GnssSource::Backup,
             },
             last_cmd_seq: 9001,
             health: HealthBits(0b0000_0100),

@@ -30,7 +30,7 @@ use embassy_time::{Duration, Ticker};
 use ina226::{Config, INA226, AVG, MODE, VBUSCT, VSHCT};
 use rover_msgs::{encode_frame, PowerSample, Wire};
 
-use crate::config::{INA226_ADDR, POWER_PUBLISH_HZ, RPI_IP, RPI_PORT, SHUNT_OHMS};
+use crate::config::{INA226_ADDR, POWER_PUBLISH_HZ, POWER_SAMPLE_DEST, SHUNT_OHMS};
 
 /// `embassy_stm32::i2c::I2c` implements `embedded_hal::i2c::I2c` directly
 /// (unlike the LSM6DSV16X driver on the chassis board, the INA226 crate needs
@@ -98,7 +98,7 @@ pub async fn publish_task(mut power: Power, stack: embassy_net::Stack<'static>) 
 
         let n = encode_frame(&sample, seq, &mut buf);
         seq = seq.wrapping_add(1);
-        let _ = socket.send_to(&buf[..n], (RPI_IP, RPI_PORT)).await;
+        let _ = socket.send_to(&buf[..n], POWER_SAMPLE_DEST).await;
     }
 }
 

@@ -10,14 +10,39 @@
 
 use embassy_net::Ipv4Address;
 
-/// `[hosts] sensors` / `[ports] sensors` - this board's own address.
+/// `[services] sensors` - this board's own address.
+///
+/// # Design defect D1 (`docs/RUST_REWRITE_PLAN.md` §13.3b)
+///
+/// `config/rover.toml` used to give one UDP port per *host*, under `[hosts]`/
+/// `[ports]`, which put three separate RPi processes on the same "rpi" port —
+/// only one could actually bind it. `[services]` now maps a service name
+/// straight to a `host:port`, one per *process*, so the RPi side below is
+/// `CONTROL_ADDR`/`TELEMETRY_ADDR` (two different ports on the same IP)
+/// instead of a single `RPI_IP`/`RPI_PORT` pair.
 pub const SELF_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 6);
-pub const SELF_PORT: u16 = 7004;
+pub const SELF_PORT: u16 = 7011;
 
-/// `[hosts] rpi` / `[ports] rpi` - `[routes]` sends `WheelSensors` and
-/// `PowerSample` only to `["rpi"]`, so there is exactly one publish peer.
-pub const RPI_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-pub const RPI_PORT: u16 = 7001;
+/// `[services] control` address. `rover-control` subscribes to
+/// `WheelSensors` (`[routes]`) for the speed loop and odometry.
+pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7001);
+
+/// `[services] telemetry` address. `rover-telemetry` subscribes to
+/// `WheelSensors` (for its liveness bookkeeping) and `PowerSample`, and this
+/// board watches *inbound* `Telemetry` from here as its own link-watchdog
+/// heartbeat — see `watchdog.rs`.
+pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
+
+/// Per-message-type destination table.
+///
+/// `WheelSensors` is the one message on this rover that needs two
+/// destinations — `control` for the speed loop, `telemetry` for its CSV and
+/// liveness bookkeeping — so it is a slice, not a single address; every
+/// other message here still needs only one. That asymmetry is exactly what
+/// `docs/RUST_REWRITE_PLAN.md`'s D1 fix anticipates: "no message needs more
+/// than two destinations, so the cost on the MCUs is one extra `send_to`."
+pub const WHEEL_SENSORS_DESTS: [(Ipv4Address, u16); 2] = [CONTROL_ADDR, TELEMETRY_ADDR];
+pub const POWER_SAMPLE_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed), same scheme as
 /// `firmware/chassis/src/config.rs` - last octet mirrors the host part of

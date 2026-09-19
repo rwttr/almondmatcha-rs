@@ -89,7 +89,11 @@ impl Mission {
     ///
     /// `SetSpeedLimit` and `Nop` are not mission-state transitions: the speed
     /// cap is `rover-control`'s actuation task's concern (plan §8.3), and
-    /// `Nop` exists only so the base can prove the link works.
+    /// `Nop` exists only so the base can prove the link works. `ClearEStop`
+    /// likewise does not touch mission state — it only releases
+    /// `rover-control::actuate::SafetyGate`'s E-stop latch, on the process
+    /// that owns it; a faulted mission still needs a fresh `SetMissionGoal`
+    /// to re-arm (see below).
     ///
     /// A new `SetMissionGoal` always re-arms, from *any* current state —
     /// including `Fault` and `Cancelled`. This is what gives an operator (or
@@ -112,7 +116,7 @@ impl Mission {
                 // driving; it is not the safety mechanism.
                 self.state = MissionState::Fault;
             }
-            Command::SetSpeedLimit(_) | Command::Nop => {}
+            Command::SetSpeedLimit(_) | Command::Nop | Command::ClearEStop => {}
         }
     }
 
@@ -357,6 +361,17 @@ mod mission_tests {
         m.apply_command(Command::SetSpeedLimit(50));
         m.apply_command(Command::Nop);
         assert_eq!(m.state(), MissionState::Running);
+    }
+
+    #[test]
+    fn clear_estop_does_not_change_mission_state() {
+        // ClearEStop only releases rover-control's SafetyGate latch; a
+        // faulted mission still needs a fresh SetMissionGoal to re-arm.
+        let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
+        m.apply_command(Command::EStop);
+        assert_eq!(m.state(), MissionState::Fault);
+        m.apply_command(Command::ClearEStop);
+        assert_eq!(m.state(), MissionState::Fault);
     }
 
     #[test]

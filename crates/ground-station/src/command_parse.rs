@@ -33,7 +33,7 @@ impl fmt::Display for ParseCommandError {
             ParseCommandError::UnknownCommand => {
                 write!(
                     f,
-                    "unknown command (try: estop, cancel, goal <lat> <lon>, speed <pct>, nop)"
+                    "unknown command (try: estop, clearestop, cancel, goal <lat> <lon>, speed <pct>, nop)"
                 )
             }
             ParseCommandError::BadArgCount { expected, got } => {
@@ -47,10 +47,17 @@ impl fmt::Display for ParseCommandError {
 
 /// Parse one line of operator input.
 ///
-/// `estop`/`e` and `cancel`/`c` take no arguments; `goal <lat> <lon>`/`g <lat>
-/// <lon>` takes two; `speed <pct>`/`s <pct>` takes one, `0..=100`; `nop`
-/// takes none. Matching is case-insensitive on the command word so `ESTOP`
-/// under stress is as valid as `estop`.
+/// `estop`/`e`, `clearestop`/`ce`, and `cancel`/`c` take no arguments; `goal
+/// <lat> <lon>`/`g <lat> <lon>` takes two; `speed <pct>`/`s <pct>` takes one,
+/// `0..=100`; `nop` takes none. Matching is case-insensitive on the command
+/// word so `ESTOP` under stress is as valid as `estop`.
+///
+/// `clearestop` is deliberately a distinct word from `cancel`, not an alias:
+/// `rover-control::actuate::SafetyGate` used to release its E-stop latch on
+/// `Command::CancelMission`, which was flagged as surprising (cancelling a
+/// mission is not obviously "please let me drive again"). `Command::
+/// ClearEStop` is the explicit, unambiguous release; `cancel` no longer
+/// touches the E-stop latch at all.
 pub fn parse_command(line: &str) -> Result<Command, ParseCommandError> {
     let mut parts = line.split_whitespace();
     let word = parts.next().ok_or(ParseCommandError::Empty)?.to_lowercase();
@@ -60,6 +67,10 @@ pub fn parse_command(line: &str) -> Result<Command, ParseCommandError> {
         "estop" | "e" => {
             require_args(&args, 0)?;
             Ok(Command::EStop)
+        }
+        "clearestop" | "ce" => {
+            require_args(&args, 0)?;
+            Ok(Command::ClearEStop)
         }
         "cancel" | "c" => {
             require_args(&args, 0)?;
@@ -113,6 +124,13 @@ mod tests {
     fn cancel_and_its_alias() {
         assert_eq!(parse_command("cancel"), Ok(Command::CancelMission));
         assert_eq!(parse_command("c"), Ok(Command::CancelMission));
+    }
+
+    #[test]
+    fn clearestop_and_its_alias() {
+        assert_eq!(parse_command("clearestop"), Ok(Command::ClearEStop));
+        assert_eq!(parse_command("ce"), Ok(Command::ClearEStop));
+        assert_eq!(parse_command("CLEARESTOP"), Ok(Command::ClearEStop));
     }
 
     #[test]

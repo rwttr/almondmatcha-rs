@@ -53,7 +53,7 @@ use rover_msgs::{frame::encode_frame, ChassisCommand, ChassisStatus, FaultBits, 
 
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::config::{IWDG_TIMEOUT_US, RPI_IP, RPI_PORT, STATUS_PUBLISH_HZ};
+use crate::config::{CHASSIS_STATUS_DEST, IWDG_TIMEOUT_US, STATUS_PUBLISH_HZ};
 use crate::watchdog::{CMD_SIGNAL, STATUS};
 
 /// Marks the IMU as absent in [`ChassisStatus::fault`].
@@ -178,7 +178,7 @@ async fn status_task(stack: Stack<'static>) -> ! {
         let n = encode_frame(&status, seq, &mut buf);
         seq = seq.wrapping_add(1);
 
-        if socket.send_to(&buf[..n], (RPI_IP, RPI_PORT)).await.is_err() {
+        if socket.send_to(&buf[..n], CHASSIS_STATUS_DEST).await.is_err() {
             // A full transmit buffer or an unreachable peer. Telemetry is
             // best-effort by design — the next frame is 200 ms away and
             // carries the same state, so dropping this one costs nothing.

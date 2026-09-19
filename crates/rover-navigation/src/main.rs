@@ -6,39 +6,26 @@
 //! [`gnss::SpresenseAssembler`], and a main loop that runs [`mission::Mission`]
 //! and answers [`rover_msgs::CommandFrame`]s from the base station.
 //!
-//! # Two known cross-cutting gaps, not fixed here
+//! # Two cross-cutting gaps that used to live here, now fixed
 //!
-//! Both are protocol/deployment questions that reach outside this crate's
-//! locked dependencies (`rover-msgs`, `rover-bus`, `rover-link`) and are
-//! reported rather than silently patched around, per this task's brief:
+//! `docs/RUST_REWRITE_PLAN.md` §13.3b, D1 and D2 — recorded here because this
+//! file's own history flagged both:
 //!
 //! 1. **One UDP port per host, three RPi processes.** `config/rover.toml`
-//!    gives `PeerId::Rpi` exactly one port. `rover-control`, `rover-navigation`
-//!    and `rover-telemetry` are three separate OS processes that each need to
-//!    *receive* traffic addressed to "rpi" (`CommandFrame` here;
-//!    `ImuSample`/`WheelSensors`/`LaneMeasurement` for `rover-control`;
-//!    `RoverState`/`MissionStatus`/`PowerSample`/`GnssFix` for
-//!    `rover-telemetry`). Only one process can actually bind that port at a
-//!    time under the current schema — `rover-link::UdpLink` does not use
-//!    `SO_REUSEPORT`, and unicast delivery would not fan out to multiple
-//!    listeners even if it did. This binary binds `PeerId::Rpi` the same way
-//!    `rover-tap` does, which is correct in isolation and under test, but it
-//!    will collide (`EADDRINUSE`) with `rover-control`/`rover-telemetry` doing
-//!    the same on real hardware. Resolving it needs a decision in
-//!    `rover-bus`/`rover-link`/`config/rover.toml` (per-service ports, or an
-//!    in-process fan-out) that is out of this crate's scope.
-//! 2. **`GnssFix` cannot self-identify as "rtk" or "backup" on the bus.**
-//!    `rover_msgs::GnssFix` is one `Wire` type with one `TYPE_ID` for both
-//!    receivers by design (see its doc comment), so the bus's newest-wins,
-//!    one-slot-per-type model cannot let a cross-process subscriber tell
-//!    which receiver a given `GnssFix` came from. Within this process that
-//!    is not a problem — `select_navigation_fix` sees both readings
-//!    directly — but any other process subscribing to `GnssFix` over the
-//!    bus (`rover-telemetry`, to fill `Telemetry::rtk`/`Telemetry::backup`)
-//!    cannot reliably do so from this stream alone. See `rover-telemetry`'s
-//!    `main.rs` for how it copes today, and the top-level report for why a
-//!    real fix means adding a discriminant to `GnssFix` (or splitting it
-//!    into two types) in `rover-msgs`.
+//!    used to give `PeerId::Rpi` exactly one port, and `rover-control`,
+//!    `rover-navigation` and `rover-telemetry` all needed to bind it —
+//!    correct in isolation and under test, but an `EADDRINUSE` collision on
+//!    real hardware. Fixed by making `PeerId` a service identity: `[hosts]`/
+//!    `[ports]` collapsed into one `[services]` table with a full `host:port`
+//!    per process, so this binary now binds its own `PeerId::Navigation`
+//!    address. See `rover-link::PeerId`'s doc comment.
+//! 2. **`GnssFix` could not self-identify as "rtk" or "backup" on the bus.**
+//!    `rover_msgs::GnssFix` was one `Wire` type with one `TYPE_ID` for both
+//!    receivers, so a cross-process subscriber (`rover-telemetry`, filling
+//!    `Telemetry::rtk`/`Telemetry::backup`) could not tell which receiver a
+//!    given reading came from. Fixed by `GnssFix::source`: this file's
+//!    `UbloxAssembler`/`SpresenseAssembler` (`gnss.rs`) now set it directly
+//!    at the point each reading is assembled — see `rover_msgs::GnssSource`.
 
 mod config;
 mod geo;
@@ -108,15 +95,15 @@ fn main() {
         std::process::exit(1);
     });
 
-    let bind_addr = bus_config.addr_of(PeerId::Rpi).unwrap_or_else(|| {
+    let bind_addr = bus_config.addr_of(PeerId::Navigation).unwrap_or_else(|| {
         log::error!(
-            "no [hosts]/[ports] entry for `rpi` in {}",
+            "no [services] entry for `navigation` in {}",
             args.config.display()
         );
         std::process::exit(1);
     });
-    let link =
-        UdpLink::bind(PeerId::Rpi, bind_addr, bus_config.peers().clone()).unwrap_or_else(|e| {
+    let link = UdpLink::bind(PeerId::Navigation, bind_addr, bus_config.peers().clone())
+        .unwrap_or_else(|e| {
             log::error!("binding {bind_addr}: {e}");
             std::process::exit(1);
         });

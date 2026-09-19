@@ -89,7 +89,7 @@ use embassy_stm32::{bind_interrupts, Peri};
 use embassy_time::{Duration, Instant, Ticker};
 use rover_msgs::{encode_frame, Wire, WheelSensors};
 
-use crate::config::{ENCODER_PUBLISH_HZ, RPI_IP, RPI_PORT};
+use crate::config::{ENCODER_PUBLISH_HZ, WHEEL_SENSORS_DESTS};
 
 // EXTI5 and EXTI15 each cover a *pin number* shared across all GPIO ports
 // (e.g. PA5/PB5/PC5.../PA15/PB15... all arbitrate the same EXTI line), which
@@ -260,7 +260,11 @@ pub async fn publish_task(stack: embassy_net::Stack<'static>) -> ! {
 
         let n = encode_frame(&sample, seq, &mut buf);
         seq = seq.wrapping_add(1);
-        let _ = socket.send_to(&buf[..n], (RPI_IP, RPI_PORT)).await;
+        // Two destinations: control (speed loop / odometry) and telemetry
+        // (CSV + liveness). See `config::WHEEL_SENSORS_DESTS`.
+        for &dest in WHEEL_SENSORS_DESTS.iter() {
+            let _ = socket.send_to(&buf[..n], dest).await;
+        }
     }
 }
 

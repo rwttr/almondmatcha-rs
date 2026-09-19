@@ -157,7 +157,6 @@ pub async fn task(mut imu: Imu, stack: embassy_net::Stack<'static>) -> ! {
 
         let n = rover_msgs::encode_frame(&sample, seq, &mut buf);
         seq = seq.wrapping_add(1);
-        let remote = (crate::config::RPI_IP, crate::config::RPI_PORT);
-        let _ = socket.send_to(&buf[..n], remote).await;
+        let _ = socket.send_to(&buf[..n], crate::config::IMU_SAMPLE_DEST).await;
     }
 }

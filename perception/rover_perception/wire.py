@@ -109,6 +109,17 @@ class MissionState(IntEnum):
     FAULT = 5
 
 
+class GnssSource(IntEnum):
+    """Which physical receiver a `GnssFix` came from. Mirrors
+    `rover_msgs::GnssSource` -- see its doc comment for why this field
+    exists (design defect D2, docs/RUST_REWRITE_PLAN.md sec 13.3b): a single
+    `GnssFix` type serves both the u-blox and the Spresense, so a subscriber
+    off the wire alone used to have no way to tell them apart."""
+
+    RTK = 0
+    BACKUP = 1
+
+
 # ===========================================================================
 # 0x01xx -- chassis board -> RPi
 # ===========================================================================
@@ -263,13 +274,13 @@ class PowerSample:
 # 0x04xx -- GNSS
 # ===========================================================================
 
-_GNSS_FIX_STRUCT = struct.Struct("<ddfBBfffQ")
+_GNSS_FIX_STRUCT = struct.Struct("<ddfBBfffQB")
 
 
 @dataclass(frozen=True)
 class GnssFix:
     TYPE_ID: ClassVar[int] = 0x0401
-    WIRE_LEN: ClassVar[int] = 42
+    WIRE_LEN: ClassVar[int] = 43
     NAME: ClassVar[str] = "GnssFix"
 
     lat_deg: float
@@ -281,22 +292,27 @@ class GnssFix:
     speed_mps: float
     course_deg: float
     utc_ms: int
+    source: GnssSource
 
     def encode(self) -> bytes:
         return _GNSS_FIX_STRUCT.pack(
             self.lat_deg, self.lon_deg, self.alt_m, int(self.fix), self.sats,
-            self.h_acc_m, self.speed_mps, self.course_deg, self.utc_ms,
+            self.h_acc_m, self.speed_mps, self.course_deg, self.utc_ms, int(self.source),
         )
 
     @classmethod
     def decode(cls, buf: bytes) -> "GnssFix":
         _check_len(buf, cls.WIRE_LEN, cls.NAME)
-        lat, lon, alt, fix_raw, sats, h_acc, speed, course, utc_ms = _GNSS_FIX_STRUCT.unpack_from(buf, 0)
+        lat, lon, alt, fix_raw, sats, h_acc, speed, course, utc_ms, source_raw = _GNSS_FIX_STRUCT.unpack_from(buf, 0)
         try:
             fix = FixQuality(fix_raw)
         except ValueError:
             raise DecodeError(f"GnssFix: invalid discriminant {fix_raw} for field `FixQuality`")
-        return cls(lat, lon, alt, fix, sats, h_acc, speed, course, utc_ms)
+        try:
+            source = GnssSource(source_raw)
+        except ValueError:
+            raise DecodeError(f"GnssFix: invalid discriminant {source_raw} for field `GnssSource`")
+        return cls(lat, lon, alt, fix, sats, h_acc, speed, course, utc_ms, source)
 
 
 # ===========================================================================
@@ -472,6 +488,7 @@ class Command:
     SET_MISSION_GOAL: ClassVar[int] = 2
     CANCEL_MISSION: ClassVar[int] = 3
     ESTOP: ClassVar[int] = 4
+    CLEAR_ESTOP: ClassVar[int] = 5
 
     tag: int
     speed_limit_pct: int = 0
@@ -496,6 +513,10 @@ class Command:
     @classmethod
     def estop(cls) -> "Command":
         return cls(cls.ESTOP)
+
+    @classmethod
+    def clear_estop(cls) -> "Command":
+        return cls(cls.CLEAR_ESTOP)
 
 
 @dataclass(frozen=True)
@@ -534,6 +555,8 @@ class CommandFrame:
             body = Command.cancel_mission()
         elif tag == Command.ESTOP:
             body = Command.estop()
+        elif tag == Command.CLEAR_ESTOP:
+            body = Command.clear_estop()
         else:
             raise DecodeError(f"CommandFrame: invalid discriminant {tag} for field `Command`")
         return cls(cmd_seq, body)

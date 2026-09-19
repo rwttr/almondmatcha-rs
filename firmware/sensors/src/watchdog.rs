@@ -12,31 +12,25 @@
 //! solid off to a fast blink. The point (per the plan) is that someone
 //! standing next to the rover can see the link is down without a laptop.
 //!
-//! # ⚠️ Known integration gap: `config/rover.toml` routes nothing to `sensors`
+//! # The routing this depends on
 //!
-//! This task binds `config::SELF_PORT` (7004, per `[ports] sensors`) and
-//! watches for inbound `Telemetry` frames, exactly as specified. But
-//! `config/rover.toml`'s `[routes]` table is:
+//! This task binds `config::SELF_PORT` (7011, per `[services] sensors`) and
+//! watches for inbound `Telemetry` frames. `config/rover.toml`'s `[routes]`
+//! table does route `Telemetry` here:
 //!
 //! ```text
-//! Telemetry = ["base"]
+//! Telemetry = ["base", "sensors"]
 //! ```
 //!
-//! — and no entry routes *anything* to `"sensors"`. Nothing in the current
-//! configuration ever addresses a datagram to this board. That table lives in
-//! `config/rover.toml`, outside `firmware/sensors/` and outside this task's
-//! scope, so it is not changed here.
-//!
-//! The mechanism below is complete and matches the plan's specification: bind,
-//! wait with a 2 s timeout, log and blink on timeout, go quiet again the
-//! moment a real `Telemetry` frame arrives. What it cannot yet do, absent a
-//! routing change (e.g. `Telemetry = ["base", "sensors"]`, or a lighter
-//! dedicated heartbeat type) or a debug `[debug] mirror` pointed at this
-//! board, is ever see that frame arrive on real hardware. Until that routing
-//! gap is closed, this watchdog will read as permanently tripped in the
-//! field — which is at least an honest, visible failure rather than a
-//! silently-wrong one, but it is not yet exercised end-to-end. Flagged here
-//! and in the top-level task report.
+//! (an earlier draft of this comment described a gap where nothing routed to
+//! `"sensors"` at all — that was fixed in the same config change that added
+//! this comment's correction, and separately by design defect D1 giving this
+//! board its own `[services]` port rather than sharing one with the RPi's
+//! three processes). The mechanism below is complete and matches the plan's
+//! specification: bind, wait with a 2 s timeout, log and blink on timeout, go
+//! quiet again the moment a real `Telemetry` frame arrives. Still not
+//! exercised end-to-end on real hardware — see the plan's §13.4 hardware
+//! verification debt.
 //!
 //! # The IWDG pet site
 //!

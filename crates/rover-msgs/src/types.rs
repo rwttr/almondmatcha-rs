@@ -456,6 +456,43 @@ impl Wire for PowerSample {
 // 0x04xx — GNSS
 // ===========================================================================
 
+/// Which physical receiver a [`GnssFix`] came from.
+///
+/// **Design defect D2** (`docs/RUST_REWRITE_PLAN.md` §13.3b): a single
+/// `GnssFix` type serves both the u-blox and the Spresense, so before this
+/// field existed a subscriber in a different process from
+/// `rover-navigation` had no way to tell them apart from the bus alone.
+/// `rover-telemetry` used to guess from `FixQuality` (see the now-deleted
+/// `gnss_source::classify`) — sound in one direction, but a u-blox in cold
+/// start reporting `Autonomous` was indistinguishable from the backup, and
+/// the RTK stream is what mission logic and the heading reference depend
+/// on. Self-describing beats a heuristic: this field is set once, at the
+/// point each receiver's reading is assembled (`rover-navigation`'s
+/// `UbloxAssembler`/`SpresenseAssembler`), and never has to be inferred
+/// again downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum GnssSource {
+    /// u-blox SimpleRTK2b — the correctable, primary receiver.
+    #[default]
+    Rtk = 0,
+    /// Spresense — uncorrected backup.
+    Backup = 1,
+}
+
+impl GnssSource {
+    pub fn from_u8(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(Self::Rtk),
+            1 => Ok(Self::Backup),
+            _ => Err(DecodeError::BadDiscriminant {
+                field: "GnssSource",
+                value: v,
+            }),
+        }
+    }
+}
+
 /// One GNSS solution.
 ///
 /// A single type serves both receivers — the u-blox SimpleRTK2b and the
@@ -485,6 +522,8 @@ pub struct GnssFix {
     /// being differentiated out of successive positions.
     pub course_deg: f32,
     pub utc_ms: u64,
+    /// Which receiver produced this reading. See [`GnssSource`].
+    pub source: GnssSource,
 }
 
 impl GnssFix {
@@ -501,7 +540,7 @@ impl GnssFix {
 
 impl Wire for GnssFix {
     const TYPE_ID: u16 = 0x0401;
-    const WIRE_LEN: usize = 42;
+    const WIRE_LEN: usize = 43;
     const NAME: &'static str = "GnssFix";
 
     fn encode(&self, buf: &mut [u8]) -> usize {
@@ -515,6 +554,7 @@ impl Wire for GnssFix {
         w.f32(self.speed_mps);
         w.f32(self.course_deg);
         w.u64(self.utc_ms);
+        w.u8(self.source as u8);
         w.len()
     }
 
@@ -531,6 +571,7 @@ impl Wire for GnssFix {
             speed_mps: r.f32(),
             course_deg: r.f32(),
             utc_ms: r.u64(),
+            source: GnssSource::from_u8(r.u8())?,
         })
     }
 }
@@ -869,6 +910,16 @@ pub enum Command {
     /// arrive in order to fire. Never design safety around this reaching the
     /// rover.
     EStop,
+    /// Explicitly release an [`Command::EStop`] latch.
+    ///
+    /// Added because `rover-control::actuate::SafetyGate` used to clear the
+    /// E-stop latch on `CancelMission` — a judgement call the previous pass
+    /// flagged as surprising: an operator pressing "cancel mission" to
+    /// resume from an emergency stop is not an obviously safe reading of
+    /// that word, and it meant there was no way to cancel a mission *without*
+    /// also releasing the E-stop. This variant separates the two: cancelling
+    /// a mission never touches the E-stop latch, and only this command does.
+    ClearEStop,
 }
 
 impl Command {
@@ -882,6 +933,7 @@ impl Command {
             Command::SetMissionGoal(_) => 2,
             Command::CancelMission => 3,
             Command::EStop => 4,
+            Command::ClearEStop => 5,
         }
     }
 }
@@ -940,7 +992,7 @@ impl Wire for CommandFrame {
                 w.f64(goal.lat_deg);
                 w.f64(goal.lon_deg);
             }
-            Command::Nop | Command::CancelMission | Command::EStop => {
+            Command::Nop | Command::CancelMission | Command::EStop | Command::ClearEStop => {
                 for _ in 0..Command::PAYLOAD_LEN {
                     w.u8(0);
                 }
@@ -963,6 +1015,7 @@ impl Wire for CommandFrame {
             }),
             3 => Command::CancelMission,
             4 => Command::EStop,
+            5 => Command::ClearEStop,
             _ => {
                 return Err(DecodeError::BadDiscriminant {
                     field: "Command",

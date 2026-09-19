@@ -19,16 +19,37 @@
 
 use embassy_net::Ipv4Address;
 
-/// `[hosts] chassis` / `[ports] chassis` - this board's own address.
+/// `[services] chassis` - this board's own address.
+///
+/// # Design defect D1 (`docs/RUST_REWRITE_PLAN.md` §13.3b)
+///
+/// `config/rover.toml` used to give one UDP port per *host*, under `[hosts]`/
+/// `[ports]`. That put `rover-control`, `rover-navigation` and
+/// `rover-telemetry` — three separate RPi processes — on the same "rpi" port,
+/// which only one of them could actually bind. The fix makes `[services]` map
+/// a service name straight to a `host:port`, one per *process*: this board is
+/// still one process, so it keeps one address, but the RPi side is now
+/// `CONTROL_ADDR`/`TELEMETRY_ADDR` below instead of a single `RPI_IP`/
+/// `RPI_PORT` pair — each message this board publishes now names exactly
+/// which RPi process it is for.
 pub const SELF_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
-pub const SELF_PORT: u16 = 7002;
+pub const SELF_PORT: u16 = 7010;
 
-/// `[hosts] rpi` / `[ports] rpi` - every message this board publishes routes
-/// to the RPi (`[routes]`: `ImuSample`, `ChassisStatus`, `MagSample` all list
-/// only `["rpi"]`), and `ChassisCommand` arrives from the RPi's actuation
-/// task, so there is exactly one peer to talk to.
-pub const RPI_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-pub const RPI_PORT: u16 = 7001;
+/// `[services] control` address. `ChassisCommand` arrives *from* here (the
+/// RPi's actuation task); nothing in this crate needs to send there.
+pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7001);
+
+/// `[services] telemetry` address.
+pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
+
+/// Per-message-type destination table. No message this board publishes needs
+/// more than one destination, so each is a single address rather than a
+/// list — but naming them by message type (not by host) is what makes it
+/// obvious at the call site *why* that destination was chosen, and keeps a
+/// future second destination (like `WheelSensors` on the sensors board, which
+/// needs two) a one-line change here rather than a call-site rewrite.
+pub const IMU_SAMPLE_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
+pub const CHASSIS_STATUS_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed) - there is no vendor
 /// assignment to collide with on a closed LAN with four fixed hosts. The last

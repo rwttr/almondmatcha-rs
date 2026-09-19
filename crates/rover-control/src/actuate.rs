@@ -476,21 +476,27 @@ impl SafetyGate {
 
     /// Apply a base-station command that affects the drive gate.
     ///
-    /// `Command::EStop` latches the gate closed. There is no
-    /// `Command`-level "resume" variant in `rover_msgs` — `EStop` is
-    /// documented there as best-effort and one-directional ("never design
-    /// safety around this reaching the rover"). This crate treats
-    /// `Command::CancelMission` — an unambiguous, deliberate operator
-    /// action — as the release. **This is a judgment call, not a ported
-    /// ROS2 behaviour**: the ROS2 system had no base-originated E-stop at
-    /// all, only the continuous `mission_active` level signal. Flag this if
-    /// a different resume policy (e.g. requiring a fresh `SetMissionGoal`)
-    /// is wanted.
+    /// `Command::EStop` latches the gate closed; `Command::ClearEStop` is the
+    /// only thing that releases it.
+    ///
+    /// **This used to be `Command::CancelMission`.** An earlier pass treated
+    /// "cancel mission" as an unambiguous release, since `rover_msgs` had no
+    /// dedicated resume variant and `EStop` is documented as best-effort and
+    /// one-directional ("never design safety around this reaching the
+    /// rover"). That was flagged as a judgment call, and on reflection it was
+    /// the wrong one: an operator pressing "cancel mission" to clear an
+    /// emergency stop is surprising, and it meant there was no way to cancel
+    /// a mission *without* also releasing the E-stop. `Command::ClearEStop`
+    /// (added alongside this change) separates the two actions; cancelling a
+    /// mission no longer touches this latch at all.
     pub fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::EStop => self.estopped = true,
-            Command::CancelMission => self.estopped = false,
-            Command::Nop | Command::SetSpeedLimit(_) | Command::SetMissionGoal(_) => {}
+            Command::ClearEStop => self.estopped = false,
+            Command::Nop
+            | Command::SetSpeedLimit(_)
+            | Command::SetMissionGoal(_)
+            | Command::CancelMission => {}
         }
     }
 }
@@ -1099,15 +1105,31 @@ mod tests {
     }
 
     #[test]
-    fn safety_gate_cancel_mission_clears_the_estop_latch() {
+    fn safety_gate_clear_estop_clears_the_latch() {
+        let mut gate = SafetyGate::new();
+        gate.on_mission_status(true);
+        gate.on_command(Command::EStop);
+        assert!(!gate.drive_allowed());
+        gate.on_command(Command::ClearEStop);
+        // Latch cleared, but drive still gated on mission_active.
+        gate.on_mission_status(true);
+        assert!(gate.drive_allowed());
+    }
+
+    /// Regression test for the defect `Command::ClearEStop` fixes: cancelling
+    /// a mission must never itself release an E-stop latch.
+    #[test]
+    fn safety_gate_cancel_mission_does_not_clear_the_estop_latch() {
         let mut gate = SafetyGate::new();
         gate.on_mission_status(true);
         gate.on_command(Command::EStop);
         assert!(!gate.drive_allowed());
         gate.on_command(Command::CancelMission);
-        // Latch cleared, but drive still gated on mission_active.
         gate.on_mission_status(true);
-        assert!(gate.drive_allowed());
+        assert!(
+            !gate.drive_allowed(),
+            "CancelMission must not clear an E-stop latch"
+        );
     }
 
     // -- Actuator: end-to-end guard rails -----------------------------------

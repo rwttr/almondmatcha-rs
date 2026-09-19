@@ -177,6 +177,7 @@ mod tests {
             speed_mps: 0.5,
             course_deg: 90.0,
             utc_ms: 1_705_321_845_000,
+            source: rover_msgs::GnssSource::Rtk,
         };
         let row = format_gnss_row(5_000, &f);
         assert_eq!(

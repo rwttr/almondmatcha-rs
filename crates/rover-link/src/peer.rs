@@ -1,49 +1,76 @@
-//! The five hosts on the rover network.
+//! The named services on the rover network.
 //!
-//! `docs/RUST_REWRITE_PLAN.md` §1.2 and `config/rover.toml`'s `[hosts]` table
-//! name exactly these five. A closed enum rather than a `String` or a raw
-//! `SocketAddr`, because the set is small, fixed at build time, and shared by
-//! every binary in the workspace: a typo in a host name becomes a compile
-//! error here instead of a misrouted UDP packet in a field.
-
+//! **Design defect D1** (`docs/RUST_REWRITE_PLAN.md` §13.3b): this used to be
+//! five *hosts* (`Rpi`, `Chassis`, `Jetson`, `Sensors`, `Base`), one UDP port
+//! each, per `config/rover.toml`'s old `[hosts]`/`[ports]` tables. But the RPi
+//! runs **three** separate receiving processes — `rover-control`,
+//! `rover-navigation`, `rover-telemetry` — that all need to bind `PeerId::Rpi`.
+//! On real hardware the second and third to start die with `EADDRINUSE`, and
+//! even if `UdpLink` used `SO_REUSEPORT` that load-balances one socket's
+//! traffic across listeners rather than duplicating it to all of them, which
+//! is not what this bus needs. The bug was a modelling error: the bus routes
+//! to *endpoints*, and an endpoint is a process, not a machine.
+//!
+//! **Fix — `PeerId` names a service (a process), not a host.** `config/
+//! rover.toml`'s `[hosts]`/`[ports]` collapse into one `[services]` table
+//! mapping a service name straight to a `host:port` socket address, and
+//! `[routes]` targets service names. A single physical machine can (and does,
+//! for the RPi) host several services, each with its own port — that is what
+//! makes running `rover-control`, `rover-navigation` and `rover-telemetry` as
+//! three OS processes actually work.
 use std::fmt;
 use std::str::FromStr;
 
-/// A named endpoint on the rover network.
+/// A named endpoint on the rover network — one bus-visible process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PeerId {
-    Rpi,
+    /// `rover-control`, on the RPi.
+    Control,
+    /// `rover-navigation`, on the RPi.
+    Navigation,
+    /// `rover-telemetry`, on the RPi.
+    Telemetry,
+    /// The chassis board firmware.
     Chassis,
-    Jetson,
+    /// The sensors board firmware.
     Sensors,
+    /// The Jetson perception process.
+    Perception,
+    /// `ground-station`, on the base PC.
     Base,
 }
 
 impl PeerId {
-    /// All five, in the order `config/rover.toml` lists them.
-    pub const ALL: [PeerId; 5] = [
-        PeerId::Rpi,
+    /// All seven, in the order `config/rover.toml`'s `[services]` table
+    /// lists them.
+    pub const ALL: [PeerId; 7] = [
+        PeerId::Control,
+        PeerId::Navigation,
+        PeerId::Telemetry,
         PeerId::Chassis,
-        PeerId::Jetson,
         PeerId::Sensors,
+        PeerId::Perception,
         PeerId::Base,
     ];
 
-    /// The spelling used as a key in `config/rover.toml`'s `[hosts]` /
-    /// `[ports]` tables, and by this type's `Display` impl.
+    /// The spelling used as a key in `config/rover.toml`'s `[services]` /
+    /// `[routes]` tables, and by this type's `Display` impl.
     pub const fn as_str(self) -> &'static str {
         match self {
-            PeerId::Rpi => "rpi",
+            PeerId::Control => "control",
+            PeerId::Navigation => "navigation",
+            PeerId::Telemetry => "telemetry",
             PeerId::Chassis => "chassis",
-            PeerId::Jetson => "jetson",
             PeerId::Sensors => "sensors",
+            PeerId::Perception => "perception",
             PeerId::Base => "base",
         }
     }
 
-    /// Parse a `config/rover.toml` host name. Case-sensitive on purpose: the
-    /// config file is the one source of truth for spelling, and silently
-    /// accepting `"RPi"` would just move a typo further from where it starts.
+    /// Parse a `config/rover.toml` service name. Case-sensitive on purpose:
+    /// the config file is the one source of truth for spelling, and silently
+    /// accepting `"Control"` would just move a typo further from where it
+    /// starts.
     pub fn parse(name: &str) -> Option<PeerId> {
         Self::ALL.into_iter().find(|p| p.as_str() == name)
     }
@@ -63,13 +90,13 @@ impl FromStr for PeerId {
     }
 }
 
-/// A host name that matches none of [`PeerId::ALL`].
+/// A service name that matches none of [`PeerId::ALL`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownPeerName(pub String);
 
 impl fmt::Display for UnknownPeerName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown host name `{}`", self.0)
+        write!(f, "unknown service name `{}`", self.0)
     }
 }
 
@@ -89,8 +116,12 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_wrong_case() {
-        assert_eq!(PeerId::parse("groundstation"), None);
-        assert_eq!(PeerId::parse("RPi"), None);
+        assert_eq!(
+            PeerId::parse("rpi"),
+            None,
+            "the old host-based name is gone"
+        );
+        assert_eq!(PeerId::parse("Control"), None);
         assert!("nonsense".parse::<PeerId>().is_err());
     }
 }

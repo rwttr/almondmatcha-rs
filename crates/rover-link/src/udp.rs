@@ -170,12 +170,12 @@ mod tests {
     use rover_msgs::{ImuSample, Wire};
 
     fn linked_pair() -> (UdpLink, UdpLink) {
-        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mut a = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
         let mut b = UdpLink::bind(PeerId::Chassis, "127.0.0.1:0", HashMap::new()).unwrap();
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
         a.set_peer(PeerId::Chassis, b_addr);
-        b.set_peer(PeerId::Rpi, a_addr);
+        b.set_peer(PeerId::Control, a_addr);
         (a, b)
     }
 
@@ -207,7 +207,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let (peer, seq, decoded) = received.expect("frame never arrived");
-        assert_eq!(peer, PeerId::Rpi);
+        assert_eq!(peer, PeerId::Control);
         assert_eq!(seq, 7);
         assert_eq!(decoded, msg);
     }
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn send_to_unknown_peer_is_a_typed_error() {
-        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mut a = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
         let err = a.send(PeerId::Base, &[0u8; 4]).unwrap_err();
         assert!(matches!(err, LinkError::UnknownPeer(PeerId::Base)));
     }
@@ -237,13 +237,13 @@ mod tests {
     fn send_to_addr_reaches_a_raw_address_outside_the_peer_table() {
         // The debug mirror's whole point: a destination `send` cannot reach
         // because it was never registered as a `PeerId`.
-        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mut a = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
         let mut mirror = UdpLink::bind(PeerId::Base, "127.0.0.1:0", HashMap::new()).unwrap();
         let mirror_addr = mirror.local_addr().unwrap();
         // The mirror still has to recognise `a` as a sender to accept its
         // datagram — that part of the peer table isn't bypassed, only the
         // *destination* lookup on the sending side is.
-        mirror.set_peer(PeerId::Rpi, a.local_addr().unwrap());
+        mirror.set_peer(PeerId::Control, a.local_addr().unwrap());
 
         let mut buf = [0u8; rover_msgs::frame::MAX_FRAME_LEN];
         let n = encode_frame(
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn send_to_addr_oversized_frame_is_rejected_the_same_way_as_send() {
-        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mut a = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
         let big = vec![0u8; LAN_MTU + 1];
         let err = a
             .send_to_addr("127.0.0.1:9".parse().unwrap(), &big)
