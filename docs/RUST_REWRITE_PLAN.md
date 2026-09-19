@@ -1,7 +1,7 @@
 # Rust Rewrite Plan — `almondmatcha` v5
 
-**Status:** proposal, not yet started
-**Written:** 2026-09-19 · **Revised:** 2026-09-19 (rev 2)
+**Status:** implemented on branch `rs`. §13 records what actually exists.
+**Written:** 2026-09-19 · **Revised:** 2026-09-20 (rev 4)
 **Scope:** full replacement of the ROS 2 / DDS / mros2 stack with a Rust workspace,
 adding state estimation (EKF), a pluggable control law, a firmware command
 watchdog, metric speed, and a link layer that survives the base station leaving
@@ -11,10 +11,10 @@ the LAN for LoRa. Big-bang rewrite on a branch; `main` is preserved untouched.
 plan; §13 is what actually exists on branch `rs`. Where the two disagree, §13
 is right and the plan text is aspirational.
 
-**Rev 2 changes:** §2.5 metric speed calibration (encoder spec is *not* in the
+**Rev 2 changes:** §2.6 metric speed calibration (encoder spec is *not* in the
 repo — measurement procedure supplied), §5.2 full watchdog specification, §6 new
 link-layer abstraction for the LoRa future, §4 base↔rover protocol changed from
-TCP to idempotent datagrams, §2.6 LIS2MDL magnetometer (present on the shield,
+TCP to idempotent datagrams, §2.5 LIS2MDL magnetometer (present on the shield,
 currently unused), §8 pluggable controller trait for LQR/MPC.
 
 ---
@@ -87,7 +87,7 @@ base — and the rewrite makes it an explicit invariant.
 | `ground-station` | Base | Rust | Mission goals, speed limit, E-stop, live display. Works over either link. |
 | `perception` | Jetson | Python | Camera + lane detection (later YOLO/TensorRT) in **one** process. |
 | `chassis-fw` | STM32 .2 | Rust `no_std` | Motor PWM, steering servo, LSM6DSV16X @100 Hz, **watchdog**. |
-| `sensors-fw` | STM32 .6 | Rust `no_std` | HW quadrature encoders, INA226, **watchdog**. |
+| `sensors-fw` | STM32 .6 | Rust `no_std` | Software 4× EXTI quadrature decode (§5.4), INA226, **watchdog**. |
 
 ---
 
@@ -167,7 +167,9 @@ Runs free every time the rover pauses.
   cannot see. Non-negotiable.
 - `nalgebra` `SMatrix<f32, 5, 5>` — no allocation, `no_std` capable.
 - Ship as a **pure library** (`rover-estimator`), no I/O, driven by `tools/replay`
-  over existing `runs/*.csv`. Must be tunable on a laptop.
+  over existing `runs/*.csv`. Must be tunable on a laptop. (No such `runs/*.csv`
+  exists in this repository, nor ever did — §13.2, §13.5. This is not merely
+  open: a run must first be produced on `main` before it is achievable.)
 
 ### 2.4 Heading observability — and what the magnetometer does about it
 
@@ -179,8 +181,11 @@ camera. With the lane lost, heading drifts at the residual gyro bias rate — ex
 
 **Yes — the X-NUCLEO-IKS4A1 carries a LIS2MDL 3-axis magnetometer.** Confirmed
 both by ST's product page and by the vendored
-`libs/X-Nucleo-IKS4A1_mbedOS/README.md`, which lists it. The board also carries
-LSM6DSO16IS, LIS2DUXS12, SHT40-AD1B, LPS22DF and STTS22H. Your firmware includes
+`libs/X-Nucleo-IKS4A1_mbedOS/README.md`, which lists it (that path no longer
+exists on this branch — see Appendix A; `git show main:<path>` still has it).
+The board also carries
+LSM6DSO16IS, LIS2DUXS12, SHT40-AD1B, LPS22DF and STTS22H. Your firmware
+includes
 only three headers (`LSM6DSV16X.h`, `STTS22H.h`, `LPS22DF.h`) — **the magnetometer
 has never been wired up.**
 
@@ -425,9 +430,10 @@ Stable `u16` per type. Publish = encode, `send_to` each subscriber in a static
 routing table. Subscribe = bind, filter on type ID. Newest-wins; no retransmit,
 no ordering, no session state.
 
-**Unicast fan-out, not multicast.** With 4 hosts and sub-100-byte messages this
-costs nothing, and it removes the IGMP dependency that forced the hand-maintained
-`initialPeersList` workaround in `fastdds_rover.xml`.
+**Unicast fan-out, not multicast.** With seven services on five hosts and
+sub-200-byte messages this costs nothing, and it removes the IGMP dependency
+that forced the hand-maintained `initialPeersList` workaround in
+`fastdds_rover.xml`.
 
 ### 4.2 Commands — idempotent datagrams with sequence echo (**changed in rev 2**)
 
@@ -470,7 +476,8 @@ CHASSIS_CMD = struct.Struct("<ffH")
 ([`st-mems-rust-drivers`](https://github.com/STMicroelectronics/st-mems-rust-drivers)).
 Use [`lsm6dsv16x-rs`](https://crates.io/crates/lsm6dsv16x-rs) v2.1.0 — `no_std`,
 BSD-3-Clause, `embedded-hal` 1.0, same vendor and register abstraction as the C
-driver already vendored in `libs/`.
+driver already vendored in `libs/` (that path no longer exists on this branch —
+see Appendix A; `git show main:<path>` still has it).
 
 ```rust
 let mut imu = Lsm6dsv16x::new_i2c(i2c, I2CAddress::I2cAddH, delay)?;
@@ -717,13 +724,12 @@ has to do.
 
 ## 7. Repository layout
 
-New work on branch `rust-rewrite`. `main` keeps the ROS 2 system.
+New work on branch `rs`. `main` keeps the ROS 2 system.
 
 ```
 almondmatcha/
 ├── Cargo.toml                   # workspace: firmware + host, one message crate
 ├── rust-toolchain.toml
-├── .cargo/config.toml           # target aliases, probe-rs runner
 ├── config/
 │   └── rover.toml               # hosts, routes, drivetrain calib, gains, link cfg
 ├── crates/
@@ -742,7 +748,7 @@ almondmatcha/
 │   └── sensors/                 # no_std
 ├── perception/                  # Jetson Python
 │   ├── pyproject.toml
-│   └── rover_perception/{camera,lane,bus,main}.py
+│   └── rover_perception/{camera,lane,bus,wire,main}.py
 ├── tools/replay/                # CSV replay harness for estimator + control
 ├── testdata/                    # golden wire-format fixtures
 └── docs/
@@ -829,7 +835,7 @@ Big-bang, so this is build order. Each step is testable.
 | 3 | `rover-link` + `rover-bus` (UDP + command echo) + `rover-tap` | two processes on a laptop |
 | 4 | **Spike:** Embassy blink → static IP → UDP echo on one NUCLEO | **hard gate — §10** |
 | 5 | `rover-model` + `rover-estimator` EKF + `tools/replay` | offline, laptop |
-| 6 | `sensors-fw` — HW quadrature, INA226, watchdog | bench, `rover-tap` |
+| 6 | `sensors-fw` — software 4× EXTI quadrature decode (§5.4), INA226, watchdog | bench, `rover-tap` |
 | 7 | `chassis-fw` — PWM, servo, IMU @100 Hz, **watchdog + IWDG** | bench, motors on blocks |
 | 8 | `rover-control` — estimate + guide (`StaticGain`) + actuate | replay, then bench |
 | 9 | `rover-navigation` — GNSS ×2 + mission + RTCM injection | bench with live GNSS |
@@ -864,7 +870,7 @@ against recorded data, refactor only in a separate commit.**
 | lookahead | 1.22 m ahead of front axle | ROI geometry |
 | `speed_kp/ki/kd` | 0.3 / 0.5 / 0.0 | field-derived (`5c3a3fa`, `f46768c`, `dc858af`) |
 | `autocal_min_duty_pct` | 13.0 | cruises 15–16%, stalls at 11% |
-| `steer_max_deg` | 45.0 | mechanical limit |
+| `steer_max_deg` | 45.0 | mechanical limit — **tightened, not ported**: the ROS 2 value was ±60° (`CONTROL_LAW.md` §1.6) |
 | lane segmentation | L\* channel, not chroma | `6a49552`, validated on D415 |
 | `max_ticks_per_sec` | **placeholder — not calibrated** | see §2.6 |
 
@@ -878,7 +884,10 @@ offset.
 
 **Required before hardware:** `tools/replay` must drive `rover-estimator` and
 `StaticGain` from existing `runs/*.csv` and match recorded ROS 2 behaviour within
-tolerance. No motor turns until that passes.
+tolerance. No motor turns until that passes. **No such `runs/*.csv` exists, and
+none ever did (§13.2, §13.5).** This is not merely open — it requires first
+checking out `main` and recording a run there, since the ROS 2 tree that could
+produce one is gone from this branch.
 
 ---
 
@@ -892,7 +901,7 @@ tolerance. No motor turns until that passes.
 | **Encoder constant wrong after the 2×→4× decoding change** | High | §2.6 warning; `decoding` recorded in `rover.toml`; verify commanded vs. measured speed on the first bench run |
 | **RTK bandwidth over 433 MHz** | Medium | §6.4 — plan for FSK, not long-range LoRa SF |
 | **No command uplink when disconnected** | Medium | §6.5 — decide before step 3 |
-| **EKF tuning eats time** | Medium | Seed `R` from measured variance of lane params, stationary, facing a straight line — you have the CSVs. Log innovations from day one. |
+| **EKF tuning eats time** | Medium | Seed `R` from measured variance of lane params, stationary, facing a straight line. No such CSVs exist yet (§13.5) — this means recording one first, not pulling from an existing log. Log innovations from day one. |
 | **Magnetometer disappoints** | Low | Optional, behind a flag, after step 13. §2.5 says why to expect little. |
 | **Jetson Python bus drifts from Rust** | Medium | Shared golden-byte fixtures (§4.3) |
 | **No ROS 2 escape hatch** | Medium | Accepted. `main` keeps the working system. |
@@ -904,7 +913,9 @@ tolerance. No motor turns until that passes.
 1. `cargo test --workspace` green, golden-byte fixtures cross-checked against the
    Python decoder.
 2. `tools/replay` reproduces recorded ROS 2 steering output from
-   `runs/*/lane_detection.csv` within tolerance.
+   `runs/*/lane_detection.csv` within tolerance. **No recorded run exists in
+   this repository and none ever did (§13.2, §13.5); this criterion cannot be
+   attempted until one is produced on `main`.**
 3. **Watchdog:** rover on blocks, driving, Ethernet pulled → throttle ramps to zero
    within 200 ms + 300 ms, steering centres, `watchdog_tripped` observable.
 4. **IWDG:** artificially hang the control task → board resets, PWM safe.
@@ -1004,8 +1015,9 @@ was left untouched by instruction.
    three. Revisit if `bisync` is ever unyanked.
 
 2. **Firmware constants are a hand-transcribed `config.rs`, not a compile-time
-   parser.** §6 says firmware should `include_str!` `rover.toml` and parse it
-   in a `const fn`. That parser is a project in itself and getting it subtly
+   parser.** `config/rover.toml`'s own header comment says firmware should
+   `include_str!` it and parse it in a `const fn`. That parser is a project in
+   itself and getting it subtly
    wrong is a worse failure than a small constants file a human can diff by
    eye. Every constant cites its `rover.toml` key. **The manual sync step is
    real and is the documented cost of not having the parser.**
@@ -1039,8 +1051,11 @@ was left untouched by instruction.
 
 ### 13.3b Open design defects found during implementation
 
-Three real flaws in this plan, surfaced by building against it. Recorded here
-with their decisions; **not yet implemented**.
+Four real flaws in this plan, surfaced by building against it. Recorded here
+with their decisions; **all four are implemented** — D1 as `[services]` in
+`config/rover.toml`, D2 as `GnssSource` / `GnssFix.source`, D3 as
+`select_navigation_fix` in `crates/rover-navigation/src/mission.rs` (with
+passing tests), D4 as perception's `--csv` flag, off by default.
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
 
@@ -1110,6 +1125,16 @@ operator actually saw, including link gaps the rover's own log cannot show.
 **Decision: keep it, behind an off-by-default flag**, so the shipped behaviour
 matches the ROS 2 baseline and the capability is there when a comms problem
 needs diagnosing.
+
+**What actually shipped only half-follows that decision.** `perception/main.py`
+does implement it correctly: `--csv` defaults to `None` and logging is opt-in.
+`crates/ground-station/src/main.rs` does not — `--log-file` has a
+`default_value` and `CsvLogger::spawn` is called unconditionally, so the base
+station logs CSVs on every run with no flag to turn it off.
+`crates/ground-station/src/csv_log.rs` documents the tension itself (it quotes
+`CSV_LOGGING.md`'s "No CSV logging on base station" line) and resolves it the
+other way, citing the crate's own task brief. So: perception is off by
+default as decided; the base station is on unconditionally, undecided-in-code.
 
 ### 13.4 Hardware-verification debt
 
@@ -1182,7 +1207,8 @@ Sensitivity conversions mirror the C driver's `from_fsN_to_mg` /
 ## Appendix B — X-NUCLEO-IKS4A1 sensor complement
 
 Your firmware uses **one** of these. Confirmed against ST's product page and the
-vendored `libs/X-Nucleo-IKS4A1_mbedOS/README.md`:
+vendored `libs/X-Nucleo-IKS4A1_mbedOS/README.md` (that path no longer exists on
+this branch — see Appendix A; `git show main:<path>` still has it):
 
 | Part | Function | Used today? | Rust driver |
 |---|---|---|---|
