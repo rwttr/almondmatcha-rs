@@ -1,0 +1,11 @@
+[target.thumbv7em-none-eabihf]
+# probe-rs talks to the on-board ST-Link on the Nucleo-144 - no external
+# programmer needed. Chip name per `probe-rs chip list`. Same part as
+# firmware/chassis - both boards are STM32F767ZI Nucleo-144s.
+runner = "probe-rs run --chip STM32F767ZITx"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+DEFMT_LOG = "info"

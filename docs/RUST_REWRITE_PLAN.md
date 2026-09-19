@@ -571,15 +571,36 @@ Motors must ramp to zero within 200 ms + 300 ms, steering must centre,
 - Dead `MAIN_LOOP_PERIOD_MS` and the unreachable `mros2::spin()` after
   `while(true)` both vanish. Noted so they are not faithfully reproduced.
 
-### 5.4 Encoders: hardware quadrature
+### 5.4 Encoders: 4× decoding — but in software, not hardware
 
-STM32 general-purpose timers decode quadrature **in hardware** — zero CPU, no
-missed counts under load. `embassy-stm32` exposes timer encoder mode. The current
-implementation counts edges in `InterruptIn` handlers and only attaches interrupts
-to channel A.
+**This section was wrong in rev 1–3 and is corrected here.** The plan called for
+STM32 timer encoder mode (zero CPU, no missed counts). That is impossible with
+this rover's physical wiring, and the compiler says so:
 
-> ⚠️ This changes decoding from **2× to 4×**. Tick counts double.
-> See the warning in §2.6 — calibrate after this change, not before.
+| Pin pair | TIM2 | TIM3 |
+|---|---|---|
+| Encoder A as wired, `{PA15, PB5}` | `PB5: TimerPin<TIM2>` unsatisfied | `PA15: TimerPin<TIM3>` unsatisfied |
+| Encoder B as wired, `{PB3, PB4}` | `PB4: TimerPin<TIM2>` unsatisfied | `PB3: TimerPin<TIM3>` unsatisfied |
+
+`PA15` and `PB3` are TIM2 channels; `PB4` and `PB5` are TIM3 channels. Each
+encoder's A/B pair therefore straddles two timers, and no alternate function on
+any of the four pins changes that. The pairs that *would* work — `{PA15, PB3}`
+on TIM2, `{PB4, PB5}` on TIM3 — each combine one channel from encoder A with one
+from encoder B, which is a harness rewire, not something firmware can do.
+
+The implementation instead does **software quadrature decode over EXTI
+interrupts on all four channels**, through a 4-state transition table that
+rejects an ambiguous transition as zero rather than guessing a direction.
+
+This still delivers the thing that actually mattered: **4× decoding**, matching
+`config/rover.toml`'s `decoding = "quadrature_4x"`. What it gives up is the
+"zero CPU, cannot miss a count" property — so tick-rate behaviour under
+sustained load, competing with UDP and I2C interrupts, is now a bench question
+rather than a hardware guarantee.
+
+> ⚠️ Decoding still changes from **2× to 4×** versus the mros2 firmware, which
+> attached interrupts to channel A only. Tick counts double. See §2.6 —
+> calibrate against *this* firmware, and only after it is running.
 
 ---
 
@@ -916,6 +937,7 @@ plan.** Where they disagree, believe this.
 | `rover-estimator` | **done** | 5-state EKF, Joseph form, chi-square gate, coast-on-dropout, zero-rate bias update. 10 behavioural tests. |
 | `perception/wire.py` + `lane.py` | **done** | 51 Python tests green against the Rust fixtures — the two languages provably agree on the wire. |
 | `firmware/chassis` | **builds** | 65,048 B flash (3.1%), 17,724 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
+| `firmware/sensors` | **builds** | 54,316 B flash (2.6%), 17,844 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
 
 Host workspace: **66 tests**, clippy and `fmt` clean.
 
@@ -923,7 +945,6 @@ Host workspace: **66 tests**, clippy and `fmt` clean.
 
 | Component | State |
 |---|---|
-| `firmware/sensors` | **not started** — encoders, INA226, mirror watchdog |
 | `rover-control` | skeleton only — estimate/guide/actuate, `StaticGain`, speed PID |
 | `rover-navigation` | skeleton only — GNSS, mission state machine |
 | `rover-telemetry` | skeleton only — CSV, health bits, base feed |
@@ -966,7 +987,13 @@ Host workspace: **66 tests**, clippy and `fmt` clean.
    would let a detector producing consistent garbage read as healthy while the
    filter coasted with no corrections. Camera liveness is `HealthBits::LANE_STALE`.
 
-6. **`TelemetryLite` is not implemented.** The LoRa radios are deferred, and an
+6. **Encoders decode in software, not in timer hardware.** §5.4 as originally
+   written was not achievable on this board — each encoder's channel pair
+   straddles TIM2 and TIM3. Verified by compilation, not by reading a
+   datasheet. 4× decoding is preserved; the "cannot miss a count" guarantee is
+   not. See the corrected §5.4.
+
+7. **`TelemetryLite` is not implemented.** The LoRa radios are deferred, and an
    unused type rots. Add it with `LoraSerialLink`.
 
 ### 13.4 Hardware-verification debt
@@ -978,11 +1005,18 @@ Nothing in `firmware/` has met silicon. In rough order of risk:
 2. **I2C1 on PB8/PB9** — inherited from the mbed target's generic
    `I2C_SDA`/`I2C_SCL` names for `NUCLEO_F767ZI`. Standard Nucleo-144 Arduino
    bus, not confirmed against the physical board.
-3. **TIM1 left-motor PWM** — the only channel on an advanced-control timer. If
+3. **Encoder sign convention** — the quadrature table's forward direction was
+   defined from first principles and cannot be checked without turning a wheel
+   by hand and watching `ticks_left`/`ticks_right`. If it counts backwards,
+   swap that encoder's two pin arguments.
+4. **Software decode under load** — an EXTI decode, unlike a timer peripheral,
+   can in principle miss edges while competing with UDP and I2C interrupts.
+   Unmeasured.
+5. **TIM1 left-motor PWM** — the only channel on an advanced-control timer. If
    the left motor alone produces no PWM while the right motor and servo work,
    TIM1's break/MOE gate is the first place to look.
-4. **Watchdog end-to-end** — §12 criterion 3. Cannot be faked in a test.
-5. **Every timing constant** — 200 ms / 300 ms / 500 ms are reasoned, not measured.
+6. **Watchdog end-to-end** — §12 criterion 3. Cannot be faked in a test.
+7. **Every timing constant** — 200 ms / 300 ms / 500 ms are reasoned, not measured.
 
 ### 13.5 Standing blockers
 

@@ -60,7 +60,11 @@ LaneMeasurement = ["rpi"]
 RoverState      = ["rpi"]
 MotionSetpoint  = ["rpi"]
 MissionStatus   = ["rpi"]
-Telemetry       = ["base"]
+# Also to "sensors": that board publishes only, so it has no command stream
+# to time out on. Telemetry is its liveness heartbeat — without it its mirror
+# watchdog (plan §5.2) would read as permanently tripped, which is exactly the
+# false alarm that teaches people to ignore a warning LED.
+Telemetry       = ["base", "sensors"]
 CommandFrame    = ["rpi"]
 SpeedLoopDebug  = ["rpi"]
 EkfDebug        = ["rpi"]
