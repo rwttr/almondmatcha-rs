@@ -1,0 +1,29 @@
+# almondmatcha — Rust rover workspace
+#
+# Host binaries and MCU firmware share one workspace and one message crate,
+# so a wire-layout disagreement between the RPi and an STM32 is a compile
+# error here, not a HardFault in a field.
+#
+# Firmware crates live in firmware/ and are NOT members of this workspace:
+# they build for thumbv7em-none-eabihf with their own profile and linker
+# settings. They depend on rover-msgs by path.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/rover-msgs",
+]
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "Apache-2.0"
+repository = "https://github.com/RoboticsGG/almondmatcha"
+
+[workspace.dependencies]
+rover-msgs = { path = "crates/rover-msgs" }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1

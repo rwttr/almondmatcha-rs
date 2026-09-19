@@ -1,0 +1,1163 @@
+//! Every message that crosses the bus.
+//!
+//! Each type is hand-written rather than macro-generated, so the byte layout
+//! can be read straight off `encode`. The cost of that choice is that `encode`
+//! and `decode` could drift apart; `tests/roundtrip.rs` closes it by
+//! round-tripping every type and asserting the encoded length equals
+//! [`Wire::WIRE_LEN`].
+//!
+//! # Type IDs
+//!
+//! Allocated by group and **permanent**. Reusing an ID for a different shape
+//! makes two machines silently disagree about what they are reading.
+//!
+//! | Range    | Group                    |
+//! |----------|--------------------------|
+//! | `0x01xx` | chassis board → RPi      |
+//! | `0x02xx` | RPi → chassis board      |
+//! | `0x03xx` | sensors board → RPi      |
+//! | `0x04xx` | GNSS                     |
+//! | `0x05xx` | perception               |
+//! | `0x06xx` | estimation and guidance  |
+//! | `0x07xx` | mission                  |
+//! | `0x08xx` | base station link        |
+//! | `0x09xx` | debug                    |
+
+use crate::codec::{DecodeError, Reader, Writer};
+use crate::{check_len, Wire};
+
+// ===========================================================================
+// Enums and bit flags
+// ===========================================================================
+
+/// GNSS solution quality, in ascending order of trust.
+///
+/// Replaces the free-text `fix_quality` string the ROS 2 `UbloxGNSS` message
+/// carried, which could not be compared or ordered without parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(u8)]
+pub enum FixQuality {
+    #[default]
+    None = 0,
+    Autonomous = 1,
+    Dgps = 2,
+    RtkFloat = 3,
+    RtkFixed = 4,
+}
+
+impl FixQuality {
+    pub fn from_u8(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Autonomous),
+            2 => Ok(Self::Dgps),
+            3 => Ok(Self::RtkFloat),
+            4 => Ok(Self::RtkFixed),
+            _ => Err(DecodeError::BadDiscriminant {
+                field: "FixQuality",
+                value: v,
+            }),
+        }
+    }
+
+    /// True once the solution is good enough to trust course-over-ground as a
+    /// heading reference (see the plan, §2.5).
+    pub fn is_rtk(self) -> bool {
+        matches!(self, Self::RtkFloat | Self::RtkFixed)
+    }
+}
+
+/// Mission state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum MissionState {
+    /// No goal loaded.
+    #[default]
+    Idle = 0,
+    /// Goal loaded, waiting for a usable GNSS fix before moving.
+    Armed = 1,
+    /// Driving toward the goal.
+    Running = 2,
+    /// Goal reached.
+    Arrived = 3,
+    /// Cancelled by the operator.
+    Cancelled = 4,
+    /// Halted by a fault: stall, watchdog, or loss of a required sensor.
+    Fault = 5,
+}
+
+impl MissionState {
+    pub fn from_u8(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(Self::Idle),
+            1 => Ok(Self::Armed),
+            2 => Ok(Self::Running),
+            3 => Ok(Self::Arrived),
+            4 => Ok(Self::Cancelled),
+            5 => Ok(Self::Fault),
+            _ => Err(DecodeError::BadDiscriminant {
+                field: "MissionState",
+                value: v,
+            }),
+        }
+    }
+
+    /// True when the rover should be allowed to drive.
+    pub fn is_driving(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// Chassis board fault flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FaultBits(pub u8);
+
+impl FaultBits {
+    pub const NONE: Self = Self(0);
+    /// IMU did not answer, or returned the wrong `WHO_AM_I`.
+    pub const IMU_LOST: Self = Self(1 << 0);
+    /// Motor driver reported a fault, or current exceeded its limit.
+    pub const MOTOR_FAULT: Self = Self(1 << 1);
+    /// Board came up from an independent-watchdog reset, i.e. firmware hung.
+    pub const IWDG_RESET: Self = Self(1 << 2);
+    /// Steering servo out of range or unresponsive.
+    pub const SERVO_FAULT: Self = Self(1 << 3);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub fn set(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    pub fn clear(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+    pub fn is_clear(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// System-wide health flags, aggregated by `rover-telemetry`.
+///
+/// One bit per feed that the rover needs and can lose independently. A stale
+/// feed is not necessarily a fault — the estimator copes with a missing camera
+/// for seconds — but it must be visible from the base station.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealthBits(pub u16);
+
+impl HealthBits {
+    pub const NONE: Self = Self(0);
+    pub const CHASSIS_STALE: Self = Self(1 << 0);
+    pub const SENSORS_STALE: Self = Self(1 << 1);
+    pub const LANE_STALE: Self = Self(1 << 2);
+    pub const RTK_STALE: Self = Self(1 << 3);
+    pub const BACKUP_GNSS_STALE: Self = Self(1 << 4);
+    /// Chassis board reported its command watchdog had tripped.
+    pub const WATCHDOG_TRIPPED: Self = Self(1 << 5);
+    /// Speed loop believes a wheel is stalled.
+    pub const STALL_DETECTED: Self = Self(1 << 6);
+    /// Estimator covariance exceeded its trust threshold.
+    pub const ESTIMATOR_DIVERGED: Self = Self(1 << 7);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub fn set(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    pub fn clear(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+    pub fn is_clear(self) -> bool {
+        self.0 == 0
+    }
+}
+
+// ===========================================================================
+// 0x01xx — chassis board → RPi
+// ===========================================================================
+
+/// Inertial sample from the LSM6DSV16X on the chassis board.
+///
+/// Published at **100 Hz**, not the 10 Hz the ROS 2 firmware used: the board
+/// always sampled at 100 Hz and discarded nine of every ten samples. The EKF
+/// wants all of them.
+///
+/// Unlike the ROS 2 `ChassisIMU` message, which shipped raw sensor LSBs
+/// nominally scaled by 1000 (a conversion no consumer ever actually applied),
+/// these are real SI values converted on the board.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImuSample {
+    pub accel_mps2: [f32; 3],
+    pub gyro_radps: [f32; 3],
+    /// Board uptime in microseconds. Lets the estimator compute a true `dt`
+    /// and measure end-to-end latency against its own clock.
+    pub t_us: u32,
+}
+
+impl Wire for ImuSample {
+    const TYPE_ID: u16 = 0x0101;
+    const WIRE_LEN: usize = 28;
+    const NAME: &'static str = "ImuSample";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32x3(self.accel_mps2);
+        w.f32x3(self.gyro_radps);
+        w.u32(self.t_us);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            accel_mps2: r.f32x3(),
+            gyro_radps: r.f32x3(),
+            t_us: r.u32(),
+        })
+    }
+}
+
+/// Magnetic field from the LIS2MDL.
+///
+/// Present on the X-NUCLEO-IKS4A1 shield but **optional and off by default**.
+/// Hard- and soft-iron distortion from the drive motors varies with current
+/// draw, so a stationary calibration does not hold under load, and the field
+/// gives yaw in the *earth* frame rather than the lane-relative heading error
+/// the estimator actually tracks. Intended as a gyro-bias aid only — RTK
+/// course-over-ground is the better heading reference while moving. See the
+/// plan, §2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MagSample {
+    pub field_gauss: [f32; 3],
+    pub t_us: u32,
+}
+
+impl Wire for MagSample {
+    const TYPE_ID: u16 = 0x0102;
+    const WIRE_LEN: usize = 16;
+    const NAME: &'static str = "MagSample";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32x3(self.field_gauss);
+        w.u32(self.t_us);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            field_gauss: r.f32x3(),
+            t_us: r.u32(),
+        })
+    }
+}
+
+/// Chassis board liveness and fault report.
+///
+/// New in the Rust system. The ROS 2 firmware had no way to tell the rover
+/// that its command watchdog had tripped — or that it had a watchdog at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChassisStatus {
+    /// `ChassisCommand.seq` of the most recently applied command. The RPi
+    /// compares this against what it sent to measure command loss.
+    pub seq_echo: u16,
+    /// True while the board is in the watchdog-tripped state: no command
+    /// arrived within its timeout, throttle was ramped to zero and steering
+    /// centred. Cleared only by an explicit zero-throttle command.
+    pub watchdog_tripped: bool,
+    pub fault: FaultBits,
+    pub t_us: u32,
+}
+
+impl Wire for ChassisStatus {
+    const TYPE_ID: u16 = 0x0103;
+    const WIRE_LEN: usize = 8;
+    const NAME: &'static str = "ChassisStatus";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.u16(self.seq_echo);
+        w.bool(self.watchdog_tripped);
+        w.u8(self.fault.0);
+        w.u32(self.t_us);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            seq_echo: r.u16(),
+            watchdog_tripped: r.bool(),
+            fault: FaultBits(r.u8()),
+            t_us: r.u32(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x02xx — RPi → chassis board
+// ===========================================================================
+
+/// Actuation command for the chassis board, at 50 Hz.
+///
+/// Two signed normalised quantities. The ROS 2 `ChassisCtrl` split these into
+/// four fields — `fdr_msg` (1=right/2=straight/3=left) with `ro_ctrl_msg`
+/// (0.0–1.0), and `bdr_msg` (0=stop/1=fwd/2=bwd) with `spd_msg` (0–255) —
+/// which put H-bridge direction pins, a firmware concern, onto the wire.
+/// The firmware now derives direction from the sign.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChassisCommand {
+    /// `-1.0` full left … `+1.0` full right. Positive steers right, matching
+    /// the sign convention of `heading_err_rad` and `cross_track_m`.
+    pub steer: f32,
+    /// `-1.0` full reverse … `+1.0` full forward. Exactly `0.0` is stop.
+    pub throttle: f32,
+    /// Increments per command. Echoed in [`ChassisStatus::seq_echo`], and used
+    /// by the firmware watchdog to tell a fresh command from a stale one.
+    pub seq: u16,
+}
+
+impl ChassisCommand {
+    /// A command that stops the rover and centres the steering. Also the value
+    /// the firmware applies on a watchdog trip.
+    pub const STOP: Self = Self {
+        steer: 0.0,
+        throttle: 0.0,
+        seq: 0,
+    };
+
+    /// Clamp both channels into range. Call before sending: a controller under
+    /// development can and will produce values outside `[-1, 1]`, and the
+    /// firmware should never be the only thing standing between a bad gain and
+    /// the hardware.
+    pub fn clamped(self) -> Self {
+        Self {
+            steer: self.steer.clamp(-1.0, 1.0),
+            throttle: self.throttle.clamp(-1.0, 1.0),
+            seq: self.seq,
+        }
+    }
+}
+
+impl Wire for ChassisCommand {
+    const TYPE_ID: u16 = 0x0201;
+    const WIRE_LEN: usize = 10;
+    const NAME: &'static str = "ChassisCommand";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.steer);
+        w.f32(self.throttle);
+        w.u16(self.seq);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            steer: r.f32(),
+            throttle: r.f32(),
+            seq: r.u16(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x03xx — sensors board → RPi
+// ===========================================================================
+
+/// Wheel encoder counts, at 10 Hz.
+///
+/// Split out of the ROS 2 `ChassisSensors` message, which bundled encoders and
+/// power into one 4 Hz publication even though they have different rates and
+/// entirely different consumers. Encoders feed the estimator; power feeds
+/// telemetry.
+///
+/// Counts are free-running and signed; consumers difference consecutive
+/// samples. Converting to metres needs `metres_per_tick` from
+/// `config/rover.toml`, which **depends on the decoding mode** — hardware
+/// quadrature gives 4× the counts the ROS 2 firmware's 2× edge counting did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WheelSensors {
+    pub ticks_left: i32,
+    pub ticks_right: i32,
+    pub t_us: u32,
+}
+
+impl Wire for WheelSensors {
+    const TYPE_ID: u16 = 0x0301;
+    const WIRE_LEN: usize = 12;
+    const NAME: &'static str = "WheelSensors";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.i32(self.ticks_left);
+        w.i32(self.ticks_right);
+        w.u32(self.t_us);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            ticks_left: r.i32(),
+            ticks_right: r.i32(),
+            t_us: r.u32(),
+        })
+    }
+}
+
+/// Battery bus voltage and current from the INA226, at 5 Hz.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PowerSample {
+    pub bus_volts: f32,
+    pub current_amps: f32,
+}
+
+impl PowerSample {
+    /// Instantaneous draw. Derived rather than transmitted — the ROS 2
+    /// `TelemetryRelay` carried a `power_watts` field that was just this
+    /// product, recomputed and sent across the network for no reason.
+    pub fn watts(&self) -> f32 {
+        self.bus_volts * self.current_amps
+    }
+}
+
+impl Wire for PowerSample {
+    const TYPE_ID: u16 = 0x0302;
+    const WIRE_LEN: usize = 8;
+    const NAME: &'static str = "PowerSample";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.bus_volts);
+        w.f32(self.current_amps);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            bus_volts: r.f32(),
+            current_amps: r.f32(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x04xx — GNSS
+// ===========================================================================
+
+/// One GNSS solution.
+///
+/// A single type serves both receivers — the u-blox SimpleRTK2b and the
+/// Spresense — on two separate streams. The ROS 2 system had two near-identical
+/// messages (`UbloxGNSS`, `SpresenseGNSS`) whose fields had drifted apart:
+/// different date/time representations, one with SNR, one with a satellite
+/// count named differently. Consumers had to special-case each.
+///
+/// Free-text fields are gone: `fix_quality` is now an ordered enum, and the
+/// separate `date` and `time` strings are one UTC millisecond count.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct GnssFix {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub alt_m: f32,
+    pub fix: FixQuality,
+    pub sats: u8,
+    /// Horizontal accuracy estimate, metres (1-sigma). The ROS 2 message
+    /// carried `centimeter_error`; metres keeps units consistent everywhere.
+    pub h_acc_m: f32,
+    pub speed_mps: f32,
+    /// Course over ground, degrees from true north, `[0, 360)`.
+    ///
+    /// Only meaningful while moving — below roughly 0.3 m/s it is noise. With
+    /// an RTK fix this is a better heading reference than the magnetometer
+    /// (see the plan, §2.5), which is why it is carried explicitly rather than
+    /// being differentiated out of successive positions.
+    pub course_deg: f32,
+    pub utc_ms: u64,
+}
+
+impl GnssFix {
+    /// Whether this fix is good enough to navigate on.
+    pub fn is_usable(&self) -> bool {
+        self.fix != FixQuality::None && self.sats >= 4
+    }
+
+    /// Whether `course_deg` can be trusted as a heading reference right now.
+    pub fn course_is_trustworthy(&self) -> bool {
+        self.fix.is_rtk() && self.speed_mps > 0.3
+    }
+}
+
+impl Wire for GnssFix {
+    const TYPE_ID: u16 = 0x0401;
+    const WIRE_LEN: usize = 42;
+    const NAME: &'static str = "GnssFix";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f64(self.lat_deg);
+        w.f64(self.lon_deg);
+        w.f32(self.alt_m);
+        w.u8(self.fix as u8);
+        w.u8(self.sats);
+        w.f32(self.h_acc_m);
+        w.f32(self.speed_mps);
+        w.f32(self.course_deg);
+        w.u64(self.utc_ms);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            lat_deg: r.f64(),
+            lon_deg: r.f64(),
+            alt_m: r.f32(),
+            fix: FixQuality::from_u8(r.u8())?,
+            sats: r.u8(),
+            h_acc_m: r.f32(),
+            speed_mps: r.f32(),
+            course_deg: r.f32(),
+            utc_ms: r.u64(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x05xx — perception
+// ===========================================================================
+
+/// Lane geometry from the Jetson, at roughly 30 Hz.
+///
+/// Replaces the ROS 2 `Float32MultiArray` whose four elements meant
+/// `[curvature, theta, b, detected]` by position only, documented in a comment.
+///
+/// **All three geometry values are measured at the lookahead point**, roughly
+/// 1.22 m ahead of the front axle, not at the rover. That is a property of the
+/// ROI geometry, and it means `cross_track_m` is non-zero on a curve even when
+/// the rover is perfectly on line. The estimator models this explicitly —
+/// see the plan, §2.2 — which is what lets `cross_track_m` and
+/// `curvature_inv_m` be separated rather than fighting each other in the gains.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LaneMeasurement {
+    /// Lane curvature, **1/metres**.
+    ///
+    /// Converted at the source. The ROS 2 pipeline shipped a parabola
+    /// coefficient in bird's-eye-view pixels (1/px) and left every consumer to
+    /// fold in `BEV_PX_PER_M = 200.0` for itself — while `b` was converted to
+    /// metres before publication. One conversion, one place.
+    pub curvature_inv_m: f32,
+    /// Heading error relative to the lane tangent, radians. Positive means the
+    /// correct response is to steer right.
+    pub heading_err_rad: f32,
+    /// Lateral offset from lane centre at the lookahead point, metres.
+    /// Positive means the correct response is to steer right.
+    pub cross_track_m: f32,
+    /// False when the detector found no usable lane this frame. The estimator
+    /// skips its camera update and coasts; it does not hold the last value.
+    pub valid: bool,
+    pub t_us: u32,
+}
+
+impl Wire for LaneMeasurement {
+    const TYPE_ID: u16 = 0x0501;
+    const WIRE_LEN: usize = 17;
+    const NAME: &'static str = "LaneMeasurement";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.curvature_inv_m);
+        w.f32(self.heading_err_rad);
+        w.f32(self.cross_track_m);
+        w.bool(self.valid);
+        w.u32(self.t_us);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            curvature_inv_m: r.f32(),
+            heading_err_rad: r.f32(),
+            cross_track_m: r.f32(),
+            valid: r.bool(),
+            t_us: r.u32(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x06xx — estimation and guidance
+// ===========================================================================
+
+/// Number of EKF states. Kept here so `RoverState` and the estimator cannot
+/// disagree about the size of `p_diag`.
+pub const EKF_STATES: usize = 5;
+
+/// Index of each state within [`RoverState::p_diag`].
+pub mod state_idx {
+    pub const CROSS_TRACK: usize = 0;
+    pub const HEADING_ERR: usize = 1;
+    pub const CURVATURE: usize = 2;
+    pub const SPEED: usize = 3;
+    pub const GYRO_BIAS: usize = 4;
+}
+
+/// Fused estimate of where the rover is relative to the lane.
+///
+/// Produced at 100 Hz by the EKF. Unlike [`LaneMeasurement`], these values are
+/// referenced to the **front axle**, not the lookahead point — the estimator
+/// removes the lookahead geometry. Controllers that want lookahead-referenced
+/// values (the ported static-gain law does, because its field-tuned gains
+/// assume them) reconstruct them with [`Self::at_lookahead`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RoverState {
+    /// Lateral offset from lane centre at the front axle, metres.
+    pub cross_track_m: f32,
+    /// Heading error relative to the lane tangent, radians.
+    pub heading_err_rad: f32,
+    /// Lane curvature ahead, 1/metres.
+    pub curvature_inv_m: f32,
+    /// Forward speed, metres per second. Needs `metres_per_tick` calibration —
+    /// the ROS 2 system had no metric speed anywhere.
+    pub speed_mps: f32,
+    /// Estimated gyro z-axis bias, rad/s. Observable through the zero-rate
+    /// update while stationary; bounds how long the rover can coast on a lost
+    /// lane before heading drifts.
+    pub gyro_bias_radps: f32,
+    /// Diagonal of the covariance matrix, indexed by [`state_idx`]. Guidance
+    /// slows down as this grows rather than relying on a fixed timeout.
+    pub p_diag: [f32; EKF_STATES],
+    /// Milliseconds since the last accepted camera update. Saturates rather
+    /// than wrapping, so a long dropout reads as "very stale", not "fresh".
+    pub lane_age_ms: u16,
+}
+
+impl RoverState {
+    /// Reconstruct the lookahead-referenced errors the ported control law
+    /// expects, `l_a` metres ahead of the front axle.
+    ///
+    /// Returns `(cross_track_m, heading_err_rad)`. Feeding these to the
+    /// static-gain law keeps the field-derived `k_lat = 181.17 deg/m` and
+    /// `k_head = 2.024 deg/deg` valid unchanged, so swapping the EMA for the
+    /// EKF is not a reason to re-tune.
+    pub fn at_lookahead(&self, l_a: f32) -> (f32, f32) {
+        let cross = self.cross_track_m
+            + l_a * self.heading_err_rad
+            + 0.5 * self.curvature_inv_m * l_a * l_a;
+        let heading = self.heading_err_rad + l_a * self.curvature_inv_m;
+        (cross, heading)
+    }
+
+    /// Variance of the lateral position estimate, m^2.
+    ///
+    /// Available everywhere. `sqrt` lives in `std`, so firmware that wants to
+    /// reason about uncertainty compares variances rather than pulling in a
+    /// software float library for a cosmetic square root.
+    pub fn cross_track_var(&self) -> f32 {
+        self.p_diag[state_idx::CROSS_TRACK].max(0.0)
+    }
+
+    /// One-sigma uncertainty in lateral position, metres.
+    #[cfg(feature = "std")]
+    pub fn cross_track_sigma(&self) -> f32 {
+        self.cross_track_var().sqrt()
+    }
+}
+
+impl Wire for RoverState {
+    const TYPE_ID: u16 = 0x0601;
+    const WIRE_LEN: usize = 42;
+    const NAME: &'static str = "RoverState";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.cross_track_m);
+        w.f32(self.heading_err_rad);
+        w.f32(self.curvature_inv_m);
+        w.f32(self.speed_mps);
+        w.f32(self.gyro_bias_radps);
+        w.f32x5(self.p_diag);
+        w.u16(self.lane_age_ms);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            cross_track_m: r.f32(),
+            heading_err_rad: r.f32(),
+            curvature_inv_m: r.f32(),
+            speed_mps: r.f32(),
+            gyro_bias_radps: r.f32(),
+            p_diag: r.f32x5(),
+            lane_age_ms: r.u16(),
+        })
+    }
+}
+
+/// What the guidance law wants the rover to do, before safety limiting.
+///
+/// Kept separate from [`ChassisCommand`] on purpose: this is a request in
+/// physical units, that one is a normalised actuator command. The actuation
+/// task owns the conversion and every guard rail — saturation, slew limiting,
+/// the speed cap, stall detection — so an experimental controller cannot reach
+/// the hardware directly.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotionSetpoint {
+    /// Requested steering angle, radians. Positive steers right.
+    pub steer_rad: f32,
+    /// Requested forward speed, metres per second.
+    pub speed_mps: f32,
+}
+
+impl Wire for MotionSetpoint {
+    const TYPE_ID: u16 = 0x0602;
+    const WIRE_LEN: usize = 8;
+    const NAME: &'static str = "MotionSetpoint";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.steer_rad);
+        w.f32(self.speed_mps);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            steer_rad: r.f32(),
+            speed_mps: r.f32(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x07xx — mission
+// ===========================================================================
+
+/// A destination waypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MissionGoal {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+}
+
+impl Wire for MissionGoal {
+    const TYPE_ID: u16 = 0x0702;
+    const WIRE_LEN: usize = 16;
+    const NAME: &'static str = "MissionGoal";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f64(self.lat_deg);
+        w.f64(self.lon_deg);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            lat_deg: r.f64(),
+            lon_deg: r.f64(),
+        })
+    }
+}
+
+/// Mission progress, produced on the rover.
+///
+/// This replaces the ROS 2 `DesData` action's feedback and result channels.
+/// The action machinery — goal UUIDs, accept/reject, cancel handshakes, a
+/// feedback watchdog on the base station — existed to deliver these few fields
+/// reliably. Publishing them in the telemetry stream does the same job without
+/// a session, and keeps working over a lossy one-way link.
+///
+/// **The rover owns mission state.** `mission_active` came from the RPi in the
+/// ROS 2 system too; making that explicit means losing the base station never
+/// stops or endangers the rover, which is what the LoRa future requires.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MissionStatus {
+    /// True while the rover is permitted to drive. The actuation task
+    /// emergency-stops on a false edge.
+    pub active: bool,
+    /// Great-circle distance to the goal, metres. The ROS 2 action reported
+    /// kilometres in one place and metres in another; this is metres, always.
+    pub distance_remaining_m: f32,
+    /// `None` when no goal is loaded. On the wire this is a presence flag plus
+    /// a goal that is zeroed when absent — there are no optional fields in the
+    /// byte layout.
+    pub target: Option<MissionGoal>,
+    pub state: MissionState,
+}
+
+impl Wire for MissionStatus {
+    const TYPE_ID: u16 = 0x0701;
+    const WIRE_LEN: usize = 23;
+    const NAME: &'static str = "MissionStatus";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.bool(self.active);
+        w.f32(self.distance_remaining_m);
+        w.bool(self.target.is_some());
+        let goal = self.target.unwrap_or_default();
+        w.f64(goal.lat_deg);
+        w.f64(goal.lon_deg);
+        w.u8(self.state as u8);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        let active = r.bool();
+        let distance_remaining_m = r.f32();
+        let has_target = r.bool();
+        let goal = MissionGoal {
+            lat_deg: r.f64(),
+            lon_deg: r.f64(),
+        };
+        Ok(Self {
+            active,
+            distance_remaining_m,
+            target: has_target.then_some(goal),
+            state: MissionState::from_u8(r.u8())?,
+        })
+    }
+}
+
+// ===========================================================================
+// 0x08xx — base station link
+// ===========================================================================
+
+/// What the base station is asking the rover to do.
+///
+/// Discriminant values are part of the wire format and must not be renumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Command {
+    /// Do nothing. Sent as a keepalive so the base can prove the link works
+    /// without changing rover state.
+    #[default]
+    Nop,
+    /// Cap the speed the actuation task will ever request, as a percentage of
+    /// full duty, `0..=100`. `0` is a full stop override.
+    SetSpeedLimit(u8),
+    /// Load and arm a destination.
+    SetMissionGoal(MissionGoal),
+    /// Abandon the current goal and stop.
+    CancelMission,
+    /// Immediate stop.
+    ///
+    /// Best-effort by nature — it crosses a network. The stop that is
+    /// guaranteed is the firmware command watchdog, which needs no packet to
+    /// arrive in order to fire. Never design safety around this reaching the
+    /// rover.
+    EStop,
+}
+
+impl Command {
+    /// Largest payload any variant carries: a [`MissionGoal`].
+    const PAYLOAD_LEN: usize = MissionGoal::WIRE_LEN;
+
+    fn tag(&self) -> u8 {
+        match self {
+            Command::Nop => 0,
+            Command::SetSpeedLimit(_) => 1,
+            Command::SetMissionGoal(_) => 2,
+            Command::CancelMission => 3,
+            Command::EStop => 4,
+        }
+    }
+}
+
+/// A command from the base station, carried as an idempotent datagram.
+///
+/// There is no request/response handshake and no connection. The base
+/// retransmits the same frame at about 1 Hz until it sees `cmd_seq` echoed
+/// back in [`Telemetry::last_cmd_seq`]; the rover applies any frame newer than
+/// the last one it applied and ignores repeats.
+///
+/// This replaces the ROS 2 service and action clients. It is loss-tolerant,
+/// stateless, and works unchanged over a link that cannot carry TCP — which
+/// the LoRa base link cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CommandFrame {
+    /// Monotonic per base-station session. Wrapping is handled by comparing
+    /// with wrapping arithmetic, so a long session does not break the ordering.
+    pub cmd_seq: u16,
+    pub body: Command,
+}
+
+impl CommandFrame {
+    /// Whether this frame is newer than the last applied sequence number,
+    /// tolerant of `u16` wraparound.
+    ///
+    /// Treats the nearer half of the sequence space as "newer", the standard
+    /// approach for wrapping counters: a frame more than 32767 ahead is read as
+    /// stale rather than as an enormous jump forward.
+    pub fn is_newer_than(&self, last_applied: u16) -> bool {
+        self.cmd_seq != last_applied && self.cmd_seq.wrapping_sub(last_applied) < 0x8000
+    }
+}
+
+impl Wire for CommandFrame {
+    const TYPE_ID: u16 = 0x0802;
+    // cmd_seq(2) + tag(1) + fixed payload area(16)
+    const WIRE_LEN: usize = 3 + Command::PAYLOAD_LEN;
+    const NAME: &'static str = "CommandFrame";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.u16(self.cmd_seq);
+        w.u8(self.body.tag());
+
+        // The payload area is always written in full, whatever the variant, so
+        // the frame is a constant size. Unused bytes are zero.
+        match self.body {
+            Command::SetSpeedLimit(pct) => {
+                w.u8(pct);
+                for _ in 0..Command::PAYLOAD_LEN - 1 {
+                    w.u8(0);
+                }
+            }
+            Command::SetMissionGoal(goal) => {
+                w.f64(goal.lat_deg);
+                w.f64(goal.lon_deg);
+            }
+            Command::Nop | Command::CancelMission | Command::EStop => {
+                for _ in 0..Command::PAYLOAD_LEN {
+                    w.u8(0);
+                }
+            }
+        }
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        let cmd_seq = r.u16();
+        let tag = r.u8();
+        let body = match tag {
+            0 => Command::Nop,
+            1 => Command::SetSpeedLimit(r.u8()),
+            2 => Command::SetMissionGoal(MissionGoal {
+                lat_deg: r.f64(),
+                lon_deg: r.f64(),
+            }),
+            3 => Command::CancelMission,
+            4 => Command::EStop,
+            _ => {
+                return Err(DecodeError::BadDiscriminant {
+                    field: "Command",
+                    value: tag,
+                })
+            }
+        };
+        Ok(Self { cmd_seq, body })
+    }
+}
+
+/// Full telemetry frame for the LAN, at 5 Hz.
+///
+/// Composed of the same types the rest of the system uses rather than
+/// re-flattening them. The ROS 2 `TelemetryRelay` restated every field of
+/// every source message as a flat struct with a `*_valid` bool beside each
+/// group — 40-odd fields that had to be kept in step by hand, and which had
+/// already drifted: its `lane_*` fields were permanently hardcoded to
+/// `false`/`0` because the bridge that would have filled them was ruled out on
+/// architectural grounds and never removed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Telemetry {
+    pub seq: u32,
+    pub t_us: u64,
+    pub state: RoverState,
+    pub mission: MissionStatus,
+    pub power: PowerSample,
+    /// u-blox SimpleRTK2b.
+    pub rtk: GnssFix,
+    /// Spresense, as a cross-check and fallback.
+    pub backup: GnssFix,
+    /// Most recent [`CommandFrame::cmd_seq`] the rover applied. This is the
+    /// acknowledgement the base station retransmits until it sees.
+    pub last_cmd_seq: u16,
+    pub health: HealthBits,
+}
+
+impl Wire for Telemetry {
+    const TYPE_ID: u16 = 0x0801;
+    const WIRE_LEN: usize = 4
+        + 8
+        + RoverState::WIRE_LEN
+        + MissionStatus::WIRE_LEN
+        + PowerSample::WIRE_LEN
+        + GnssFix::WIRE_LEN * 2
+        + 2
+        + 2;
+    const NAME: &'static str = "Telemetry";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut n = 0;
+        let mut w = Writer::new(buf);
+        w.u32(self.seq);
+        w.u64(self.t_us);
+        n += w.len();
+        n += self.state.encode(&mut buf[n..]);
+        n += self.mission.encode(&mut buf[n..]);
+        n += self.power.encode(&mut buf[n..]);
+        n += self.rtk.encode(&mut buf[n..]);
+        n += self.backup.encode(&mut buf[n..]);
+        let mut w = Writer::new(&mut buf[n..]);
+        w.u16(self.last_cmd_seq);
+        w.u16(self.health.0);
+        n + w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        let seq = r.u32();
+        let t_us = r.u64();
+        let mut n = r.len();
+
+        let state = RoverState::decode(&buf[n..])?;
+        n += RoverState::WIRE_LEN;
+        let mission = MissionStatus::decode(&buf[n..])?;
+        n += MissionStatus::WIRE_LEN;
+        let power = PowerSample::decode(&buf[n..])?;
+        n += PowerSample::WIRE_LEN;
+        let rtk = GnssFix::decode(&buf[n..])?;
+        n += GnssFix::WIRE_LEN;
+        let backup = GnssFix::decode(&buf[n..])?;
+        n += GnssFix::WIRE_LEN;
+
+        let mut r = Reader::new(&buf[n..]);
+        Ok(Self {
+            seq,
+            t_us,
+            state,
+            mission,
+            power,
+            rtk,
+            backup,
+            last_cmd_seq: r.u16(),
+            health: HealthBits(r.u16()),
+        })
+    }
+}
+
+// NOTE: `TelemetryLite`, the 18-byte packed frame for a constrained LoRa link,
+// is specified in `docs/RUST_REWRITE_PLAN.md` §6.3 but deliberately not
+// implemented yet — the ESP32 radios are out of scope for this pass, and an
+// unused type is code that rots. Add it with `LoraSerialLink`, not before.
+
+// ===========================================================================
+// 0x09xx — debug
+// ===========================================================================
+
+/// Internals of the closed-loop speed PID, at the encoder rate.
+///
+/// These signals were computed and discarded inside the ROS 2 controller until
+/// a debug topic was added late; they turned out to be what made
+/// auto-calibration and stall detection tunable. First-class from the start
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SpeedLoopDebug {
+    pub measured_left_tps: f32,
+    pub measured_right_tps: f32,
+    pub target_tps: f32,
+    /// Error as a percentage of full scale — the unit the PID operates in.
+    /// Expressing it this way rather than in ticks/sec is what keeps the gains
+    /// valid across a re-calibration of `max_ticks_per_sec`.
+    pub error_pct: f32,
+    pub pid_output_pct: f32,
+}
+
+impl Wire for SpeedLoopDebug {
+    const TYPE_ID: u16 = 0x0901;
+    const WIRE_LEN: usize = 20;
+    const NAME: &'static str = "SpeedLoopDebug";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32(self.measured_left_tps);
+        w.f32(self.measured_right_tps);
+        w.f32(self.target_tps);
+        w.f32(self.error_pct);
+        w.f32(self.pid_output_pct);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            measured_left_tps: r.f32(),
+            measured_right_tps: r.f32(),
+            target_tps: r.f32(),
+            error_pct: r.f32(),
+            pid_output_pct: r.f32(),
+        })
+    }
+}
+
+/// EKF innovation for one camera update.
+///
+/// Logged from the first bench run. `Q` and `R` cannot be tuned without seeing
+/// the innovation sequence, and retrofitting this after the fact means
+/// repeating field runs to get the data.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EkfDebug {
+    /// Measurement minus prediction, in the camera's own units:
+    /// `[cross_track_m, heading_err_rad, curvature_inv_m]`.
+    pub innovation: [f32; 3],
+    /// Normalised innovation squared. Should average near 3 (the measurement
+    /// dimension) when `Q` and `R` are consistent with reality; persistently
+    /// higher means the filter trusts itself too much.
+    pub nis: f32,
+    /// True when the chi-square gate rejected this update. A steady trickle is
+    /// healthy — it is the gate catching glare and blob false positives. A
+    /// sustained run of rejections means the filter has diverged from the
+    /// world and is now rejecting the truth.
+    pub gated: bool,
+}
+
+impl Wire for EkfDebug {
+    const TYPE_ID: u16 = 0x0902;
+    const WIRE_LEN: usize = 17;
+    const NAME: &'static str = "EkfDebug";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.f32x3(self.innovation);
+        w.f32(self.nis);
+        w.bool(self.gated);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            innovation: r.f32x3(),
+            nis: r.f32(),
+            gated: r.bool(),
+        })
+    }
+}

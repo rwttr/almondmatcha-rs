@@ -1,0 +1,192 @@
+# almondmatcha — single source of truth for the whole system.
+#
+# Every host binary reads this at startup. The two firmware images parse the
+# subset they need at COMPILE time (include_str! + a const parser), so a NUCLEO
+# cannot be running against a stale copy of the routing table.
+#
+# Nothing here may be duplicated in code. If a constant appears in both a
+# source file and this file, this file is wrong or the source file is.
+
+# ---------------------------------------------------------------------------
+# Hosts. Static IPs on a private wired LAN; there is no discovery anywhere in
+# this system, by design.
+# ---------------------------------------------------------------------------
+[hosts]
+rpi     = "192.168.1.1"
+chassis = "192.168.1.2"
+jetson  = "192.168.1.5"
+sensors = "192.168.1.6"
+base    = "192.168.1.10"
+
+[ports]
+# One UDP port per receiving host. Type IDs demultiplex within a port, so
+# adding a message type never needs a firewall or config change.
+rpi     = 7001
+chassis = 7002
+jetson  = 7003
+sensors = 7004
+base    = 7005
+
+# ---------------------------------------------------------------------------
+# Routing: which hosts receive each message type.
+#
+# Unicast fan-out from a static table, NOT multicast. With five hosts and
+# sub-200-byte messages the duplication costs nothing, and it removes the IGMP
+# dependency that forced a hand-maintained initialPeersList in the ROS 2 system.
+# ---------------------------------------------------------------------------
+[routes]
+ImuSample       = ["rpi"]
+MagSample       = ["rpi"]
+ChassisStatus   = ["rpi"]
+ChassisCommand  = ["chassis"]
+WheelSensors    = ["rpi"]
+PowerSample     = ["rpi"]
+GnssFix         = ["rpi"]
+LaneMeasurement = ["rpi"]
+RoverState      = ["rpi"]
+MotionSetpoint  = ["rpi"]
+MissionStatus   = ["rpi"]
+Telemetry       = ["base"]
+CommandFrame    = ["rpi"]
+SpeedLoopDebug  = ["rpi"]
+EkfDebug        = ["rpi"]
+
+# ---------------------------------------------------------------------------
+# Drivetrain
+#
+# ⚠️  NOT YET CALIBRATED. The ROS 2 system had no metric speed anywhere and no
+#     record of encoder counts per revolution. Run both procedures in
+#     docs/RUST_REWRITE_PLAN.md §2.6 before trusting speed_mps.
+#
+# ⚠️  `decoding` MUST match the firmware. The mbed firmware attached interrupts
+#     to channel A only (rise + fall), giving 2x counts. Hardware quadrature
+#     timer mode gives 4x. Switching modes DOUBLES every tick count and halves
+#     metres_per_tick. Calibrate after choosing, never before.
+# ---------------------------------------------------------------------------
+[drivetrain]
+wheel_diameter_m = 0.125      # measured
+decoding         = "quadrature_4x"
+ticks_per_rev    = 0.0        # TODO: §2.6 Procedure A
+metres_per_tick  = 0.0        # TODO: §2.6 Procedure B — authoritative
+track_width_m    = 0.0        # TODO: measure; gives a second yaw-rate estimate
+wheelbase_m      = 0.4875     # measured, carried over from the ROS 2 system
+
+# ---------------------------------------------------------------------------
+# Perception geometry. Carried over unchanged — these are camera-calibration
+# facts, not tuning knobs.
+# ---------------------------------------------------------------------------
+[perception]
+bev_px_per_m   = 200.0
+lookahead_m    = 1.22         # ahead of the FRONT axle, set by the ROI geometry
+frame_width    = 1280
+frame_height   = 720
+fps            = 30
+
+# ---------------------------------------------------------------------------
+# Lateral control.
+#
+# `law` selects the LateralController implementation. Start on "static_gain":
+# it is the bit-exact port of the ROS 2 law and the parity baseline every other
+# controller is measured against. Do not switch until replay shows parity.
+# ---------------------------------------------------------------------------
+[control]
+law            = "static_gain"
+steer_max_deg  = 45.0
+steer_slew_deg_per_s = 180.0  # guard rail, applies to every law
+
+[control.static_gain]
+# Field-derived. A fixed LQR solution on the linearised error model, expressed
+# in degrees because the ROS 2 law output degrees.
+#
+# These assume LOOKAHEAD-referenced errors. The EKF estimates at the front
+# axle, so guidance must call RoverState::at_lookahead() before applying them —
+# that is what keeps these values valid across the EMA -> EKF change.
+k_lat  = 181.17               # deg per metre of lateral offset
+k_head = 2.024                # deg per degree of heading error
+
+[control.lqr]
+# Phase 2. Solved from the shared model in rover-model at startup, per speed
+# bin, because A depends on v. Weights only; gains are derived, never pasted.
+q_cross_track = 1.0
+q_heading     = 1.0
+r_steer       = 1.0
+
+[control.mpc]
+# Phase 3. Condensed to a box-constrained QP in `horizon` variables.
+horizon       = 10
+q_cross_track = 1.0
+q_heading     = 1.0
+r_steer       = 1.0
+r_steer_rate  = 1.0
+
+# ---------------------------------------------------------------------------
+# Speed loop. Field-derived on this rover: it cruises at 15-16% duty and cannot
+# climb the ramp below ~11%.
+# ---------------------------------------------------------------------------
+[speed]
+reference_mps         = 0.20
+kp                    = 0.3
+ki                    = 0.5
+kd                    = 0.0
+integral_limit        = 100.0
+max_duty_step_pct     = 15.0
+limit_cap_pct         = 40.0   # hard ceiling, independent of any controller
+sensor_timeout_s      = 1.0
+
+[speed.autocal]
+enabled        = true
+min_duty_pct   = 13.0          # under the cruise band, above the dead zone
+min_samples    = 40
+window_s       = 60.0
+
+[speed.stall]
+enabled            = true
+min_duty_pct       = 30.0      # well past what terrain needs; blocked, not loaded
+min_ticks_per_sec  = 10.0
+timeout_s          = 2.0
+
+# ---------------------------------------------------------------------------
+# State estimator. Q/R are starting points only.
+#
+# Seed measurement noise from recorded data: park the rover facing a straight
+# line and take the variance of the lane parameters over a few hundred frames.
+# The ROS 2 runs/ CSVs already contain what you need.
+# ---------------------------------------------------------------------------
+[estimator]
+predict_hz            = 100.0
+nis_gate              = 11.34  # chi-square, 3 DoF, 99%
+lane_stale_ms         = 500
+use_magnetometer      = false  # see §2.5 — motors distort it under load
+
+[estimator.q]                  # process noise
+cross_track  = 1e-4
+heading      = 1e-4
+curvature    = 1e-3
+speed        = 1e-3
+gyro_bias    = 1e-7
+
+[estimator.r]                  # measurement noise — MEASURE, do not guess
+lane_cross_track = 2.5e-3
+lane_heading     = 2.0e-3
+lane_curvature   = 1.0e-2
+odom_speed       = 1.0e-3
+
+# ---------------------------------------------------------------------------
+# Firmware safety. See docs/RUST_REWRITE_PLAN.md §5.2.
+#
+# The ROS 2 firmware had NO watchdog: if the RPi died mid-drive, the STM32 held
+# its last PWM indefinitely.
+# ---------------------------------------------------------------------------
+[safety]
+command_rate_hz       = 50
+command_timeout_ms    = 200    # 10 missed frames
+throttle_ramp_ms      = 300    # ramp to zero, not a step into a loaded drivetrain
+iwdg_timeout_ms       = 500    # independent watchdog: catches hung firmware
+
+# ---------------------------------------------------------------------------
+# Mission. Goals may be pre-loaded here and armed before departure — the rover
+# must be able to complete a mission with no uplink at all.
+# ---------------------------------------------------------------------------
+[mission]
+arrival_radius_m     = 2.0
+preloaded_goal       = []      # [lat, lon], empty = wait for a CommandFrame

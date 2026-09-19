@@ -33,3 +33,8 @@ ws_base/tools/
 
 # D415 capture utility output (Windows laptop tool, not workspace-scoped)
 tools/videocapture/
+
+# ---- Rust rewrite (branch `rs`) ----
+target/
+Cargo.lock
+.venv/

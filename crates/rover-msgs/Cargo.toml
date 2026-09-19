@@ -1,0 +1,13 @@
+[package]
+name        = "rover-msgs"
+description = "Wire types and codec shared by every rover node and both STM32 boards."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+
+[features]
+default = ["std"]
+std     = []
