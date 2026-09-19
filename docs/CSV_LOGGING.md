@@ -1,5 +1,12 @@
 # Dual CSV Logging Architecture
 
+> **This documents the ROS 2 system that branch `rs` replaced.** The dual-tier
+> D4/D5 relay architecture went with the DDS domains. Kept for its column
+> schemas and analysis guidance, which `rover-telemetry` follows. See design
+> defect D4 in [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) §13.3b for where
+> the base-station CSV knowingly contradicts this file.
+
+
 ## Overview
 
 The rover implements a **dual-tier CSV logging system** to ensure data redundancy, leverage hardware strengths, and prepare for future database migration:

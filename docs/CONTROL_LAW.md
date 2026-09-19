@@ -1,9 +1,22 @@
 # Control Law
 
+> **This documents the ROS 2 system that branch `rs` replaced.** It is kept
+> because the derivations and field-tuned constants in it are expensive to
+> regenerate, not because it describes what runs now. For the current system
+> see [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) (§13 is authoritative) and
+> [HARDWARE.md](HARDWARE.md).
+>
+> ⚠️ **This document describes a full PID (`k_e1`, `k_e2`, `k_p`, `k_i`,
+> `k_d`, `k_ff`) that `rover_kinematic_control_node.py` never actually
+> implemented.** The port in `crates/rover-control/src/guide.rs` follows the
+> code, not this document. That drift predates the rewrite and exists on
+> `main` too — see `RUST_REWRITE_PLAN.md` §10.
+
+
 Steering and speed control law implemented across the vision (Jetson, D6/D5)
 and chassis (RPi, D5) nodes. For network/domain topology see
-[ARCHITECTURE.md](ARCHITECTURE.md); for topic schemas see
-[TOPICS.md](TOPICS.md).
+[HARDWARE.md](HARDWARE.md); for topic schemas see
+`crates/rover-msgs`.
 
 ## Overview
 

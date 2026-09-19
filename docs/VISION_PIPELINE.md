@@ -1,9 +1,18 @@
 # Vision Pipeline
 
+> **This documents the ROS 2 system that branch `rs` replaced.** The pipeline
+> itself is ported behaviour-preservingly into
+> `perception/rover_perception/lane.py`, which cites this document by section;
+> the ROS wrapper described here (`lane_detection_node.py`) is gone, its
+> frame-to-frame state folded into `LaneDetector`. Camera capture and
+> detection now run in one process, so the `tpc_rover_d415_rgb` hop this
+> document ends at no longer exists.
+
+
 How a camera frame becomes the three numbers the steering loop consumes.
 This document ends where [CONTROL_LAW.md](CONTROL_LAW.md) begins — at the
-`tpc_rover_nav_lane` topic. For topic schemas see [TOPICS.md](TOPICS.md); for
-domain topology see [ARCHITECTURE.md](ARCHITECTURE.md).
+`tpc_rover_nav_lane` topic. For topic schemas see `crates/rover-msgs`; for
+domain topology see [HARDWARE.md](HARDWARE.md).
 
 **Files:**
 `ws_jetson/src/vision_navigation/vision_navigation/lane_detector.py` (the
