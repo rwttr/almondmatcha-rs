@@ -24,6 +24,10 @@ pub struct BusConfig {
     // `Bus::route_for::<T>()` needs nothing but `T` — no separate registry of
     // every type's ID has to be kept in step with this file.
     routes: HashMap<String, Vec<PeerId>>,
+    // Debug firehose mirror (`[debug] mirror`). `None` when unset — the
+    // field default, and the only state that costs `Bus::publish` anything
+    // at runtime: see its doc comment.
+    mirror: Option<SocketAddr>,
 }
 
 impl BusConfig {
@@ -65,7 +69,25 @@ impl BusConfig {
             routes.insert(msg_name, dests);
         }
 
-        Ok(Self { peers, routes })
+        // Empty (the field default, and what a bare `[debug]` section with no
+        // `mirror` key also deserializes to) means disabled. Anything else
+        // must parse as a real address — a typo'd mirror address that
+        // silently disables debugging is worse than a startup failure, since
+        // the whole point is to have it available when a field problem shows
+        // up.
+        let mirror = match raw.debug.mirror.trim() {
+            "" => None,
+            addr => Some(
+                addr.parse::<SocketAddr>()
+                    .map_err(|e| ConfigError::BadMirrorAddress(addr.to_string(), e))?,
+            ),
+        };
+
+        Ok(Self {
+            peers,
+            routes,
+            mirror,
+        })
     }
 
     /// The resolved address of a peer, if `[hosts]`/`[ports]` named it.
@@ -91,6 +113,15 @@ impl BusConfig {
     pub fn route_for<T: rover_msgs::Wire>(&self) -> &[PeerId] {
         self.routes.get(T::NAME).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// The debug firehose mirror address (`[debug] mirror`), if configured.
+    ///
+    /// `Bus::publish` sends an extra, best-effort copy of every frame here on
+    /// top of its normal route — see its doc comment. `None` (an absent or
+    /// empty `mirror` key) is the zero-cost default field runs must keep.
+    pub fn mirror(&self) -> Option<SocketAddr> {
+        self.mirror
+    }
 }
 
 /// Shape of the TOML file, before host/port names are resolved into
@@ -103,6 +134,17 @@ struct RawConfig {
     ports: HashMap<String, u16>,
     #[serde(default)]
     routes: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    debug: RawDebug,
+}
+
+/// `[debug]` is entirely optional — a config with no such section at all
+/// (every fixture and test config before this feature existed) must still
+/// parse, with mirroring disabled.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawDebug {
+    #[serde(default)]
+    mirror: String,
 }
 
 /// Something was wrong with a bus config file.
@@ -120,6 +162,8 @@ pub enum ConfigError {
     BadAddress(String, AddrParseError),
     /// A host appears in `[hosts]` but has no matching entry in `[ports]`.
     MissingPort(String),
+    /// `[debug] mirror` was non-empty but did not parse as `ip:port`.
+    BadMirrorAddress(String, AddrParseError),
 }
 
 impl fmt::Display for ConfigError {
@@ -136,6 +180,9 @@ impl fmt::Display for ConfigError {
             ConfigError::MissingPort(name) => {
                 write!(f, "host `{name}` is in [hosts] but missing from [ports]")
             }
+            ConfigError::BadMirrorAddress(addr, e) => {
+                write!(f, "[debug] mirror = \"{addr}\" is not a valid address: {e}")
+            }
         }
     }
 }
@@ -146,6 +193,7 @@ impl std::error::Error for ConfigError {
             ConfigError::Io(_, e) => Some(e),
             ConfigError::Toml(e) => Some(e),
             ConfigError::BadAddress(_, e) => Some(e),
+            ConfigError::BadMirrorAddress(_, e) => Some(e),
             _ => None,
         }
     }
@@ -242,6 +290,34 @@ mod tests {
     }
 
     #[test]
+    fn mirror_absent_section_is_none() {
+        // SAMPLE has no [debug] section at all.
+        let cfg = BusConfig::parse(SAMPLE).unwrap();
+        assert_eq!(cfg.mirror(), None);
+    }
+
+    #[test]
+    fn mirror_empty_string_is_none() {
+        let with_debug = format!("{SAMPLE}\n[debug]\nmirror = \"\"\n");
+        let cfg = BusConfig::parse(&with_debug).unwrap();
+        assert_eq!(cfg.mirror(), None);
+    }
+
+    #[test]
+    fn mirror_present_resolves_to_socket_addr() {
+        let with_debug = format!("{SAMPLE}\n[debug]\nmirror = \"192.168.1.100:7099\"\n");
+        let cfg = BusConfig::parse(&with_debug).unwrap();
+        assert_eq!(cfg.mirror(), Some("192.168.1.100:7099".parse().unwrap()));
+    }
+
+    #[test]
+    fn mirror_malformed_address_is_a_hard_error_not_a_silent_none() {
+        let with_debug = format!("{SAMPLE}\n[debug]\nmirror = \"not-an-address\"\n");
+        let err = BusConfig::parse(&with_debug).unwrap_err();
+        assert!(matches!(err, ConfigError::BadMirrorAddress(a, _) if a == "not-an-address"));
+    }
+
+    #[test]
     fn loads_the_real_repo_config() {
         // The actual file this crate ships against. If this ever fails, the
         // config file and this parser have drifted apart.
@@ -253,5 +329,7 @@ mod tests {
         );
         assert_eq!(cfg.route_for::<ImuSample>(), &[PeerId::Rpi]);
         assert_eq!(cfg.route_for::<Telemetry>(), &[PeerId::Base]);
+        // Shipped default is `mirror = ""` — disabled.
+        assert_eq!(cfg.mirror(), None);
     }
 }

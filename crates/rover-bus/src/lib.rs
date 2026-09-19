@@ -52,6 +52,10 @@ pub struct Bus<L: Link> {
     send_seq: HashMap<u16, u16>,
     latest: HashMap<u16, Slot>,
     callbacks: HashMap<u16, Vec<Callback>>,
+    // Count, not propagate: see `publish`'s doc comment on the mirror send.
+    // `u64` so a field run with the mirror pointed at a laptop that's been
+    // switched off for the whole run still can't wrap this around.
+    mirror_failures: u64,
 }
 
 impl<L: Link> Bus<L> {
@@ -62,19 +66,33 @@ impl<L: Link> Bus<L> {
             send_seq: HashMap::new(),
             latest: HashMap::new(),
             callbacks: HashMap::new(),
+            mirror_failures: 0,
         }
     }
 
     /// Encode `msg` and send it to every host `config/rover.toml` routes its
-    /// type to.
+    /// type to, plus the debug firehose mirror if `[debug] mirror` is set.
     ///
     /// A per-`TYPE_ID` sequence counter is what lets a receiver — or
     /// `rover-tap --hz` — see packet loss as gaps, per plan §4.1. Fan-out is
     /// best-effort per destination: a send failure to one host does not stop
     /// the others from receiving it, since an unreachable peer is exactly the
-    /// kind of thing this loss-tolerant protocol is meant to shrug off. If
-    /// any destination failed, this returns that failure after every send
-    /// has been attempted.
+    /// kind of thing this loss-tolerant protocol is meant to shrug off.
+    ///
+    /// **The returned `Err`, if any, names only the first destination that
+    /// failed — it is not a complete report.** Every configured destination
+    /// is still attempted regardless of earlier failures; a caller that needs
+    /// to know about every failed destination, not just that at least one
+    /// did, cannot get that from this return value and would need per-`Link`
+    /// instrumentation instead.
+    ///
+    /// The mirror send (see [`BusConfig::mirror`]) is different in kind, not
+    /// just another destination: it is a debugging convenience with a
+    /// deliberately absent operator on the other end most of the time, so its
+    /// failure is expected, routine, and must never surface as this call
+    /// failing — a laptop that has been closed or walked out of range cannot
+    /// be allowed to affect the control path. Its failures are only counted;
+    /// see [`Bus::mirror_failures`].
     pub fn publish<T: Wire>(&mut self, msg: &T) -> Result<(), LinkError> {
         let seq_slot = self.send_seq.entry(T::TYPE_ID).or_insert(0);
         let seq = *seq_slot;
@@ -89,10 +107,26 @@ impl<L: Link> Bus<L> {
                 first_err.get_or_insert(e);
             }
         }
+
+        if let Some(mirror_addr) = self.config.mirror() {
+            if self.link.send_to_addr(mirror_addr, &buf[..n]).is_err() {
+                self.mirror_failures = self.mirror_failures.wrapping_add(1);
+            }
+        }
+
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// How many mirror sends have failed since this `Bus` was created —
+    /// including every publish while `[debug] mirror` points at an address
+    /// nothing is listening on, which is the expected state outside an
+    /// active debugging session. Purely a diagnostic; nothing in this crate
+    /// acts on it.
+    pub fn mirror_failures(&self) -> u64 {
+        self.mirror_failures
     }
 
     /// Drain every frame currently waiting on the link, updating the
@@ -176,5 +210,191 @@ impl<L: Link> fmt::Debug for Bus<L> {
             .field("known_types_seen", &self.latest.len())
             .field("subscribed_types", &self.callbacks.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rover_link::{PeerId, UdpLink};
+    use rover_msgs::ImuSample;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    fn config_with_mirror(mirror: Option<&str>) -> BusConfig {
+        let mirror_line = mirror
+            .map(|a| format!("[debug]\nmirror = \"{a}\"\n"))
+            .unwrap_or_default();
+        let text = format!(
+            r#"
+            [hosts]
+            rpi = "127.0.0.1"
+
+            [ports]
+            rpi = 7001
+
+            [routes]
+            ImuSample = ["rpi"]
+
+            {mirror_line}
+            "#
+        );
+        BusConfig::parse(&text).unwrap()
+    }
+
+    fn imu() -> ImuSample {
+        ImuSample {
+            accel_mps2: [1.0, 2.0, 3.0],
+            gyro_radps: [0.0, 0.0, 0.0],
+            t_us: 1,
+        }
+    }
+
+    fn recv_with_retries(sock: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 256];
+        for _ in 0..200 {
+            match sock.recv(&mut buf) {
+                Ok(n) => return Some(buf[..n].to_vec()),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn publish_reaches_both_the_route_and_the_mirror() {
+        // A bare socket standing in for rpi (the normal route destination):
+        // recv() on a real socket, not another Bus, so this test only
+        // exercises Bus::publish's fan-out, not a second Bus's receive path.
+        let route_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        route_sock.set_nonblocking(false).unwrap();
+        route_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mirror_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        mirror_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        let config = config_with_mirror(Some(&mirror_sock.local_addr().unwrap().to_string()));
+        let mut peers = HashMap::new();
+        peers.insert(PeerId::Rpi, route_sock.local_addr().unwrap());
+        let link = UdpLink::bind(PeerId::Base, "127.0.0.1:0", peers).unwrap();
+        let mut bus = Bus::new(link, config);
+
+        bus.publish(&imu()).unwrap();
+
+        assert!(
+            recv_with_retries(&route_sock).is_some(),
+            "normal route never received the frame"
+        );
+        assert!(
+            recv_with_retries(&mirror_sock).is_some(),
+            "mirror never received the frame"
+        );
+        assert_eq!(bus.mirror_failures(), 0);
+    }
+
+    #[test]
+    fn publish_succeeds_even_when_the_mirror_is_unreachable() {
+        let route_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        route_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        // Bind and immediately drop a socket to get a port nothing is
+        // listening on, standing in for "the debugging laptop isn't here".
+        let dead_addr = {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+
+        let config = config_with_mirror(Some(&dead_addr.to_string()));
+        let mut peers = HashMap::new();
+        peers.insert(PeerId::Rpi, route_sock.local_addr().unwrap());
+        let link = UdpLink::bind(PeerId::Base, "127.0.0.1:0", peers).unwrap();
+        let mut bus = Bus::new(link, config);
+
+        // UDP has no delivery confirmation, so a send to a dead local port
+        // does not actually surface as a `send_to_addr` error on most
+        // platforms — the point of this test is the *contract*: whatever
+        // happens on the wire, `publish`'s `Ok` here is not contingent on
+        // the mirror at all. Combined with `Link::send_to_addr`'s own
+        // default-`Unsupported` test in rover-link, this is what makes the
+        // "must never affect the return value" requirement concrete rather
+        // than just documented.
+        assert!(bus.publish(&imu()).is_ok());
+        assert!(
+            recv_with_retries(&route_sock).is_some(),
+            "the real route must still get the frame even though the mirror is dead"
+        );
+    }
+
+    #[test]
+    fn publish_is_unaffected_by_a_link_that_cannot_mirror_at_all() {
+        // A `Link` whose `send_to_addr` uses the trait default
+        // (`LinkError::Unsupported`) — standing in for a future
+        // `LoraSerialLink`. This is the case the trait default exists for:
+        // `publish` must swallow it exactly like a network failure.
+        struct NoMirrorLink {
+            sent: Vec<u8>,
+        }
+        impl Link for NoMirrorLink {
+            fn send(&mut self, _dest: PeerId, frame: &[u8]) -> Result<(), LinkError> {
+                self.sent = frame.to_vec();
+                Ok(())
+            }
+            fn recv(&mut self) -> Option<(PeerId, rover_msgs::Frame<'_>)> {
+                None
+            }
+            fn mtu(&self) -> usize {
+                256
+            }
+            fn class(&self) -> rover_link::LinkClass {
+                rover_link::LinkClass::Lan
+            }
+            // send_to_addr intentionally not overridden.
+        }
+
+        let config = config_with_mirror(Some("127.0.0.1:9"));
+        let mut bus = Bus::new(NoMirrorLink { sent: Vec::new() }, config);
+
+        assert!(bus.publish(&imu()).is_ok());
+        assert_eq!(bus.mirror_failures(), 1);
+        assert!(!bus.link().sent.is_empty(), "the real route still ran");
+    }
+
+    #[test]
+    fn no_mirror_configured_means_no_mirror_send_is_attempted() {
+        struct CountingLink {
+            mirror_calls: u32,
+        }
+        impl Link for CountingLink {
+            fn send(&mut self, _dest: PeerId, _frame: &[u8]) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn recv(&mut self) -> Option<(PeerId, rover_msgs::Frame<'_>)> {
+                None
+            }
+            fn mtu(&self) -> usize {
+                256
+            }
+            fn class(&self) -> rover_link::LinkClass {
+                rover_link::LinkClass::Lan
+            }
+            fn send_to_addr(
+                &mut self,
+                _addr: std::net::SocketAddr,
+                _frame: &[u8],
+            ) -> Result<(), LinkError> {
+                self.mirror_calls += 1;
+                Ok(())
+            }
+        }
+
+        let config = config_with_mirror(None);
+        let mut bus = Bus::new(CountingLink { mirror_calls: 0 }, config);
+        bus.publish(&imu()).unwrap();
+        assert_eq!(bus.link().mirror_calls, 0);
     }
 }

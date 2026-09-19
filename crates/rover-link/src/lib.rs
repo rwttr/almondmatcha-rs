@@ -28,6 +28,7 @@ pub use udp::{UdpLink, LAN_MTU};
 use rover_msgs::Frame;
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 
 /// Largest single frame this crate's links will carry.
 ///
@@ -72,6 +73,27 @@ pub trait Link {
     /// information now so that decision does not require touching every
     /// existing `Link` impl later.
     fn class(&self) -> LinkClass;
+
+    /// Send one already-encoded frame straight to `addr`, bypassing the peer
+    /// table entirely.
+    ///
+    /// This exists for exactly one caller: `rover-bus`'s debug firehose
+    /// mirror (`BusConfig::mirror`, plan-adjacent but not itself in the plan
+    /// — see `config/rover.toml`'s `[debug]` section). A mirror destination
+    /// is an ad hoc debugging address with no place in the fixed five-host
+    /// [`PeerId`] table every other `send` call routes through, so it needs
+    /// its own escape hatch rather than a sixth, not-really-a-host `PeerId`
+    /// variant.
+    ///
+    /// The default implementation returns [`LinkError::Unsupported`]. That
+    /// is deliberately not a panic: a future `LoraSerialLink` has no notion
+    /// of an IP address to send to at all, and "this link cannot do that" is
+    /// a value a caller checks and ignores, not a reason for a debug-only
+    /// feature to take down a link with no way to support it.
+    fn send_to_addr(&mut self, addr: SocketAddr, frame: &[u8]) -> Result<(), LinkError> {
+        let _ = (addr, frame);
+        Err(LinkError::Unsupported)
+    }
 }
 
 /// What kind of link this is.
@@ -97,6 +119,10 @@ pub enum LinkError {
     UnknownPeer(PeerId),
     /// A frame larger than [`Link::mtu`] was handed to `send`.
     FrameTooLarge { len: usize, mtu: usize },
+    /// This link does not implement the operation that was called — today
+    /// only [`Link::send_to_addr`], whose default implementation returns
+    /// this.
+    Unsupported,
 }
 
 impl fmt::Display for LinkError {
@@ -107,6 +133,7 @@ impl fmt::Display for LinkError {
             LinkError::FrameTooLarge { len, mtu } => {
                 write!(f, "frame of {len} bytes exceeds link MTU of {mtu}")
             }
+            LinkError::Unsupported => write!(f, "operation not supported by this link"),
         }
     }
 }
@@ -117,5 +144,42 @@ impl std::error::Error for LinkError {
             LinkError::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `Link` that implements nothing beyond the required methods,
+    /// standing in for a future transport (e.g. `LoraSerialLink`) that has no
+    /// notion of a raw address to send to.
+    struct Bare;
+
+    impl Link for Bare {
+        fn send(&mut self, _dest: PeerId, _frame: &[u8]) -> Result<(), LinkError> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Option<(PeerId, Frame<'_>)> {
+            None
+        }
+        fn mtu(&self) -> usize {
+            64
+        }
+        fn class(&self) -> LinkClass {
+            LinkClass::Constrained {
+                bps: 1_000,
+                duty_pct: 1.0,
+            }
+        }
+    }
+
+    #[test]
+    fn send_to_addr_default_is_unsupported_not_a_panic() {
+        let mut link = Bare;
+        let err = link
+            .send_to_addr("127.0.0.1:9".parse().unwrap(), &[0u8; 4])
+            .unwrap_err();
+        assert!(matches!(err, LinkError::Unsupported));
     }
 }

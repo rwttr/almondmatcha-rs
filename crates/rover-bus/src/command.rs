@@ -52,7 +52,29 @@ impl CommandSender {
     /// `body` is identical to the pending one — so a repeated "cancel" click
     /// from an operator still restarts the 1 Hz retransmit clock.
     pub fn set(&mut self, body: Command) {
-        self.cmd_seq = self.cmd_seq.wrapping_add(1);
+        // The receiver's "nothing applied yet" state is the bare u16 `0`
+        // (see `CommandReceiver`), not an `Option` — chosen to mirror what
+        // actually crosses the wire, where there is no room for one. That
+        // makes "this sender never emits 0" load-bearing: if it did, a
+        // freshly restarted receiver would treat that command as a duplicate
+        // of its own startup state and silently drop it.
+        //
+        // So 0 is skipped on wraparound rather than merely asserted against.
+        // An assertion that can fire during correct operation is not an
+        // invariant, it is a delayed panic: `cmd_seq` wraps once every 65536
+        // commands, and a soak test or a long-lived ground station in a debug
+        // build would eventually hit it for no reason. Skipping the value
+        // makes the invariant true for the life of the process, which is what
+        // lets the debug_assert below mean something.
+        self.cmd_seq = match self.cmd_seq.wrapping_add(1) {
+            0 => 1,
+            n => n,
+        };
+        debug_assert_ne!(
+            self.cmd_seq, 0,
+            "CommandSender must never emit cmd_seq == 0; it is CommandReceiver's \
+             sentinel for \"nothing applied yet\""
+        );
         self.pending = Some(CommandFrame {
             cmd_seq: self.cmd_seq,
             body,
@@ -294,5 +316,32 @@ mod tests {
         tx.on_telemetry(rx.last_applied());
         assert!(tx.is_acked());
         assert!(tx.poll(t + Duration::from_secs(1)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod wraparound_tests {
+    use super::*;
+
+    /// `cmd_seq` must skip 0 when it wraps, for the life of the process.
+    ///
+    /// 0 is the receiver's "nothing applied yet" sentinel. A sender that
+    /// emitted it after 65536 commands would have that command silently
+    /// dropped by any receiver still sitting at startup state — a failure
+    /// that would only ever show up in a long field session, which is the
+    /// worst possible place to discover it.
+    #[test]
+    fn cmd_seq_skips_zero_on_wraparound() {
+        let mut s = CommandSender::new(core::time::Duration::from_secs(1));
+
+        // Walk right up to the wrap point.
+        for _ in 0..u16::MAX {
+            s.set(Command::Nop);
+        }
+        assert_eq!(s.cmd_seq, u16::MAX, "should be at the wrap boundary");
+
+        // The next one must land on 1, not 0.
+        s.set(Command::Nop);
+        assert_eq!(s.cmd_seq, 1, "wraparound must skip the reserved sentinel 0");
     }
 }

@@ -88,6 +88,20 @@ impl UdpLink {
             .map(|(&p, _)| p)
     }
 
+    /// Shared by [`Link::send`] and [`Link::send_to_addr`]: the MTU check and
+    /// the actual socket write are identical either way, only how the
+    /// destination address was obtained differs.
+    fn send_raw(&mut self, addr: SocketAddr, frame: &[u8]) -> Result<(), LinkError> {
+        if frame.len() > self.mtu() {
+            return Err(LinkError::FrameTooLarge {
+                len: frame.len(),
+                mtu: self.mtu(),
+            });
+        }
+        self.socket.send_to(frame, addr).map_err(LinkError::Io)?;
+        Ok(())
+    }
+
     /// Read one datagram from a recognised peer into `self.buf`, retrying
     /// past anything from an unrecognised sender. Returns the sender and how
     /// many bytes of `self.buf` it wrote — deliberately not a `Frame`, so
@@ -118,15 +132,8 @@ impl UdpLink {
 
 impl Link for UdpLink {
     fn send(&mut self, dest: PeerId, frame: &[u8]) -> Result<(), LinkError> {
-        if frame.len() > self.mtu() {
-            return Err(LinkError::FrameTooLarge {
-                len: frame.len(),
-                mtu: self.mtu(),
-            });
-        }
         let addr = *self.peers.get(&dest).ok_or(LinkError::UnknownPeer(dest))?;
-        self.socket.send_to(frame, addr).map_err(LinkError::Io)?;
-        Ok(())
+        self.send_raw(addr, frame)
     }
 
     fn recv(&mut self) -> Option<(PeerId, Frame<'_>)> {
@@ -149,6 +156,10 @@ impl Link for UdpLink {
 
     fn class(&self) -> LinkClass {
         LinkClass::Lan
+    }
+
+    fn send_to_addr(&mut self, addr: SocketAddr, frame: &[u8]) -> Result<(), LinkError> {
+        self.send_raw(addr, frame)
     }
 }
 
@@ -219,6 +230,51 @@ mod tests {
         let (mut a, _b) = linked_pair();
         let big = vec![0u8; LAN_MTU + 1];
         let err = a.send(PeerId::Chassis, &big).unwrap_err();
+        assert!(matches!(err, LinkError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn send_to_addr_reaches_a_raw_address_outside_the_peer_table() {
+        // The debug mirror's whole point: a destination `send` cannot reach
+        // because it was never registered as a `PeerId`.
+        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mut mirror = UdpLink::bind(PeerId::Base, "127.0.0.1:0", HashMap::new()).unwrap();
+        let mirror_addr = mirror.local_addr().unwrap();
+        // The mirror still has to recognise `a` as a sender to accept its
+        // datagram — that part of the peer table isn't bypassed, only the
+        // *destination* lookup on the sending side is.
+        mirror.set_peer(PeerId::Rpi, a.local_addr().unwrap());
+
+        let mut buf = [0u8; rover_msgs::frame::MAX_FRAME_LEN];
+        let n = encode_frame(
+            &ImuSample {
+                accel_mps2: [0.0; 3],
+                gyro_radps: [0.0; 3],
+                t_us: 0,
+            },
+            0,
+            &mut buf,
+        );
+        a.send_to_addr(mirror_addr, &buf[..n]).unwrap();
+
+        let mut received = false;
+        for _ in 0..200 {
+            if mirror.recv().is_some() {
+                received = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(received, "frame sent via send_to_addr never arrived");
+    }
+
+    #[test]
+    fn send_to_addr_oversized_frame_is_rejected_the_same_way_as_send() {
+        let mut a = UdpLink::bind(PeerId::Rpi, "127.0.0.1:0", HashMap::new()).unwrap();
+        let big = vec![0u8; LAN_MTU + 1];
+        let err = a
+            .send_to_addr("127.0.0.1:9".parse().unwrap(), &big)
+            .unwrap_err();
         assert!(matches!(err, LinkError::FrameTooLarge { .. }));
     }
 }

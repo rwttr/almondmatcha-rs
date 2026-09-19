@@ -1,0 +1,28 @@
+[project]
+name = "rover-perception"
+version = "0.1.0"
+description = "Jetson perception process: camera capture + lane detection, one process, no ROS."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+# pyrealsense2 is deliberately NOT a hard dependency: it has no wheel for
+# every platform this code is developed and tested on (notably macOS), and
+# camera.py imports it lazily behind a try/except so the video-file fallback
+# and the whole test suite work without it. Install it on the Jetson itself:
+#   pip install pyrealsense2
+
+[project.optional-dependencies]
+realsense = ["pyrealsense2"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+rover-perception = "rover_perception.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rover_perception*"]

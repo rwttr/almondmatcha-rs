@@ -35,9 +35,18 @@ struct Args {
     /// Which host's traffic to observe. Routing is unicast fan-out, not
     /// multicast (plan §4.1), so this tool only sees what is actually
     /// addressed to that host — pick the one that receives what you care
-    /// about. Most types route to "rpi".
+    /// about. Most types route to "rpi". Ignored if `--mirror` is given.
     #[arg(long = "as", default_value = "rpi")]
     as_host: String,
+
+    /// Bind to the debug firehose mirror instead of a named host — the only
+    /// way to see the *entire* bus at once, including `ChassisCommand` and
+    /// `Telemetry`, which no single `--as <host>` can (see `--as`'s help).
+    /// Requires `[debug] mirror` to be set in the config to a real address,
+    /// normally this machine's own — that is what tells every publisher to
+    /// send a copy here.
+    #[arg(long)]
+    mirror: bool,
 
     /// Only show one message type, by its wire name (e.g. `ImuSample`).
     #[arg(long = "type")]
@@ -48,19 +57,37 @@ struct Args {
     hz: bool,
 }
 
-fn main() -> ExitCode {
-    let args = Args::parse();
-    match run(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("rover-tap: {e}");
-            ExitCode::FAILURE
-        }
-    }
+/// Where to bind and which senders to recognise, resolved from either
+/// `--as <host>` or `--mirror`.
+struct Listen {
+    bind_addr: SocketAddr,
+    peers: HashMap<PeerId, SocketAddr>,
+    /// What to print in the startup banner.
+    label: String,
+    /// `UdpLink::bind` needs *some* `PeerId` to label itself with, but a
+    /// mirror listener doesn't stand in for any of the five real hosts — it
+    /// is an extra observer, not a peer anything sends *to* by name. Nothing
+    /// in this binary reads `UdpLink::self_id()` back, so an arbitrary value
+    /// here is inert; `label` above is what actually gets shown.
+    link_self_id: PeerId,
 }
 
-fn run(args: Args) -> Result<(), TapError> {
-    let config = BusConfig::load(&args.config).map_err(TapError::Config)?;
+fn plan_listen(config: &BusConfig, args: &Args) -> Result<Listen, TapError> {
+    if args.mirror {
+        let mirror_addr = config.mirror().ok_or(TapError::MirrorNotConfigured)?;
+        let mut peers = HashMap::new();
+        for peer in PeerId::ALL {
+            if let Some(addr) = config.addr_of(peer) {
+                peers.insert(peer, addr);
+            }
+        }
+        return Ok(Listen {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), mirror_addr.port()),
+            peers,
+            label: "the debug mirror (the whole bus)".to_string(),
+            link_self_id: PeerId::Base,
+        });
+    }
 
     let self_id =
         PeerId::parse(&args.as_host).ok_or_else(|| TapError::UnknownHost(args.as_host.clone()))?;
@@ -86,10 +113,36 @@ fn run(args: Args) -> Result<(), TapError> {
         }
     }
 
-    let link = UdpLink::bind(self_id, bind_addr, peers).map_err(TapError::Link)?;
+    Ok(Listen {
+        bind_addr,
+        peers,
+        label: format!("`{self_id}`"),
+        link_self_id: self_id,
+    })
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    match run(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rover-tap: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: Args) -> Result<(), TapError> {
+    let config = BusConfig::load(&args.config).map_err(TapError::Config)?;
+    let listen = plan_listen(&config, &args)?;
+
+    let link = UdpLink::bind(listen.link_self_id, listen.bind_addr, listen.peers)
+        .map_err(TapError::Link)?;
 
     eprintln!(
-        "rover-tap: listening as `{self_id}` on port {port}{}",
+        "rover-tap: listening as {} on port {}{}",
+        listen.label,
+        listen.bind_addr.port(),
         args.type_filter
             .as_deref()
             .map(|t| format!(", filtering to `{t}`"))
@@ -170,6 +223,7 @@ enum TapError {
     UnknownHost(String),
     NoAddress(PeerId),
     Link(LinkError),
+    MirrorNotConfigured,
 }
 
 impl fmt::Display for TapError {
@@ -179,6 +233,11 @@ impl fmt::Display for TapError {
             TapError::UnknownHost(h) => write!(f, "`{h}` is not a known host (see PeerId::ALL)"),
             TapError::NoAddress(p) => write!(f, "no address configured for `{p}` in [hosts]"),
             TapError::Link(e) => write!(f, "{e}"),
+            TapError::MirrorNotConfigured => write!(
+                f,
+                "--mirror was given but [debug] mirror is empty in the config; \
+                 set it to this machine's address (e.g. \"192.168.1.100:7099\") first"
+            ),
         }
     }
 }

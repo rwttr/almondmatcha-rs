@@ -1,0 +1,94 @@
+[package]
+name        = "chassis-fw"
+description = "STM32F767ZI firmware: motor PWM, steering servo, LSM6DSV16X IMU, command watchdog."
+version     = "0.1.0"
+edition     = "2021"
+license     = "Apache-2.0"
+publish     = false
+
+# Not a workspace member: this crate builds for thumbv7em-none-eabihf, the
+# root workspace builds for the host. Cargo does not support two default
+# targets in one workspace, so this crate is deliberately excluded (see the
+# root Cargo.toml's module comment) and depends on rover-msgs by path instead
+# of `workspace = true`.
+[dependencies]
+rover-msgs = { path = "../../crates/rover-msgs", default-features = false }
+
+# --- Embassy async runtime -------------------------------------------------
+# Versions pinned exactly, per the rewrite plan: a firmware image is not the
+# place to float on semver and discover a breaking change during a field
+# bring-up session.
+embassy-executor = { version = "=0.10.0", features = ["defmt", "platform-cortex-m", "executor-thread"] }
+embassy-time     = { version = "=0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-sync     = { version = "=0.8.0", features = ["defmt"] }
+embassy-futures  = { version = "=0.1.2" }
+
+# embassy-net: UDP only (rev 2 dropped TCP everywhere, see plan §4.2), static
+# IP only (no DHCP - this is a closed LAN with a fixed routing table in
+# config/rover.toml).
+embassy-net = { version = "=0.9.1", features = ["defmt", "udp", "medium-ethernet", "proto-ipv4"] }
+
+# embassy-stm32: `stm32f767zi` is the real die on the Nucleo board. The
+# plan's "built against stm32f777zi" note is about which chip embassy's
+# upstream *example* targets (same silicon family, crypto fused on) - our
+# Cargo.toml targets the real part directly, which crates.io has as its own
+# feature. `time-driver-tim5`: TIM5 is not used by any PWM or encoder
+# function on this board, so pinning the time driver to it (rather than
+# `time-driver-any`, which could silently pick TIM2 - our steering timer -
+# or TIM3 - our right motor timer - depending on embassy's internal
+# preference order) avoids a peripheral collision that would only show up
+# as a HardFault or silently-wrong PWM at runtime.
+embassy-stm32 = { version = "=0.6.0", default-features = false, features = [
+    "defmt",
+    "stm32f767zi",
+    "memory-x",
+    "time-driver-tim5",
+    "single-bank",
+    "exti",
+] }
+
+# --- Boot / panic / logging -------------------------------------------------
+cortex-m     = { version = "=0.7.9", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt  = { version = "=0.7.6" }
+defmt        = { version = "=1.1.1" }
+defmt-rtt    = { version = "=1.3.0" }
+panic-probe  = { version = "=1.0.0", features = ["print-defmt"] }
+
+# --- Misc no_std helpers -----------------------------------------------------
+static_cell      = { version = "=2.1.1" }
+heapless         = { version = "=0.9.3", default-features = false }
+embedded-hal     = { version = "=1.0.0" }
+embedded-io-async = { version = "=0.7.0" }
+
+# --- Sensor drivers ----------------------------------------------------------
+# ST's own Rust drivers (BSD-3-Clause), same vendor/register abstraction as
+# the C driver already vendored in the ROS 2 tree's libs/.
+#
+# NOTE (deviation from the plan): the plan names lsm6dsv16x-rs v2.1.0 /
+# lis2mdl-rs v2.0.0. Both those versions depend on `bisync` (to generate
+# their blocking/async API split at compile time), and as of this writing
+# EVERY published version of `bisync` on crates.io is yanked, so v2.x cannot
+# be freshly resolved at all (`cargo generate-lockfile` fails outright).
+# v1.0.0 of each predates the bisync-based async/blocking split - it's a
+# single, plain synchronous API with the exact same method names
+# (new_i2c/device_id_get/xl_data_rate_set/acceleration_raw_get/
+# from_fs4_to_mg/...) - and its own dependency tree has no yanked crates.
+# Confirmed by hand against the v1.0.0 tag source on GitHub. If ST re-yanks
+# or fixes `bisync`, revisit.
+lsm6dsv16x-rs = { version = "=1.0.0" }
+lis2mdl-rs    = { version = "=1.0.0", optional = true }
+
+[features]
+default = []
+# LIS2MDL magnetometer scaffolding. Default OFF - see plan §2.5: motor
+# current draw distorts the field under load, and the estimator does not
+# consume MagSample yet. Wiring it up is here only so the hardware and the
+# wire message are not both dead code; it is not fused into anything.
+magnetometer = ["dep:lis2mdl-rs"]
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+debug         = 2
+panic         = "abort"
