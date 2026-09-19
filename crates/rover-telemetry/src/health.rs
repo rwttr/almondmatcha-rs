@@ -16,17 +16,34 @@ use rover_msgs::{ChassisStatus, HealthBits, RoverState};
 // ---------------------------------------------------------------------------
 // Staleness thresholds.
 //
-// Each is roughly 5-10x the feed's native publish period (documented per
-// rover_msgs' own rate comments and docs/CSV_LOGGING.md): generous enough to
-// absorb a couple of dropped frames without the health bit flapping on
-// ordinary jitter, tight enough that a genuinely dead feed is flagged within
-// about a second. `lane_stale_ms` is the one exception — it is not a
-// constant here at all, see `LANE_STALE` below.
+// Each is 2.5-10x the feed's native publish period: generous enough to absorb
+// a dropped frame or two without the health bit flapping on ordinary jitter,
+// tight enough that a genuinely dead feed is flagged within about a second.
+// `lane_stale_ms` is the one exception — it is not a constant here at all,
+// see `LANE_STALE` below.
+//
+// The spread is not uniform and that is deliberate: the two wired 5 Hz board
+// feeds sit at 2.5x, the two 10 Hz GNSS feeds at 10x, because a GNSS solution
+// drops a sentence far more readily than a board on a switch does.
+//
+// ⚠️ 2.5x is tight. Two consecutive lost datagrams plus scheduling jitter
+// will trip the 5 Hz bits, and nothing has run on hardware yet to say how
+// often that happens in practice. If these flap in the field, raise them to
+// 1000 ms (5x) rather than suppressing the bit — a health bit people learn to
+// ignore is worse than none. Left tight for now because both feeds carry
+// safety-relevant state (`watchdog_tripped`, INA226 liveness) and an early
+// flag beats a late one.
 // ---------------------------------------------------------------------------
 
-/// `ChassisStatus` has no documented rate, but it rides along with the 50 Hz
-/// command loop (plan §5.2's `command_rate_hz`) on the same board; 500 ms is
-/// 25 missed reports.
+/// `ChassisStatus` is published at 5 Hz by the chassis board's own
+/// `status_task` — `firmware/chassis/src/config.rs`'s `STATUS_PUBLISH_HZ`,
+/// on its own `Ticker`, matching `Telemetry`'s rate. 500 ms is 2.5 missed
+/// reports.
+///
+/// (This used to say the feed "rides along with the 50 Hz command loop ...
+/// 500 ms is 25 missed reports". Both halves were wrong: `status_task` is a
+/// separate task at 5 Hz, so the real margin is a tenth of what the comment
+/// claimed.)
 pub const CHASSIS_STALE_MS: u64 = 500;
 
 /// `PowerSample` is 5 Hz (rover_msgs' own doc comment). 500 ms is the same
@@ -69,7 +86,7 @@ pub struct FeedAges {
 /// [`RoverState::lane_age_ms`], **not** from subscribing to
 /// `LaneMeasurement` directly — see the module doc comment on why a second
 /// raw-lane bridge onto the RPi/base side is exactly what
-/// `HANDOFF_field_run_verification.md` rules out, and `RoverState` already
+/// the field-run hand-off ruled out, and `RoverState` already
 /// carries the one number (`lane_age_ms`, reset only on an *accepted* camera
 /// update — see `docs/RUST_REWRITE_PLAN.md` §13.3 item 5) this bit needs.
 /// `lane_stale_ms` is `[estimator] lane_stale_ms` from `config/rover.toml` —
@@ -269,7 +286,7 @@ mod tests {
 /// Stall detection from the closed-loop speed PID's debug signal.
 ///
 /// Ports the auto-calibration-era heuristic described in
-/// `HANDOFF_field_run_verification.md` and encoded in `config/rover.toml`'s
+/// the field-run hand-off and encoded in `config/rover.toml`'s
 /// `[speed.stall]` table: commanding a high duty cycle while barely moving,
 /// sustained for a timeout (not instantaneous — a single noisy sample must
 /// not trip it), means a wheel is physically blocked rather than just

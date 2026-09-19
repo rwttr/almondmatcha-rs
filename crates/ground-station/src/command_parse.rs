@@ -1,7 +1,7 @@
 //! Parsing operator input into a [`Command`].
 //!
 //! Pulled out of `main.rs` (which reads real stdin — not exercisable in a
-//! test here, see the top-level report) so the actual parsing logic is a
+//! test here) so the actual parsing logic is a
 //! plain `&str -> Result` function a unit test can drive directly.
 //!
 //! Words, not single keystrokes: `main.rs` reads whole lines from stdin, so

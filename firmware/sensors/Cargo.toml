@@ -66,9 +66,7 @@ panic-probe  = { version = "=1.0.0", features = ["print-defmt"] }
 # same name, and the crate would fail to compile with a confusing trait-bound
 # error rather than a version-conflict error.
 static_cell       = { version = "=2.1.1" }
-heapless          = { version = "=0.9.3", default-features = false }
 embedded-hal      = { version = "=1.0.0" }
-embedded-io-async = { version = "=0.7.0" }
 
 # --- Sensor drivers ----------------------------------------------------------
 # INA226 power monitor, per the plan §5.1's own recommendation. Unlike

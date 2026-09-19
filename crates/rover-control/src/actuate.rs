@@ -153,8 +153,8 @@ impl SpeedController {
 
     /// Fallback duty percentage used by [`Self::target_duty_pct`] while
     /// `drivetrain.metres_per_tick` is `0.0` (uncalibrated). `16.0` is not
-    /// invented: it is `speed_ref` from `docs/CONTROL_LAW.md` §2.1's "Current
-    /// gains" table — "16% nominal cruise duty when lane detected" — the
+    /// invented: it is `speed_ref` from `docs/CONTROL_LAW.md` §2.1's Stage-1
+    /// parameter table — "16% nominal cruise duty when lane detected" — the
     /// last value this rover is documented to have actually cruised at. It
     /// sits comfortably above `autocal_min_duty_pct` (13.0) so a bench run
     /// with no calibration yet still collects auto-calibration samples,
@@ -690,7 +690,8 @@ impl Actuator {
     }
 
     /// Build this tick's `ChassisCommand`. Called at the configured
-    /// emission rate (plan §8: 50 Hz) — **always**, even when `!drive_allowed`,
+    /// emission rate (plan §5.2 / `[safety] command_rate_hz` = 50 Hz) —
+    /// **always**, even when `!drive_allowed`,
     /// because the firmware command watchdog (plan §5.2) treats silence
     /// itself as a fault condition.
     pub fn tick_chassis_command(

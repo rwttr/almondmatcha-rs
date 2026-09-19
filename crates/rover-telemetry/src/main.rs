@@ -6,7 +6,7 @@
 //! **one** process rather than two.
 //!
 //! # Why one process where ROS 2 used two, and why that does not undo
-//! `HANDOFF_field_run_verification.md`'s ruling
+//! the field-run hand-off's ruling
 //!
 //! The ROS 2 split existed for two reasons, per the hand-off doc: (1) keep
 //! the relay lean as "the planned future home for a low-bitrate LPWAN

@@ -80,7 +80,7 @@ pub trait Link {
     /// This exists for exactly one caller: `rover-bus`'s debug firehose
     /// mirror (`BusConfig::mirror`, plan-adjacent but not itself in the plan
     /// — see `config/rover.toml`'s `[debug]` section). A mirror destination
-    /// is an ad hoc debugging address with no place in the fixed five-host
+    /// is an ad hoc debugging address with no place in the fixed seven-service
     /// [`PeerId`] table every other `send` call routes through, so it needs
     /// its own escape hatch rather than a sixth, not-really-a-host `PeerId`
     /// variant.

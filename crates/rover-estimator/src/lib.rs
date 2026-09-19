@@ -35,14 +35,25 @@
 //! predicting forward on gyro (and odometry, if calibrated), so the estimate
 //! and its uncertainty both keep evolving through a dropout instead of
 //! freezing at the last good camera fix. `lane_age_ms` is the observable
-//! signal for how long that has been going on; it resets on any *received*
-//! camera measurement, whether or not the chi-square gate then accepts it —
-//! a gated measurement still proves the camera is alive, just that this one
-//! reading looked like an outlier. A real dropout (`valid == false`) is a
-//! different failure mode from a persistently gated one (a diverged filter,
-//! or sustained glare) and the two are deliberately reported through
-//! different signals: `lane_age_ms` for the former, [`rover_msgs::EkfDebug`]
-//! for the latter.
+//! signal for how long that has been going on; it resets **only on an
+//! *accepted* camera update**. A reading the chi-square gate rejects
+//! contributes nothing to the estimate, so counting it as fresh would let a
+//! detector producing consistent garbage read as healthy while the filter
+//! silently coasted with no corrections (plan §13.3 item 5).
+//!
+//! A real dropout (`valid == false`) and a persistently gated one (a diverged
+//! filter, or sustained glare) therefore **both** show up as a growing
+//! `lane_age_ms`. What separates them is [`rover_msgs::EkfDebug`], which is
+//! emitted for every *received* measurement and carries `gated` plus the NIS
+//! — a dropout produces no `EkfDebug` at all, a gated stream produces one per
+//! frame with `gated: true`.
+//!
+//! This matters downstream: `lane_age_ms` drives `confidence_speed_scale` in
+//! `rover-control`'s actuate stage, which ramps speed to zero over a few
+//! seconds, and `HealthBits::LANE_STALE`. An earlier version of this comment
+//! said the opposite — that a gated reading counted as fresh — which would
+//! have told a reader that a persistently-gated camera leaves the rover at
+//! full speed. It does not.
 //!
 //! # The `metres_per_tick == 0.0` trap
 //!

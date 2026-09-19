@@ -52,7 +52,7 @@ pub const IMU_SAMPLE_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
 pub const CHASSIS_STATUS_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed) - there is no vendor
-/// assignment to collide with on a closed LAN with four fixed hosts. The last
+/// assignment to collide with on a closed LAN with five fixed hosts. The last
 /// octet mirrors the board's IP host part (`.2`) purely so a packet capture
 /// is legible; it has no protocol meaning.
 pub const MAC_ADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];

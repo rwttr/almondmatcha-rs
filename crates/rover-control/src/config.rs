@@ -6,7 +6,7 @@
 //!
 //! Follows the pattern in `crates/rover-bus/src/config.rs`: deserialize into
 //! a private `Raw*` shape with `serde`, ignore every table this crate does
-//! not own (`[hosts]`, `[routes]`, `[mission]`, ...), and resolve into typed
+//! not own (`[services]`, `[routes]`, `[mission]`, ...), and resolve into typed
 //! values the rest of the binary works with. Two independent loaders reading
 //! one file, each blind to the other's tables, is what lets `rover-bus` and
 //! `rover-control` each own their slice without a shared parser to keep in
@@ -408,10 +408,10 @@ mod tests {
         iwdg_timeout_ms = 500
 
         # Tables this crate does not own must not break parsing.
-        [hosts]
-        rpi = "192.168.1.1"
-        [ports]
-        rpi = 7001
+        [services]
+        control = "192.168.1.1:7001"
+        [debug]
+        mirror = ""
     "#;
 
     #[test]

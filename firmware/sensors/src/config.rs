@@ -28,20 +28,36 @@ pub const SELF_PORT: u16 = 7011;
 pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7001);
 
 /// `[services] telemetry` address. `rover-telemetry` subscribes to
-/// `WheelSensors` (for its liveness bookkeeping) and `PowerSample`, and this
-/// board watches *inbound* `Telemetry` from here as its own link-watchdog
-/// heartbeat — see `watchdog.rs`.
+/// `PowerSample` from this board (`[routes]`), and this board watches
+/// *inbound* `Telemetry` from here as its own link-watchdog heartbeat — see
+/// `watchdog.rs`.
 pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
 
 /// Per-message-type destination table.
 ///
-/// `WheelSensors` is the one message on this rover that needs two
-/// destinations — `control` for the speed loop, `telemetry` for its CSV and
-/// liveness bookkeeping — so it is a slice, not a single address; every
-/// other message here still needs only one. That asymmetry is exactly what
-/// `docs/RUST_REWRITE_PLAN.md`'s D1 fix anticipates: "no message needs more
-/// than two destinations, so the cost on the MCUs is one extra `send_to`."
-pub const WHEEL_SENSORS_DESTS: [(Ipv4Address, u16); 2] = [CONTROL_ADDR, TELEMETRY_ADDR];
+/// Every message this board publishes has exactly one destination, so each
+/// is a single address rather than a slice. Naming them by message type
+/// (not by host) is what makes it obvious at the call site *why* that
+/// destination was chosen, and keeps a future second destination a one-line
+/// change here rather than a call-site rewrite.
+///
+/// # This used to send `WheelSensors` to telemetry as well, and it was wrong
+///
+/// The slice was justified by a comment claiming `rover-telemetry` consumed
+/// wheel ticks "for its CSV and liveness bookkeeping". It does neither:
+/// `crates/rover-telemetry/src/main.rs` never calls
+/// `bus.subscribe::<WheelSensors>`, `csv_fmt.rs` has no wheel formatter, and
+/// `HealthBits::SENSORS_STALE` is aged off `PowerSample` arrivals. So the
+/// board was emitting a 10 Hz datagram that the RPi decoded and dropped,
+/// while `config/rover.toml` said `WheelSensors = ["control"]` — the one
+/// invariant this file rests on ("every constant cites the `rover.toml` key
+/// it was transcribed from") was already broken by it.
+///
+/// If wheel ticks are ever wanted on the RPi — recording a calibration run
+/// for plan §2.6 is the obvious reason — add `"telemetry"` to `[routes]`
+/// *and* a subscriber, together. Until then a `[debug] mirror` plus
+/// `rover-tap` sees them without changing firmware.
+pub const WHEEL_SENSORS_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
 pub const POWER_SAMPLE_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed), same scheme as
@@ -91,7 +107,10 @@ pub const IWDG_PET_INTERVAL_MS: u64 = 200;
 /// one-way link failure *visible*, not to stop a motor before it hurts
 /// something.
 ///
-/// See `watchdog.rs`'s module doc for a real integration gap this constant
-/// cannot fix by itself: `config/rover.toml`'s `[routes]` table does not
-/// currently route anything at all to `sensors`.
+/// `watchdog.rs`'s module doc has the routing this depends on:
+/// `config/rover.toml`'s `[routes]` sends `Telemetry` to `["base", "sensors"]`
+/// specifically so this board has a heartbeat to watch. (An earlier draft of
+/// this comment described a gap where nothing routed to `"sensors"` at all;
+/// that was fixed in `rover.toml`, and `watchdog.rs` was updated while this
+/// sentence was not.) Still unexercised on real hardware — plan §13.4.
 pub const LINK_TIMEOUT_MS: u64 = 2_000;

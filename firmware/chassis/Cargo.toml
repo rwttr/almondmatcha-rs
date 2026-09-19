@@ -61,13 +61,12 @@ panic-probe  = { version = "=1.0.0", features = ["print-defmt"] }
 
 # --- Misc no_std helpers -----------------------------------------------------
 static_cell      = { version = "=2.1.1" }
-heapless         = { version = "=0.9.3", default-features = false }
 embedded-hal     = { version = "=1.0.0" }
-embedded-io-async = { version = "=0.7.0" }
 
 # --- Sensor drivers ----------------------------------------------------------
 # ST's own Rust drivers (BSD-3-Clause), same vendor/register abstraction as
-# the C driver already vendored in the ROS 2 tree's libs/.
+# the C driver that was vendored under mros2-mbed-chassis-dynamics/libs/
+# before the ROS 2 tree was removed (git show main:<path> to read it).
 #
 # NOTE (deviation from the plan): the plan names lsm6dsv16x-rs v2.1.0 /
 # lis2mdl-rs v2.0.0. Both those versions depend on `bisync` (to generate

@@ -39,8 +39,9 @@
 //! changes to `rover-msgs`). A failed INA226 init is logged over defmt and
 //! the board simply stops publishing `PowerSample`; `WheelSensors` keeps
 //! flowing regardless, since the two sensors are independent. The RPi-side
-//! `HealthBits::SENSORS_STALE` bit is the intended way to observe this
-//! absence, once `rover-telemetry` tracks per-message liveness.
+//! `HealthBits::SENSORS_STALE` bit is how the RPi observes this absence:
+//! `rover-telemetry` ages inbound `PowerSample` and raises the bit after
+//! 500 ms (`crates/rover-telemetry/src/health.rs`'s `SENSORS_STALE_MS`).
 #![no_std]
 #![no_main]
 

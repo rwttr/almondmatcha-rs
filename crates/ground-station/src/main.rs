@@ -29,7 +29,7 @@
 //! terminal, a real socket and a live rover to exercise meaningfully. Every
 //! piece of *logic* it calls (`link::classify`, `command_parse::parse_command`,
 //! `display::render_dashboard` and friends, `csv_log::format_row`) is pure
-//! and unit-tested without any of those. See the top-level report for what
+//! and unit-tested without any of those. See `docs/RUST_REWRITE_PLAN.md` §13.4 for what
 //! specifically needs a bench/field run to confirm end-to-end.
 
 mod command_parse;

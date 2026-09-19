@@ -4,7 +4,7 @@
 //! alignment. Reading a message definition tells you its byte layout exactly.
 //!
 //! These helpers are deliberately dull. The wire format is the contract between
-//! four machines written in three languages; it should be possible to verify by
+//! five machines written in two languages; it should be possible to verify by
 //! eye against a hex dump.
 
 /// A message failed to decode.

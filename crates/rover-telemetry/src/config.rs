@@ -1,5 +1,5 @@
 //! Loading the bits of `config/rover.toml` this crate needs beyond
-//! `rover-bus`'s `[hosts]`/`[ports]`/`[routes]`: `[speed.stall]` (stall
+//! `rover-bus`'s `[services]`/`[routes]`: `[speed.stall]` (stall
 //! detection) and `[estimator].lane_stale_ms` (lane staleness — reusing the
 //! estimator's own threshold rather than inventing a second one; see
 //! `health.rs`'s doc comment on `compute_health`).
@@ -91,8 +91,8 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-        [hosts]
-        rpi = "192.168.1.1"
+        [services]
+        control = "192.168.1.1:7001"
 
         [speed]
         reference_mps = 0.2

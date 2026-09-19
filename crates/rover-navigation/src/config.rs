@@ -1,7 +1,7 @@
 //! Loading `config/rover.toml`'s `[mission]` table.
 //!
 //! Same pattern as `rover-bus`'s `config.rs`: deserialize only the section
-//! this crate owns, leave every other table (`[hosts]`, `[control]`,
+//! this crate owns, leave every other table (`[services]`, `[control]`,
 //! `[estimator]`, ...) untouched so this file is never a reason a sibling
 //! crate's section fails to parse, and vice versa.
 
@@ -99,8 +99,8 @@ mod tests {
     use super::*;
 
     const SAMPLE_NO_GOAL: &str = r#"
-        [hosts]
-        rpi = "192.168.1.1"
+        [services]
+        control = "192.168.1.1:7001"
 
         [mission]
         arrival_radius_m = 2.0
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn missing_mission_section_is_a_hard_error() {
-        let err = MissionConfig::parse("[hosts]\nrpi = \"1.2.3.4\"\n").unwrap_err();
+        let err = MissionConfig::parse("[services]\ncontrol = \"1.2.3.4:7001\"\n").unwrap_err();
         assert!(matches!(err, MissionConfigError::Toml(_)));
     }
 
