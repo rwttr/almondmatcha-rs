@@ -9,3 +9,4 @@ repository.workspace = true
 rover-msgs = { workspace = true }
 rover-link = { workspace = true }
 rover-bus  = { workspace = true }
+clap       = { version = "4", features = ["derive"] }

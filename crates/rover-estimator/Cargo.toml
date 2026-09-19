@@ -1,9 +1,13 @@
 [package]
 name        = "rover-estimator"
+description = "5-state EKF for lane-relative pose. Pure math, no I/O — laptop-testable via tools/replay."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-rover-msgs = { workspace = true }
+rover-msgs  = { workspace = true }
+rover-model = { workspace = true }
+nalgebra    = { version = "0.35", default-features = false, features = ["std"] }
+log         = "0.4"

@@ -1,5 +1,6 @@
 [package]
 name        = "rover-model"
+description = "Linearised lateral error dynamics shared by the EKF and the (future) LQR/MPC controllers."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -7,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 rover-msgs = { workspace = true }
+nalgebra   = { version = "0.35", default-features = false, features = ["std"] }

@@ -34,6 +34,20 @@ base    = 7005
 # sub-200-byte messages the duplication costs nothing, and it removes the IGMP
 # dependency that forced a hand-maintained initialPeersList in the ROS 2 system.
 # ---------------------------------------------------------------------------
+# Optional firehose mirror for debugging.
+#
+# Unicast fan-out means a passive tap only sees traffic addressed to the host
+# it binds as: rover-tap bound as `rpi` cannot see ChassisCommand (routed to
+# chassis) or Telemetry (routed to base), and cannot co-bind with a real
+# listener on the same port. That is inherent to unicast, not a bug.
+#
+# When `mirror` is set, every published frame is additionally sent there, so
+# one rover-tap sees the whole bus from anywhere on the LAN. Costs one extra
+# datagram per message — negligible at these rates, but leave it empty for
+# field runs so nothing depends on a laptop being present.
+[debug]
+mirror = ""                   # e.g. "192.168.1.100:7099"
+
 [routes]
 ImuSample       = ["rpi"]
 MagSample       = ["rpi"]
@@ -158,18 +172,35 @@ nis_gate              = 11.34  # chi-square, 3 DoF, 99%
 lane_stale_ms         = 500
 use_magnetometer      = false  # see §2.5 — motors distort it under load
 
-[estimator.q]                  # process noise
-cross_track  = 1e-4
-heading      = 1e-4
-curvature    = 1e-3
-speed        = 1e-3
-gyro_bias    = 1e-7
+# Largest per-sample tick delta on either wheel still counted as "stationary"
+# for the zero-rate gyro-bias update. Start at 0; raise only if bench data
+# shows a resting encoder dithering on electrical noise. A stray tick must not
+# suppress bias estimation for a whole stop — bias observability is what bounds
+# how long the rover can coast on a lost lane.
+zero_rate_max_ticks = 0
+
+# Process noise, as a continuous-time spectral density PER SECOND.
+# The filter applies P += Q*dt, not P += Q, because predict is driven by IMU
+# packet arrival rather than a hardware timer: dt jitters, and a dropped packet
+# makes it several times nominal. Per-tick noise would leave the filter
+# overconfident exactly when it has least information.
+[estimator.q]
+cross_track  = 1e-2
+heading      = 1e-2
+curvature    = 1e-1
+speed        = 1e-1
+gyro_bias    = 1e-5
 
 [estimator.r]                  # measurement noise — MEASURE, do not guess
 lane_cross_track = 2.5e-3
 lane_heading     = 2.0e-3
 lane_curvature   = 1.0e-2
 odom_speed       = 1.0e-3
+# Gyro noise for the zero-rate bias update, (rad/s)^2. Seed from the
+# LSM6DSV16X datasheet noise density at the sample rate, then refine from a
+# stationary bench log — a minute of the rover sitting still measures it
+# directly, including whatever the chassis contributes.
+zero_rate_gyro   = 1e-6
 
 # ---------------------------------------------------------------------------
 # Firmware safety. See docs/RUST_REWRITE_PLAN.md §5.2.
