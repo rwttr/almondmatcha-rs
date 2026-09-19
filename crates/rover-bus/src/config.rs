@@ -246,6 +246,10 @@ mod tests {
         let cfg = BusConfig::parse(SAMPLE).unwrap();
         assert_eq!(cfg.route_for::<ImuSample>(), &[PeerId::Rpi]);
         assert_eq!(cfg.route_for::<ChassisCommand>(), &[PeerId::Chassis]);
+        // Asserted against SAMPLE, this module's own fixture — deliberately
+        // not against config/rover.toml, which `loads_the_real_repo_config`
+        // covers. Keeping them separate means a routing change in the shipped
+        // config fails exactly one test, and that test names the real file.
         assert_eq!(cfg.route_for::<Telemetry>(), &[PeerId::Base]);
     }
 
@@ -328,7 +332,13 @@ mod tests {
             Some("192.168.1.1:7001".parse().unwrap())
         );
         assert_eq!(cfg.route_for::<ImuSample>(), &[PeerId::Rpi]);
-        assert_eq!(cfg.route_for::<Telemetry>(), &[PeerId::Base]);
+        // Telemetry also goes to the sensors board: it publishes only, so it
+        // has no command stream to time out on, and uses Telemetry as its
+        // liveness heartbeat (plan §5.2 mirror watchdog).
+        assert_eq!(
+            cfg.route_for::<Telemetry>(),
+            &[PeerId::Base, PeerId::Sensors]
+        );
         // Shipped default is `mirror = ""` — disabled.
         assert_eq!(cfg.mirror(), None);
     }

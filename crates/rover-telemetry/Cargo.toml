@@ -1,5 +1,6 @@
 [package]
 name        = "rover-telemetry"
+description = "RPi binary: per-topic CSV logging + the 5 Hz Telemetry feed to the base station."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -9,3 +10,8 @@ repository.workspace = true
 rover-msgs = { workspace = true }
 rover-link = { workspace = true }
 rover-bus  = { workspace = true }
+clap       = { version = "4", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
+toml       = "1"
+log        = "0.4"
+env_logger = "0.11"

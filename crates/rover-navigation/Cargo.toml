@@ -1,11 +1,18 @@
 [package]
 name        = "rover-navigation"
+description = "RPi binary: dual GNSS serial readers + the mission state machine."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-rover-msgs = { workspace = true }
-rover-link = { workspace = true }
-rover-bus  = { workspace = true }
+rover-msgs  = { workspace = true }
+rover-link  = { workspace = true }
+rover-bus   = { workspace = true }
+serialport  = "4"
+clap        = { version = "4", features = ["derive"] }
+serde       = { version = "1", features = ["derive"] }
+toml        = "1"
+log         = "0.4"
+env_logger  = "0.11"

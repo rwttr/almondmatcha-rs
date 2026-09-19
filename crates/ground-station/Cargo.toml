@@ -1,5 +1,6 @@
 [package]
 name        = "ground-station"
+description = "Base PC binary: send commands, show live telemetry, log to CSV."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -9,3 +10,6 @@ repository.workspace = true
 rover-msgs = { workspace = true }
 rover-link = { workspace = true }
 rover-bus  = { workspace = true }
+clap       = { version = "4", features = ["derive"] }
+log        = "0.4"
+env_logger = "0.11"
