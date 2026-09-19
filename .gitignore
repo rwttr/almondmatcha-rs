@@ -38,3 +38,5 @@ tools/videocapture/
 target/
 Cargo.lock
 .venv/
+*.egg-info/
+.pytest_cache/
