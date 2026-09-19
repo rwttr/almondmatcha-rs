@@ -10,13 +10,15 @@
 > `k_d`, `k_ff`) that `rover_kinematic_control_node.py` never actually
 > implemented.** The port in `crates/rover-control/src/guide.rs` follows the
 > code, not this document. That drift predates the rewrite and exists on
-> `main` too — see `RUST_REWRITE_PLAN.md` §10.
+> `main` too — see `REWRITE_SUMMARY.md` §7.
 
 
 Steering and speed control law implemented across the vision (Jetson, D6/D5)
-and chassis (RPi, D5) nodes. For network/domain topology see
-[HARDWARE.md](HARDWARE.md); for topic schemas see
-`crates/rover-msgs`.
+and chassis (RPi, D5) nodes. The D4/D5/D6 domain topology and the `tpc_*`
+schemas the tables below reference were deleted with the ROS 2 tree —
+`git show main:docs/DOMAINS.md` and `git show main:docs/TOPICS.md` still have
+them. For current wire types see `crates/rover-msgs`; for the machines and IPs
+those domains used to run on see [HARDWARE.md](HARDWARE.md).
 
 ## Overview
 
@@ -200,9 +202,13 @@ Feedback alone covers this track. Raise toward 11172.7 only once the logs
 show `curvature_ema` is clean and stable through the bends.
 
 > Recomputed 2026-08-04 for the corrected wheelbase (48.75 cm, was
-> documented as 50 cm). Run `regenerate_roi.py` (in
-> `ws_jetson/src/vision_navigation/vision_navigation/`) to redo this if the
-> wheelbase or `BEV_PX_PER_M` changes again — see its `compute_k_ff()`.
+> documented as 50 cm). `regenerate_roi.py` (formerly in
+> `ws_jetson/src/vision_navigation/vision_navigation/`, its `compute_k_ff()`
+> did this recomputation) was deleted with the ROS 2 tree —
+> `git show main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py`
+> recovers it. If the wheelbase or `BEV_PX_PER_M` changes again, the formula
+> above is for **checking** a redone value by hand, not a substitute for
+> running the script.
 
 ---
 
