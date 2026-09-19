@@ -996,6 +996,80 @@ Host workspace: **66 tests**, clippy and `fmt` clean.
 7. **`TelemetryLite` is not implemented.** The LoRa radios are deferred, and an
    unused type rots. Add it with `LoraSerialLink`.
 
+### 13.3b Open design defects found during implementation
+
+Three real flaws in this plan, surfaced by building against it. Recorded here
+with their decisions; **not yet implemented**.
+
+#### D1 — `PeerId` addresses machines, but the bus must address processes
+
+`config/rover.toml` gives each *host* one UDP port. The RPi runs **three**
+binaries that each need to receive — `rover-control` (`ImuSample`,
+`WheelSensors`, `LaneMeasurement`), `rover-navigation` (`CommandFrame`), and
+`rover-telemetry` (everything it logs). They all bind `PeerId::Rpi`, so on real
+hardware the second and third to start die with `EADDRINUSE`. Unicast would not
+fan out to several listeners even if they could bind, and `UdpLink` has no
+`SO_REUSEPORT` — nor should it, since that load-balances rather than duplicates.
+
+This is a modelling error on my part: the bus routes to *endpoints*, and an
+endpoint is a process, not a machine.
+
+**Decision — make `PeerId` a service identity.** `[hosts]` and `[ports]` collapse
+into one `[services]` table mapping a service name to a full `host:port`:
+
+```toml
+[services]
+control    = "192.168.1.1:7001"
+navigation = "192.168.1.1:7002"
+telemetry  = "192.168.1.1:7003"
+chassis    = "192.168.1.2:7010"
+sensors    = "192.168.1.6:7011"
+perception = "192.168.1.5:7020"
+base       = "192.168.1.10:7030"
+```
+
+`[routes]` then targets services, and a type may have several — `WheelSensors`
+goes to `control` (speed loop) and `telemetry` (CSV). Firmware gains a small
+per-type destination table instead of a single `RPI_IP`/`RPI_PORT` pair; no
+message needs more than two destinations, so the cost on the MCUs is one extra
+`send_to`.
+
+#### D2 — `GnssFix` cannot say which receiver it came from
+
+One type and one `TYPE_ID` serve both the u-blox and the Spresense on two
+streams, so a subscriber in another process cannot tell them apart from the bus
+alone. `rover-telemetry` currently guesses: anything better than `Autonomous`
+must be the u-blox, since the Spresense reports only a boolean fix. That
+direction is sound, but a u-blox in cold start reporting `Autonomous` is
+misfiled as the backup — and it is the RTK stream that the mission logic and the
+heading reference depend on.
+
+**Decision — add a `source: GnssSource { Rtk, Backup }` field.** One byte,
+self-describing, no heuristic. It changes the wire format and the golden
+fixtures, which is free now and expensive after the boards are in a field.
+
+#### D3 — the ROS 2 mission monitor navigated on the *uncorrected* receiver
+
+`gnss_mission_monitor_node.cpp` tracked position from `tpc_gnss_spresense` only
+and never read the RTK stream, while arrival radius is 2 m here (20 m in ROS 2).
+Uncorrected GPS is several metres accurate, so arrival detection was being
+decided by the noisier of the two receivers with a centimetre-grade one sitting
+unused.
+
+**Decision — prefer RTK when usable, fall back to backup.** This is a deliberate
+behavioural improvement, not a port. It means mission-arrival behaviour will
+**not** match the ROS 2 baseline in replay, and that difference is expected
+rather than a parity failure.
+
+#### D4 — base-station CSV (minor)
+
+`docs/CSV_LOGGING.md` says the base station is display-only, and the ROS 2 node
+was. A base-side log is still independently useful — it records what the
+operator actually saw, including link gaps the rover's own log cannot show.
+**Decision: keep it, behind an off-by-default flag**, so the shipped behaviour
+matches the ROS 2 baseline and the capability is there when a comms problem
+needs diagnosing.
+
 ### 13.4 Hardware-verification debt
 
 Nothing in `firmware/` has met silicon. In rough order of risk:
