@@ -11,16 +11,23 @@
 
 How a camera frame becomes the three numbers the steering loop consumes.
 This document ends where [CONTROL_LAW.md](CONTROL_LAW.md) begins — at the
-`tpc_rover_nav_lane` topic. For topic schemas see `crates/rover-msgs`; for
-domain topology see [HARDWARE.md](HARDWARE.md).
+`tpc_rover_nav_lane` topic. The D4/D5/D6 domain topology and the `tpc_*`
+schemas this document references were deleted with the ROS 2 tree —
+`git show main:docs/DOMAINS.md` and `git show main:docs/TOPICS.md` still have
+them. For current wire types see `crates/rover-msgs`; for the machines and IPs
+those domains used to run on see [HARDWARE.md](HARDWARE.md).
 
 **Files:**
 `ws_jetson/src/vision_navigation/vision_navigation/lane_detector.py` (the
 pipeline itself, pure functions, no ROS) and `lane_detection_node.py` (the ROS
 wrapper: parameters, frame-to-frame state, publishing, CSV logging).
-`regenerate_roi.py` recomputes the §0/§1 geometry from the physical mount —
-run it, don't hand-recompute, whenever the mount changes.
-**Config:** `config/vision_nav_headless.yaml` / `config/vision_nav_gui.yaml`.
+`regenerate_roi.py` recomputed the §0/§1 geometry from the physical mount and
+was deleted with the ROS 2 tree — see "Regenerating the ROI" below for the
+recovery command; the formulas in this document are for checking its output,
+not replacing it.
+**Config:** `ws_jetson/src/vision_navigation/config/vision_nav_headless.yaml` /
+`ws_jetson/src/vision_navigation/config/vision_nav_gui.yaml` (deleted with the
+ROS 2 tree).
 
 ---
 
@@ -78,8 +85,9 @@ giving `X = t·(u−c_x)/f_x` and `Z = t·d_z`, with `h = 0.50 m` and
 lower ~78% of the frame is ground (at the previous 20° mount this was row 23;
 the shallower tilt pushes the horizon further down the frame).
 
-What the camera actually covers (recomputed with `regenerate_roi.py`; see
-that script for the exact formulas used for this table):
+What the camera actually covers (recomputed with `regenerate_roi.py`, deleted
+with the ROS 2 tree — see "Regenerating the ROI" below for the recovery
+command and the formulas it used for this table):
 
 | | row | distance ahead | ground width visible |
 |---|---|---|---|
@@ -146,13 +154,23 @@ inside the ROI, so it costs no fitting accuracy.
 
 ### Regenerating the ROI
 
-If the camera height, tilt, mount position, or lens changes, **run
-`ros2 run vision_navigation regenerate_roi` (or
-`python3 vision_navigation/regenerate_roi.py` directly)** — do not
-hand-recompute. It takes the physical mount as CLI arguments (defaults to
-the currently-shipped geometry) and prints the ROI corners, `k_ff`, the
-horizon row, and the coverage table above, ready to paste into `config.py`
-and both `vision_nav_*.yaml` files.
+**`regenerate_roi.py` was deleted with the ROS 2 tree** (it lived at
+`ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py`).
+Recover it with:
+
+```
+git show main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py
+```
+
+It used to take the physical mount as CLI arguments (defaults to the
+then-shipped geometry) and print the ROI corners, `k_ff`, the horizon row, and
+the coverage table above, ready to paste into `config.py` and both
+`vision_nav_*.yaml` files. If the camera height, tilt, mount position, or lens
+changes again and this script is not restored first, the formulas below are
+for **checking** a hand-recomputed result, not a substitute for the script
+that used to produce it — a rebuilt camera mount is exactly the situation this
+script existed for, and hand arithmetic is exactly what introduced the
+transcription error described below.
 
 This replaced a hand-computation process: the ROI corners used to be
 recomputed with a calculator and hand-typed into three files every time the
@@ -486,13 +504,19 @@ throughput over a 30-frame rolling window, not the configured capture rate.
 
 ## Parameter reference
 
-`lane_detection` block of `vision_nav_headless.yaml` / `vision_nav_gui.yaml`.
-Defaults live in `LaneDetectionConfig` (`vision_navigation/config.py`) and are
-kept in sync.
+`lane_detection` block of
+`ws_jetson/src/vision_navigation/config/vision_nav_headless.yaml` /
+`vision_nav_gui.yaml` (deleted with the ROS 2 tree, see above). Defaults lived
+in `LaneDetectionConfig` (`vision_navigation/config.py`) and **were** kept in
+sync with those YAML files while the ROS 2 tree existed. That file now
+survives only as the frozen parity oracle at
+`perception/tests/oracle/config.py`, whose entire purpose — per
+`perception/tests/oracle/README.md` — is that it is never synced or edited
+again.
 
 | Parameter | Value | Notes |
 |---|---|---|
-| `roi_base_points` | `[39,458, 1241,458, 915,270, 365,270]` | Derived from the mount — regenerate with `regenerate_roi.py`, don't hand-edit |
+| `roi_base_points` | `[39,458, 1241,458, 915,270, 365,270]` | Derived from the mount via `regenerate_roi.py` (deleted with the ROS 2 tree — see "Regenerating the ROI" above); don't hand-edit without it |
 | `roi_base_width` / `_height` | 1280 / 720 | Authoring base for the above |
 | `crop_margin_px` | 20.0 | Trims unwanted surroundings, in base units |
 | `bev_width_px` / `bev_height_px` | 720 / 340 | Fixes the scale at 200 px/m |
@@ -539,10 +563,13 @@ placed at known ground coordinates, then projected into the image:
   within ~20 cm of the centre line. Measured at the previous 20° mount; since
   the near-field ground width barely changes with tilt (see §1), this is
   likely still close, but hasn't been re-measured at the current 15° mount.
-- **Intrinsics are assumed, not measured** (§0). The highest-value
-  pre-run check is to launch with `vision_nav_gui.yaml` and confirm the ROI
+- **Intrinsics are assumed, not measured** (§0). The highest-value pre-run
+  check used to be launching with
+  `ws_jetson/src/vision_navigation/config/vision_nav_gui.yaml` (deleted with
+  the ROS 2 tree, see the top of this document) and confirming the ROI
   trapezoid lands on the track with all three lines inside it — that
-  validates the intrinsics and the mount angle together.
+  validated the intrinsics and the mount angle together. On this branch that
+  check has no equivalent yet.
 - **The pipeline tracks one line.** Using all three (fitting each and taking
   the midpoint of the two edges) would be substantially more robust and would
   degrade gracefully under occlusion, but is not implemented.
