@@ -137,10 +137,10 @@ regression. It does **not** prove field parity, and the tool says so itself
 every time it runs.
 
 **A known behaviour change.** The old mission monitor navigated on the
-*uncorrected* Spresense GNSS and never read the RTK receiver, against a 2 m
-arrival radius. The rewrite prefers RTK. Mission arrival will therefore not
-match the ROS 2 baseline — this is a fix, not a parity failure, but it must
-not be mistaken for one.
+*uncorrected* Spresense GNSS and never read the RTK receiver, against a 20 m
+arrival radius. The rewrite prefers RTK **and** tightens arrival to 2 m.
+Mission arrival will therefore not match the ROS 2 baseline — this is a fix,
+not a parity failure, but it must not be mistaken for one.
 
 ---
 
@@ -148,13 +148,13 @@ not be mistaken for one.
 
 | | |
 |---|---|
-| Commits on `rs` (at writing) | 24 |
 | Rust written | 16,387 lines — 10,640 non-test (of which 3,527 doc comments), 5,747 test |
-| Python written | 3,424 lines — 2,405 production, 1,019 test |
+| Python written | 3,424 lines — 2,405 production, 1,019 test (excludes `tools/capture_d415_rgb.py`, 83 lines) |
 | Vendored parity oracle | 1,130 lines (the ROS 2 lane detector, frozen verbatim) |
-| Removed | 922 files, ~137,000 lines |
+| Removed | 919 files, ~137,000 lines |
 | ├─ first-party ROS 2 | 44 files, 9,632 lines |
-| └─ vendored MCU stack | 766 files |
+| ├─ vendored MCU stack | 766 files |
+| └─ docs, launch tooling, `command/`, `.vscode/` | 109 files |
 | Tracked source, before → after | ~12.5 MB → 2.3 MB |
 | Tests | 290 Rust, 82 Python |
 | Message types | 16, plus the frame header — 17 golden byte fixtures |
