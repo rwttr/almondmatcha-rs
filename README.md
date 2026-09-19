@@ -180,6 +180,7 @@ Docker, no CMake, no mbed.
 
 | File | What it is |
 |---|---|
+| `docs/REWRITE_SUMMARY.md` | **Start here.** What this rewrite did, why, what it cost, what still blocks it. |
 | `docs/RUST_REWRITE_PLAN.md` | The design document. **§13 is authoritative.** |
 | `docs/HARDWARE.md` | Machines, sensors, pin maps, calibration status. |
 | `docs/VISION_PIPELINE.md` | Camera frame → lane geometry. Field-tuned; ROS 2 era. |
