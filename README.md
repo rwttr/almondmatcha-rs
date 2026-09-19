@@ -46,7 +46,7 @@ almondmatcha/
 │                           in code — if a constant is in both, one is wrong.
 │
 ├── crates/
-│   ├── rover-msgs          The wire contract. 17 message types, hand-written
+│   ├── rover-msgs          The wire contract. 16 message types, hand-written
 │   │                       encode/decode, no codegen. Shared by host and MCU.
 │   ├── rover-link          UDP sockets and peer addressing.
 │   ├── rover-bus           Routing table, publish fan-out, command receive.

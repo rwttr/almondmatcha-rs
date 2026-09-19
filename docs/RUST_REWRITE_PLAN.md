@@ -928,8 +928,8 @@ plan.** Where they disagree, believe this.
 
 | Component | State | Evidence |
 |---|---|---|
-| `rover-msgs` | **done** | 17 types, builds for host **and** `thumbv7em-none-eabihf`. 7 contract tests: round-trip, declared-vs-actual length, trailing bytes, truncation, frame budget, ID uniqueness, golden fixtures. |
-| `testdata/*.bin` | **done** | 17 fixtures. Regenerating them is a breaking protocol change. |
+| `rover-msgs` | **done** | 16 message types (plus the `FrameHeader` envelope, which is not a `Wire` type but has its own fixture — hence 17 files in `testdata/`), builds for host **and** `thumbv7em-none-eabihf`. 7 contract tests: round-trip, declared-vs-actual length, trailing bytes, truncation, frame budget, ID uniqueness, golden fixtures. |
+| `testdata/*.bin` | **done** | 17 fixtures — the 16 message types plus `FrameHeader`. Regenerating them is a breaking protocol change. |
 | `rover-link` | **done** | `Link` trait, `UdpLink`, `send_to_addr` with an `Unsupported` default so a future LoRa link need not implement it. |
 | `rover-bus` | **done** | config loading, unicast fan-out, newest-wins receive, idempotent command handshake, debug mirror. |
 | `rover-tap` | **done** | per-type rate and seq-gap loss; `--mirror` sees the whole bus. |
