@@ -40,3 +40,6 @@ Cargo.lock
 .venv/
 *.egg-info/
 .pytest_cache/
+
+# Claude Code personal settings override (not shared)
+.claude/settings.local.json

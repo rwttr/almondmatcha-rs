@@ -1,4 +1,4 @@
-# Almondmatcha
+# almondmatcha-rs
 
 Outdoor autonomous rover: vision-based lane following, RTK GNSS waypoint
 navigation, and an EKF tying them together. Five machines on one wired LAN,
@@ -6,17 +6,28 @@ two of them bare-metal microcontrollers.
 
 ![Almondmatcha](docs/image/almondmatcha2025.jpg)
 
+> **This is a personal, private mirror**, split off 2026-09-20 from the
+> original project's `rs` branch so the Rust rewrite could keep moving without
+> waiting on the org repo. It carries the rewrite only — **there is no `main`
+> here.** The ROS 2 system this replaces, and the rest of the project's
+> history, lives at `RoboticsGG/almondmatcha` (public), still on `main`, kept
+> as the working fallback. `rs` is this repo's only branch and its default.
+>
+> Working locally, both remotes are checked out side by side:
+> `origin` → this repo, `roboticsgg-almondmatcha` → the upstream org repo.
+> Nothing pushes upstream unless a remote is named explicitly.
+
 > **New here?** [`docs/REWRITE_SUMMARY.md`](docs/REWRITE_SUMMARY.md) is the
 > ten-minute version: what this rewrite did, why, what it cost, and what still
 > blocks it from driving.
 
 ---
 
-## What this branch is
+## What this repo is
 
-Branch `rs` replaces the entire ROS 2 / DDS / mROS 2 stack with a single Rust
-workspace plus one Python process for perception. `main` still holds the
-working ROS 2 rover and is the fallback; **nothing here has ever been flashed
+This is the entire ROS 2 / DDS / mROS 2 stack, replaced with a single Rust
+workspace plus one Python process for perception — the `rs` branch from
+`RoboticsGG/almondmatcha`, standalone. **Nothing here has ever been flashed
 to a board.**
 
 **There is no middleware.** Messages are plain UDP datagrams on a static LAN,
@@ -258,7 +269,8 @@ Docker, no CMake, no mbed.
       field data exists in this repository and none ever did, so the gate
       compares against a hand-rolled oracle of the old law rather than the
       rover's actual past behaviour. Producing a real baseline now means
-      checking out `main` to record one.
+      checking out `main` on the upstream org repo (`roboticsgg-almondmatcha`
+      remote) to record one — this repo has no `main` of its own.
 
 ---
 
