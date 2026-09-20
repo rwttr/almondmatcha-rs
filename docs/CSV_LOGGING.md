@@ -6,13 +6,31 @@
 > defect D4 in [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) §13.3b for where
 > the base-station CSV knowingly contradicts this file.
 
+## Filenames on branch `rs`
+
+The schemas and column meanings below still apply. The **filenames do not** —
+`rover-telemetry` writes a different set. Where an `rs` file covers the same
+data as a ROS 2 one, they're paired here; where it doesn't, that's noted too:
+
+| ROS 2 (as documented below) | branch `rs` |
+|---|---|
+| `rtk_gnss.csv` | `rtk_gnss.csv` — same name, header changed (see `rover-telemetry`'s `csv_fmt.rs`) |
+| `spresense_gnss.csv` | `backup_gnss.csv` |
+| `chassis_sensors.csv` | `power.csv` — voltage/current only; encoders now feed the estimator directly and aren't logged to CSV at all |
+| `mission_state.csv` | `mission_status.csv` — the schema heading below stays `mission_state.csv` because `geo.rs`/`mission.rs` cite it by that name |
+| `chassis_speed_pid.csv` | `speed_loop_debug.csv` |
+| `chassis_imu.csv` | *(none — `ImuSample` routes only to `control`; raw IMU isn't captured)* |
+| `chassis_cmd.csv` | *(none — motor commands aren't logged on this branch)* |
+| — | `rover_state.csv`, `chassis_status.csv`, `board_diagnostics.csv` — new on `rs`, no ROS 2 equivalent |
+
+---
 
 ## Overview
 
-The rover implements a **dual-tier CSV logging system** to ensure data redundancy, leverage hardware strengths, and prepare for future database migration:
-
-1. **Primary Logging (RPi)**: High-fidelity per-topic logging at native sensor rates
-2. **Secondary Logging (Jetson)**: Aggregated telemetry logging on high-capacity storage
+The ROS 2 rover ran a **dual-tier CSV logging system**: the RPi wrote
+high-fidelity per-topic CSVs at native sensor rates (Tier 1), and the Jetson
+wrote an aggregated, down-sampled copy to its higher-capacity storage (Tier
+2), for redundancy and eventual database migration.
 
 ---
 
@@ -20,33 +38,21 @@ The rover implements a **dual-tier CSV logging system** to ensure data redundanc
 
 ### Tier 1: RPi High-Fidelity Logging
 
-**Node**: `rover_monitoring_node` (rover_monitoring)
-**Domain**: 5 (rover control domain)
-**Location (ROS 2)**: ws_rpi/runs/ — this directory never existed in this
-repository (`.gitignore` excluded it) and does not exist on branch `rs`.
-**Language**: C++
-
-This is the *only* RPi node that writes local CSVs. `mission_monitoring_node_rpi`
-(same package) also subscribes to most of these Domain 5 topics, but purely to
-aggregate and relay them to the base station on Domain 4 (see Tier 2 note
-below) — it intentionally carries no local-storage responsibility, since it's
-the planned home for a future low-bitrate LPWAN telemetry link and needs to
-stay lean. The two used to duplicate each other's CSV writing (same filenames,
-different incompatible schemas, colliding in the same run directory) until
-this was split apart — don't reintroduce CSV writing in
-`mission_monitoring_node_rpi`.
+**Node**: `rover_monitoring_node` (rover_monitoring), C++, Domain 5.
+**Location (ROS 2)**: `ws_rpi/runs/` — never existed in this repository
+(`.gitignore` excluded it) and does not exist on branch `rs`.
 
 **Characteristics**:
-- Subscribes to Domain 5 topics directly (STM32 sensors/commands, Jetson steering command, RPi speed-PID debug) — deliberately not lane data, which stays Domain-6-only and is logged on the Jetson side
-- Logs each topic at native rate (event-driven)
-- 7 separate CSV files for different data categories
-- **Files are created on the first message of their topic, not at startup.**
-  A run that receives nothing leaves no directory behind and does not consume
-  a run number, and a missing CSV is positive evidence that topic never
-  delivered data — previously every file existed with headers regardless, so a
-  dead run was indistinguishable from a healthy one that had no data yet.
-- Full-resolution data capture (4-50 Hz depending on sensor)
-- Minimal overhead (direct subscription → CSV write)
+- Subscribed to Domain 5 topics directly (STM32 sensors/commands, Jetson
+  steering command, RPi speed-PID debug) — deliberately not lane data, which
+  stayed Domain-6-only and was logged on the Jetson side instead
+- Logged each topic at its native rate (event-driven), 4–50 Hz depending on
+  sensor, across 7 separate files
+- **Files were created on the first message of their topic, not at startup.**
+  A run that received nothing left no directory behind and consumed no run
+  number, and a missing CSV was positive evidence that topic never delivered
+  data — previously every file existed with headers regardless, so a dead run
+  was indistinguishable from a healthy one that had no data yet.
 
 **CSV Files**:
 - `rtk_gnss.csv` (~10 Hz): RTK position data from u-blox ZED-F9P
@@ -57,38 +63,21 @@ this was split apart — don't reintroduce CSV writing in
 - `mission_state.csv` (event-driven): Mission status, destination, steering, lane detection
 - `chassis_speed_pid.csv` (~4 Hz): Closed-loop speed PID internals (measured/target wheel speed, error, output)
 
-**Directory Structure (ROS 2)** — never existed in this repository:
-```
-ws_rpi/runs/
-├── run_001_20250104_143052/
-│   ├── rtk_gnss.csv
-│   ├── spresense_gnss.csv
-│   ├── chassis_imu.csv
-│   ├── chassis_sensors.csv
-│   ├── chassis_cmd.csv
-│   ├── mission_state.csv
-│   └── chassis_speed_pid.csv
-└── run_002_20250104_151823/
-    └── ...
-```
-
 ---
 
 ### Tier 2: Jetson Aggregated Logging
 
-**Node**: `rover_local_monitoring_node` (rover_monitoring)  
-**Domain**: 4 (base telemetry domain)  
-**Location (ROS 2)**: ws_jetson/runs/ — this directory never existed in this
-repository (`.gitignore` excluded it) and does not exist on branch `rs`.  
-**Language**: Python
+**Node**: `rover_local_monitoring_node` (rover_monitoring), Python, Domain 4.
+**Location (ROS 2)**: `ws_jetson/runs/` — never existed in this repository
+and does not exist on branch `rs`.
 
 **Characteristics**:
-- Subscribes to `/tpc_telemetry_relay` on Domain 4 (aggregated message)
-- Logs at 5 Hz (telemetry relay rate)
-- Single subscription (lower overhead than 10+ subscriptions)
-- Files created on first message, same as Tier 1 (see above)
-- High-capacity Jetson storage (vs limited RPi SD card)
-- Python-based for easy database migration
+- Subscribed to `/tpc_telemetry_relay` on Domain 4 — one aggregated message,
+  versus Tier 1's 10+ direct subscriptions
+- Logged at 5 Hz (the telemetry relay rate)
+- Files created on first message, same rule as Tier 1
+- Python, for easy database migration; high-capacity Jetson storage vs. the
+  RPi's limited SD card
 
 **CSV Files**:
 - `telemetry_unified.csv`: All telemetry data in one file (5 Hz)
@@ -97,34 +86,15 @@ repository (`.gitignore` excluded it) and does not exist on branch `rs`.
 - `chassis_data.csv`: Combined sensors, IMU, commands (5 Hz)
 - `mission_state.csv`: Mission status, destination, steering, lane (5 Hz)
 
-**Directory Structure (ROS 2)** — never existed in this repository:
-```
-ws_jetson/runs/
-├── run_001_20250104_143052/
-│   ├── telemetry_unified.csv
-│   ├── rtk_gnss.csv
-│   ├── spresense_gnss.csv
-│   ├── chassis_data.csv
-│   └── mission_state.csv
-└── run_002_20250104_151823/
-    └── ...
-```
-
 ---
 
 ## Comparison
 
-| Aspect | RPi Logging | Jetson Logging |
-|--------|-------------|----------------|
-| **Data Rate** | 4-50 Hz (per-topic) | 5 Hz (aggregated) |
-| **Resolution** | Full-fidelity | Down-sampled |
-| **Subscriptions** | 10 topics (D5) | 1 topic (D4) |
-| **CSV Files** | 7 per-topic files | 5 files (1 unified + 4 categorical) |
-| **Storage** | Limited (SD card) | High-capacity (SSD/eMMC) |
-| **Language** | C++ | Python |
-| **DB Migration** | Difficult | Easy (SQLite/PostgreSQL) |
-| **Purpose** | Primary high-res logs | Redundancy + future DB backend |
-| **Domain Impact** | +0 (already in D5) | +0 (D4, not D5) |
+RPi logged full-fidelity per-topic (4–50 Hz, 7 files, limited SD-card
+storage); Jetson logged a 5 Hz aggregate (5 files, high-capacity storage) for
+redundancy and easier database migration. Neither tier added subscription
+load to the other's domain — Tier 1 rode the existing D5 subscriptions, Tier
+2 the existing D4 relay.
 
 ---
 
@@ -226,14 +196,14 @@ Source: multiple D5 topics (event-driven on any topic change)
 | `Steering_Cmd` | float32 | ° | Kinematic control output from Jetson (`tpc_rover_ctrl_cmd[0]`). Continuous steering angle command fed to chassis_controller_node. |
 
 No `Lane_*` columns here by design: raw lane detection (`tpc_rover_nav_lane`)
-only exists on Domain 6 (Jetson localhost), and this node runs entirely on
-Domain 5, so it can never receive it — D5 and D6 logging are kept
-deliberately separate, not bridged. Lane data is logged on the Jetson side
+existed only on Domain 6 (Jetson localhost), and this node ran entirely on
+Domain 5, so it could never receive it — D5 and D6 logging were kept
+deliberately separate, not bridged. Lane data was logged on the Jetson side
 instead, see `ws_jetson_lane_detection_*.csv` below.
 
-Rides along at whatever rate `Mission_Active`/destination/distance change —
-`Steering_Cmd` is the latest value at that moment, not a forced row per
-steering update (that's the Jetson-side `ws_jetson_kinematic_ctrl_*.csv`,
+Rows arrived at whatever rate `Mission_Active`/destination/distance changed —
+`Steering_Cmd` was the latest value at that moment, not a forced row per
+steering update (that was the Jetson-side `ws_jetson_kinematic_ctrl_*.csv`,
 at full control-loop rate).
 
 ---
@@ -241,7 +211,7 @@ at full control-loop rate).
 ### RPi: chassis_speed_pid.csv
 Source: `tpc_chassis_speed_debug` topic (~4 Hz, paced by the encoder feed) — published by
 `chassis_controller_node`'s closed-loop speed PID (`chassisSensorsCallback()`), which
-otherwise computes and discards these values internally with no external trace.
+otherwise computed and discarded these values internally with no external trace.
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
@@ -253,13 +223,13 @@ otherwise computes and discards these values internally with no external trace.
 | `Error_Pct` | float32 | % of full scale | `target_speed_pct - (Measured_Avg_TPS / max_ticks_per_sec × 100)` — the error the PID actually operates on. **Not** ticks/s: the loop runs in the same 0–100% unit as its output so the gains survive re-calibrating `max_ticks_per_sec` |
 | `PID_Output_Pct` | float32 | % duty | Final output (feedforward + PID trim) before the operator safety cap — compare against `chassis_cmd.csv`'s `SPD_Msg`, which is this value *after* the cap |
 
-Use this to tune `speed_kp`/`speed_ki`/`speed_kd` and `max_ticks_per_sec` in
-`ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml` — plot
-`Target_TPS` vs `Measured_Avg_TPS` and `Error_Pct` over time.
+Used to tune `speed_kp`/`speed_ki`/`speed_kd` and `max_ticks_per_sec` in
+`ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml` by
+plotting `Target_TPS` vs `Measured_Avg_TPS` and `Error_Pct` over time.
 
-`PID_Output_Pct - target_speed_pct` is the trim the loop is applying: near zero
-means the feedforward alone is right, persistently large means the terrain load
-(or a stale `max_ticks_per_sec` calibration) is doing real work.
+`PID_Output_Pct - target_speed_pct` is the trim the loop was applying: near
+zero meant the feedforward alone was right; persistently large meant the
+terrain load (or a stale `max_ticks_per_sec` calibration) was doing real work.
 
 ---
 
@@ -304,32 +274,22 @@ Source: `tpc_telemetry_relay` topic (5 Hz) — aggregated relay from RPi. One ro
 
 ## Vision Navigation Logs (ws_jetson, `vision_navigation` package)
 
-Separate from the dual-tier system above — these files are written directly by
-the vision/control nodes themselves, not by `rover_monitoring`. They land as flat
-files inside the same `run_NNN_<stamp>/` directory as the Tier 2 telemetry
-CSVs — one launch produces exactly one directory per machine, containing
-everything that machine logged (ROS 2; this directory never existed in this
-repository):
+Separate from the dual-tier system above: these files were written directly
+by the vision/control nodes, not by `rover_monitoring`. They landed inside
+the same `run_NNN_<stamp>/` directory as the Tier 2 CSVs — one launch, one
+directory per machine (ROS 2; this directory never existed in this
+repository).
 
-```
-ws_jetson/runs/run_003_20260727_190426/
-├── lane_detection.csv        # vision_navigation
-├── kinematic_control.csv     # vision_navigation
-├── camera.avi                # vision_navigation
-├── telemetry_unified.csv     # rover_monitoring (D4)
-├── rtk_gnss.csv              # rover_monitoring (D4)
-└── ...
-```
+Each logging node was a separate process, so the launch scripts allocated the
+run directory once and exported it as `$ROVER_RUN_DIR`, which every node
+preferred over computing its own — without it, each process would pick its
+own run number and timestamp, scattering one launch across several
+directories. Starting a node by hand with `ros2 run` (no launcher, so no
+variable) gave it its own run directory, which was expected.
 
-Each logging node is a separate process, so the launch scripts allocate the
-run directory once and export it as `$ROVER_RUN_DIR`; every node prefers that
-over computing its own. Without it, four processes would each pick their own
-run number and timestamp and scatter one launch across several directories.
-Starting a node by hand with `ros2 run` (no launcher, so no variable) gives it
-its own run directory, which is expected.
-
-Every machine keeps its run output inside its own workspace, so Jetson and RPi
-logs can never collide and wiping one machine's runs cannot touch another's.
+Each machine kept its run output inside its own workspace, so Jetson and RPi
+logs could never collide, and wiping one machine's runs never touched the
+other's.
 
 All three write asynchronously: the owning node enqueues a row/frame and a
 background thread drains the queue and writes it to disk, so a slow eMMC/SD
@@ -394,7 +354,7 @@ below `low_space_warn_mb` (default 2048 MB), but does not auto-stop recording.
 
 ## Run Directory Numbering
 
-Both RPi and Jetson use synchronized run numbering:
+Both RPi and Jetson used synchronized run numbering:
 
 **Pattern**: `run_NNN_YYYYMMDD_HHMMSS/`
 
@@ -407,43 +367,29 @@ Both RPi and Jetson use synchronized run numbering:
 **Example**:
 - Run 1: `run_001_20250104_143052/`
 - Run 2: `run_002_20250104_151823/`
-- Run 3: `run_003_20250105_090015/`
 
 ---
 
 ## Launch Integration (ROS 2 — historical, not executable on branch `rs`)
 
-The banner at the top of this document covers the architecture below as
-ROS 2-era, but this section is worth flagging on its own: it is a
-copy-pasteable set of commands, and none of them run on branch `rs`.
-`ws_rpi/`, `ws_jetson/`, `ws_base/` and the launch scripts they reference were
-all removed in the ROS 2 tree deletion; recover them with, for example,
+None of the commands below run on branch `rs` — `ws_rpi/`, `ws_jetson/`,
+`ws_base/` and the launch scripts they reference were all removed in the ROS
+2 tree deletion. Recover them with, for example,
 `git show main:ws_rpi/launch_rover_tmux.sh`, or `git checkout main` to run
 them for real.
 
 ### RPi (ws_rpi)
 
-CSV logging is **automatic** when `rover_monitoring_node` launches (started alongside `mission_monitoring_node_rpi` — relay only, no CSVs — by the same launch script). No additional configuration needed.
-
-```bash
-cd ~/almondmatcha/ws_rpi
-./launch_rover_tmux.sh
-```
+CSV logging was automatic once `rover_monitoring_node` launched, started
+alongside `mission_monitoring_node_rpi` (relay only, no CSVs) by the same
+launch script — no additional configuration needed.
 
 ### Jetson (ws_jetson)
 
-Add to launch script (Domain 4 context):
-
-```bash
-# Terminal: Rover Monitoring (Domain 4)
-tmux new-window -t jetson:4 -n "RoveMon"
-tmux send-keys -t jetson:4 "source install/setup.bash" C-m
-tmux send-keys -t jetson:4 "export ROS_DOMAIN_ID=4" C-m
-tmux send-keys -t jetson:4 "ros2 run rover_monitoring rover_local_monitoring_node" C-m
-```
+`rover_local_monitoring_node` ran in the Jetson launch stack under
+`ROS_DOMAIN_ID=4`, alongside the rest of that machine's nodes.
 
 ### Base Station (ws_base)
 
-No CSV logging on base station (display-only). Monitoring node subscribes to Domain 4 telemetry relay for real-time display.
-
-
+No CSV logging on base station (display-only). Monitoring node subscribed to
+Domain 4 telemetry relay for real-time display.

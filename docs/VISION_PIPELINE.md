@@ -21,10 +21,8 @@ those domains used to run on see [HARDWARE.md](HARDWARE.md).
 `ws_jetson/src/vision_navigation/vision_navigation/lane_detector.py` (the
 pipeline itself, pure functions, no ROS) and `lane_detection_node.py` (the ROS
 wrapper: parameters, frame-to-frame state, publishing, CSV logging).
-`regenerate_roi.py` recomputed the §0/§1 geometry from the physical mount and
-was deleted with the ROS 2 tree — see "Regenerating the ROI" below for the
-recovery command; the formulas in this document are for checking its output,
-not replacing it.
+`regenerate_roi.py` recomputed the §0/§1 geometry from the mount — see
+"Regenerating the ROI" below.
 **Config:** `ws_jetson/src/vision_navigation/config/vision_nav_headless.yaml` /
 `ws_jetson/src/vision_navigation/config/vision_nav_gui.yaml` (deleted with the
 ROS 2 tree).
@@ -162,23 +160,18 @@ Recover it with:
 git show main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py
 ```
 
-It used to take the physical mount as CLI arguments (defaults to the
-then-shipped geometry) and print the ROI corners, `k_ff`, the horizon row, and
-the coverage table above, ready to paste into `config.py` and both
-`vision_nav_*.yaml` files. If the camera height, tilt, mount position, or lens
-changes again and this script is not restored first, the formulas below are
-for **checking** a hand-recomputed result, not a substitute for the script
-that used to produce it — a rebuilt camera mount is exactly the situation this
-script existed for, and hand arithmetic is exactly what introduced the
-transcription error described below.
-
-This replaced a hand-computation process: the ROI corners used to be
-recomputed with a calculator and hand-typed into three files every time the
-mount changed, which is exactly the kind of arithmetic that silently drifts
-out of sync (see the corrected coverage-table numbers above — a
-transcription error from an earlier hand-computation went unnoticed until
-this pass cross-checked it against the script). The script implements the
-same math the manual process used:
+It took the physical mount as CLI arguments (defaults to the then-shipped
+geometry) and printed the ROI corners, `k_ff`, the horizon row, and the
+coverage table above, ready to paste into `config.py` and both
+`vision_nav_*.yaml` files. It replaced a hand-computation process — the ROI
+corners recomputed with a calculator and hand-typed into three files every
+time the mount changed — which is exactly the kind of arithmetic that
+silently drifts out of sync: the corrected coverage-table numbers above are a
+transcription error from that hand process, unnoticed until this pass
+cross-checked it against the script. If the mount changes again and the
+script isn't restored first, the formulas below are for **checking** a
+hand-recomputed result, not a substitute for it. The script implements the
+same math:
 
 $$
 u = c_x + f_x\frac{X}{h\sin\phi + Z\cos\phi}
@@ -233,7 +226,7 @@ directional sun (deep shadow to glare highlight) that overlaps or exceeds
 real white paint's brightness — that Otsu-on-`L*` would just split the track
 into "its brighter half" and "its darker half" rather than finding
 red-vs-white. That reasoning came from the mobile-phone audit photo only (see
-"Known gap" below, as it stood before 2026-08-06). Validated against real
+"Known limits" below, as it stood before 2026-08-06). Validated against real
 D415 footage on 2026-08-06 (`dev/` captures, 1280×720 @ 30 FPS) and found
 backwards for this sensor: the D415 ROI's `A`/`B` channels span only ~35-40
 levels total, too narrow for Otsu to find a real bimodal split there, so step
@@ -245,10 +238,8 @@ sub-step, not the red split in step 2). `L*` on the same footage has a clean
 bimodal split (track ~110-115, paint >~170, close to the old pre-Otsu
 pipeline's hardcoded `gray > 180` cutoff — Otsu-on-`L*` just makes that
 adaptive per frame). `segment_track_colors()` uses `L*` now. This does not
-reintroduce the sun-glare risk the phone audit found: restricting the `L*`
-histogram to `near_track` (step 4) still can't by itself separate a glare
-patch from real paint by color, exactly as chroma couldn't — that is still
-what the BEV shape filter below is for, unchanged.
+reintroduce the sun-glare risk the phone audit found — see "Why adaptive"
+above; the BEV shape filter below still carries that job, unchanged.
 
 **Corridor bug (step 6):** taking "the single largest red-only blob" breaks
 because the white centre line cuts the track into a left half and a right
@@ -286,10 +277,9 @@ in the raw perspective, lines converge and shrink with distance, so a fixed
 width/aspect rule can't tell "thin far line" from "thick near glare" — they
 overlap in raw pixel dimensions.
 
-**Validated against real D415 footage 2026-08-06.** The sample originally
-used to design this section was a mobile-phone photo of the track, not the
-D415, and the white-vs-red test (step 5) did not transfer: see "Why
-brightness, not chroma" above. Validated using
+**Validated against real D415 footage 2026-08-06.** The design sample was a
+mobile-phone photo, not the D415 (see "Why brightness, not chroma" above for
+why step 5 didn't transfer). Validated using
 `test_lane_pipeline_video.py` (same package) against two D415 recordings in
 `dev/` (1280×720 @ 30 FPS, one short clip and one full round-trip lap) —
 before the `L*` fix, detection rate was ~1% of frames; after, ~90% on the
@@ -465,9 +455,10 @@ step:
 | `detected` | `len(x) ≥ min_lane_pixels` | validity |
 
 `detected = False` publishes `curvature = theta = b = 0.0`. **NaN is never put
-on the wire** — see the `fecfeb4` note in [CONTROL_LAW.md](CONTROL_LAW.md);
-`clamp(NaN, -100, 100)` used to collapse to `-100`, turning every undetected
-frame into a full-scale left steering command.
+on the wire**: `clamp(NaN, -100, 100)` used to collapse to `-100`, turning
+every undetected frame into a full-scale left steering command. The consuming
+side treats non-finite geometry as "not detected" rather than filtering it —
+[CONTROL_LAW.md](CONTROL_LAW.md) §1.1.
 
 ### `b` is a lookahead measurement
 
@@ -477,9 +468,8 @@ cross-track error at a point ahead of the rover, which on a curve is non-zero
 even when the rover is perfectly on the line.
 
 That is a usable, pure-pursuit-like signal, but it means `b` and `curvature`
-encode partly the same information. **When tuning, set `k_ff = 0` and tune
-`k_p` on `theta` first, then add `k_e2`, then `k_ff`** — otherwise the lateral
-and feedforward terms fight each other.
+encode partly the same information — see [CONTROL_LAW.md](CONTROL_LAW.md) §1
+for the tuning-order consequence.
 
 ---
 
@@ -580,11 +570,15 @@ placed at known ground coordinates, then projected into the image:
   *something* red and *something* white-on-red to split against — a
   different track color scheme would need re-deriving which channel
   discriminates it, not just new numbers.
-- **§2 has not been validated against the D415.** It was designed and tested
-  against a mobile-phone photo of the track (no D415 footage existed at the
-  time); the phone's color pipeline (white balance, saturation, compression)
-  differs from the D415's, so re-run the same audit against real D415
-  captures before trusting it unattended.
+- **§2 is validated against the D415, but only under overcast light.** It was
+  *designed* against a mobile-phone photo (no D415 footage existed then) and
+  later validated against two D415 recordings on 2026-08-06 — see §2's
+  "Validated against real D415 footage". Two things are still open from that
+  validation: `SEGMENTATION_MORPH_KERNEL_PX` and `MIN_LINE_COMPONENT_AREA_PX`
+  are still picked by eye against the phone photo rather than re-derived from
+  a D415 measurement, and only one lighting condition (overcast) has been
+  exercised. Re-check under strong directional sun before trusting it
+  unattended.
 - **A sun-glare patch on the track can still cost partial detection.** The
   color stage cannot separate a bright, desaturated glare reflection from
   real white paint when the two are genuinely close in color — confirmed on

@@ -28,7 +28,7 @@
 //! entirely in **percent of `max_ticks_per_sec`**, exactly like
 //! `chassis_controller_node.cpp`'s `target_speed_pct_`/`measured_pct`. Converting
 //! a physical m/s target into that percent domain needs `metres_per_tick`,
-//! which is currently `0.0` everywhere this system runs (plan §13.5,
+//! which is currently `0.0` everywhere this system runs (docs/STATUS_OPEN.md §1.1,
 //! standing blocker). [`SpeedController::target_duty_pct`] refuses to invent
 //! a scale factor from a missing calibration constant — that would be
 //! exactly the kind of silent wrong-by-a-constant-factor bug plan §2.6

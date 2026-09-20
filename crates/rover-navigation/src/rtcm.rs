@@ -5,7 +5,7 @@
 //! `rover-navigation` reads them and writes them straight to the u-blox's
 //! serial port — "a byte pump with framing — no parsing required." The LoRa
 //! radios themselves are deferred (plan §9 step 14; see
-//! `docs/RUST_REWRITE_PLAN.md` §13.2), so there is nothing to read *from*
+//! `docs/STATUS_OPEN.md` §1), so there is nothing to read *from*
 //! yet. This function is the seam that work plugs into: it exists, is typed,
 //! and is tested, so wiring up the radio later is "call this" rather than
 //! "first figure out what this should look like."

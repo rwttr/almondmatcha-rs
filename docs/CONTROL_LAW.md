@@ -3,7 +3,8 @@
 > **This documents the ROS 2 system that branch `rs` replaced.** It is kept
 > because the derivations and field-tuned constants in it are expensive to
 > regenerate, not because it describes what runs now. For the current system
-> see [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) (§13 is authoritative) and
+> see [STATUS_DONE.md](STATUS_DONE.md) (what is built, with evidence) and
+> [STATUS_OPEN.md](STATUS_OPEN.md) (what remains); for machines and IPs see
 > [HARDWARE.md](HARDWARE.md).
 >
 > ⚠️ **This document describes a full PID (`k_e1`, `k_e2`, `k_p`, `k_i`,
@@ -14,11 +15,10 @@
 
 
 Steering and speed control law implemented across the vision (Jetson, D6/D5)
-and chassis (RPi, D5) nodes. The D4/D5/D6 domain topology and the `tpc_*`
-schemas the tables below reference were deleted with the ROS 2 tree —
-`git show main:docs/DOMAINS.md` and `git show main:docs/TOPICS.md` still have
-them. For current wire types see `crates/rover-msgs`; for the machines and IPs
-those domains used to run on see [HARDWARE.md](HARDWARE.md).
+and chassis (RPi, D5) nodes. The D4/D5/D6 domain topology and `tpc_*` schemas
+below were deleted with the ROS 2 tree — see
+[VISION_PIPELINE.md](VISION_PIPELINE.md)'s header to recover them. Current
+wire types are in `crates/rover-msgs`.
 
 ## Overview
 
@@ -142,10 +142,10 @@ $$
 \end{cases}
 $$
 
-`δ_cmd` (degrees, + = right / − = left) is published as `data[0]` of
-`tpc_rover_ctrl_cmd`. `chassis_controller_node` on the RPi does no further
-shaping — it only maps sign → turn direction (`fdr_msg`) and forwards
-`|δ_cmd|` as `ro_ctrl_msg` to the STM32 servo driver.
+`δ_cmd` (degrees, + = right / − = left) is the steering command sent
+downstream (wire details in [§3](#3-signal-rates--units-summary)); the RPi
+adds no further shaping, only mapping sign to turn direction and forwarding
+`|δ_cmd|` to the STM32 servo driver.
 
 ### 1.5 Block diagram
 
@@ -233,8 +233,8 @@ v_{ref}\cdot r_{\text{lost}} & \text{lost, elapsed} < T_{\text{timeout}} \\
 $$
 
 This is open-loop with respect to actual chassis speed — it only reacts to
-*lane visibility*, not to how fast the wheels are actually turning. `v_cmd`
-is published as `data[1]` of `tpc_rover_ctrl_cmd`.
+*lane visibility*, not to how fast the wheels are actually turning (wire
+details in §3).
 
 | Param | Value | Role |
 |---|---|---|
@@ -267,12 +267,11 @@ $$
 > symmetric around the true centerline speed, at any steering angle — no
 > small-angle approximation needed. Left/right tick-rate divergence while
 > turning is expected geometry, not sensor error, and it cancels out exactly
-> in `ṅ_meas`. `measured_left_tps`/`measured_right_tps` are published to
-> `tpc_chassis_speed_debug` for logging only; the PID never needs to look at
-> the split, and no extra tolerance is required for it to regulate forward
-> speed correctly through curves. (A per-wheel expected-divergence check —
-> useful for detecting a slipping or stuck wheel — would be a separate
-> addition; it isn't implemented today.)
+> in `ṅ_meas`. The per-wheel split is logged for diagnostics only (§3); the
+> PID never needs to look at it, and no extra tolerance is required to
+> regulate forward speed correctly through curves. (A per-wheel
+> expected-divergence check — useful for detecting a slipping or stuck wheel
+> — would be a separate addition; it isn't implemented today.)
 
 The measured rate is then normalised into the same 0–100 % unit as the
 output, using the flat-ground calibration constant `ṅ_max`:
@@ -323,9 +322,9 @@ $$
 > ~2 Hz stop-and-spin judder at the encoder rate. So the run begins in open
 > loop, `ṅ_max` is learned from the flat opening stretch (see the
 > auto-calibration parameters in §2.4, `chassis_speed_control_params.yaml`), and the
-> controller switches itself on when that succeeds. The switch is bumpless
-> because the feedforward term is the commanded duty: at zero error the loop
-> outputs exactly what open-loop was already sending.
+> controller switches itself on when that succeeds. The switch is bumpless for
+> the same reason noted above: feedforward already equals commanded duty at
+> zero error.
 >
 > **Cap and target must differ.** `spd_limit_cap` clamps the loop's *output*,
 > not just the incoming request, so setting the cap equal to the target speed

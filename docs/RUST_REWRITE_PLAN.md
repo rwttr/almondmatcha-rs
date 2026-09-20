@@ -168,7 +168,7 @@ Runs free every time the rover pauses.
 - `nalgebra` `SMatrix<f32, 5, 5>` — no allocation, `no_std` capable.
 - Ship as a **pure library** (`rover-estimator`), no I/O, driven by `tools/replay`
   over existing `runs/*.csv`. Must be tunable on a laptop. (No such `runs/*.csv`
-  exists in this repository, nor ever did — §13.2, §13.5. This is not merely
+  exists in this repository, nor ever did — `STATUS_OPEN.md` §1.4. This is not merely
   open: a run must first be produced on `main` before it is achievable.)
 
 ### 2.4 Heading observability — and what the magnetometer does about it
@@ -251,6 +251,13 @@ Preferred: it isolates the constant and absorbs gear ratio automatically.
 4. Note the ending count. `ticks_per_revolution = (end - start) / 10`.
 5. Repeat for the other wheel. They should agree within a few percent; if not,
    you have a wiring or mounting asymmetry worth finding before you go further.
+
+> **Expect roughly 15,000 counts for the ten turns** (~1500 ticks/rev at this
+> firmware's 4× decoding). See `docs/HARDWARE.md` §3 for where that figure
+> comes from — a recollection of the ROS 2 system, not a measurement, recorded
+> so this procedure has something to agree or disagree with. **~7,500 counts
+> means the board is still decoding at 2×**, which is the failure this section
+> warns about, caught before it doubles every logged speed.
 
 **Procedure B — metres per tick directly (~10 min, do this too).**
 Absorbs tyre compression and real rolling radius, which Procedure A does not.
@@ -885,7 +892,7 @@ offset.
 **Required before hardware:** `tools/replay` must drive `rover-estimator` and
 `StaticGain` from existing `runs/*.csv` and match recorded ROS 2 behaviour within
 tolerance. No motor turns until that passes. **No such `runs/*.csv` exists, and
-none ever did (§13.2, §13.5).** This is not merely open — it requires first
+none ever did (`STATUS_OPEN.md` §1.4).** This is not merely open — it requires first
 checking out `main` and recording a run there, since the ROS 2 tree that could
 produce one is gone from this branch.
 
@@ -901,7 +908,7 @@ produce one is gone from this branch.
 | **Encoder constant wrong after the 2×→4× decoding change** | High | §2.6 warning; `decoding` recorded in `rover.toml`; verify commanded vs. measured speed on the first bench run |
 | **RTK bandwidth over 433 MHz** | Medium | §6.4 — plan for FSK, not long-range LoRa SF |
 | **No command uplink when disconnected** | Medium | §6.5 — decide before step 3 |
-| **EKF tuning eats time** | Medium | Seed `R` from measured variance of lane params, stationary, facing a straight line. No such CSVs exist yet (§13.5) — this means recording one first, not pulling from an existing log. Log innovations from day one. |
+| **EKF tuning eats time** | Medium | Seed `R` from measured variance of lane params, stationary, facing a straight line. No such CSVs exist yet (`STATUS_OPEN.md` §1.4) — this means recording one first, not pulling from an existing log. Log innovations from day one. |
 | **Magnetometer disappoints** | Low | Optional, behind a flag, after step 13. §2.5 says why to expect little. |
 | **Jetson Python bus drifts from Rust** | Medium | Shared golden-byte fixtures (§4.3) |
 | **No ROS 2 escape hatch** | Medium | Accepted. `main` keeps the working system. |
@@ -914,7 +921,7 @@ produce one is gone from this branch.
    Python decoder.
 2. `tools/replay` reproduces recorded ROS 2 steering output from
    `runs/*/lane_detection.csv` within tolerance. **No recorded run exists in
-   this repository and none ever did (§13.2, §13.5); this criterion cannot be
+   this repository and none ever did (`STATUS_OPEN.md` §1.4); this criterion cannot be
    attempted until one is produced on `main`.**
 3. **Watchdog:** rover on blocks, driving, Ethernet pulled → throttle ramps to zero
    within 200 ms + 300 ms, steering centres, `watchdog_tripped` observable.
@@ -932,78 +939,24 @@ produce one is gone from this branch.
 
 ## 13. Implementation status — branch `rs`
 
-Updated 2026-09-20. **This section is the truth; everything above it is the
-plan.** Where they disagree, believe this.
-
-### 13.1 What exists and is verified
-
-| Component | State | Evidence |
-|---|---|---|
-| `rover-msgs` | **done** | 16 message types (plus the `FrameHeader` envelope, which is not a `Wire` type but has its own fixture — hence 17 files in `testdata/`), builds for host **and** `thumbv7em-none-eabihf`. 7 contract tests: round-trip, declared-vs-actual length, trailing bytes, truncation, frame budget, ID uniqueness, golden fixtures. |
-| `testdata/*.bin` | **done** | 17 fixtures — the 16 message types plus `FrameHeader`. Regenerating them is a breaking protocol change. |
-| `rover-link` | **done** | `Link` trait, `UdpLink`, `send_to_addr` with an `Unsupported` default so a future LoRa link need not implement it. |
-| `rover-bus` | **done** | config loading, unicast fan-out, newest-wins receive, idempotent command handshake, debug mirror. |
-| `rover-tap` | **done** | per-type rate and seq-gap loss; `--mirror` sees the whole bus. |
-| `rover-model` | **done** | shared `A(v)`/`B(v)`, Euler discretisation. 6 tests. |
-| `rover-estimator` | **done** | 5-state EKF, Joseph form, chi-square gate, coast-on-dropout, zero-rate bias update. 10 behavioural tests. |
-| `rover-control` | **done** | lib + thin bin so `tools/replay` drives production code. `LateralController` trait; `StaticGain` is the bit-exact port. `actuate.rs` owns every guard rail. |
-| `rover-navigation` | **done** | two GNSS receivers, mission state machine, RTCM injection point. |
-| `rover-telemetry` | **done** | CSV at native rates, health bits, base feed. |
-| `ground-station` | **done** | mission goals, speed limit, E-stop, live display. |
-| `tools/replay` | **done** | **the §12 gate.** Synthetic trace + `legacy.rs` oracle. PASS at the 3.0° tolerance (rmse 1.349°, 267 rows compared); deliberately verified to FAIL at 0.5°, so the harness demonstrably has teeth. |
-| `perception/wire.py` | **done** | 51 tests green against the Rust fixtures — the two languages provably agree on every byte. |
-| `perception/lane.py` | **done** | behaviour-preserving port, **parity proven** — see 13.1b. |
-| `perception/{camera,bus,main}.py` | **done** | one process replacing `camera_stream_node` + `lane_detection_node`. End-to-end verified: 20 frames in, 20 `LaneMeasurement` out, seq monotonic, decoded by `wire.py`, clean exit. |
-| `firmware/chassis` | **builds** | 65,048 B flash (3.1%), 17,724 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
-| `firmware/sensors` | **builds** | 54,316 B flash (2.6%), 17,844 B RAM (3.4%). Clippy clean. **Never run on hardware.** |
-
-Host workspace: **290 tests**, clippy and `fmt` clean. Perception: **82 tests**.
-
-### 13.1b The lane parity test, and why it is believable
-
-`perception/tests/test_lane_parity.py` compares `process_frame` against the
-**real ROS 2 original**, not a description of it: `lane_detector.py` and
-`config.py` are vendored verbatim at `perception/tests/oracle/` (diffed at
-vendoring time — the only edit is one import line), the same way
-`tools/replay/legacy.rs` freezes the old control law. That is what let the
-ROS 2 tree be deleted without taking the evidence with it.
-
-Comparison is **exact** `==`, no tolerance, over six deterministic synthetic
-scenarios plus a `search_center` tracking case. Four of the six exercise the
-*detected* path with materially different geometry, so the test is not
-passing vacuously on "NaN equals NaN"; the other two (blank, pure noise) are
-the negative controls, and one is additionally asserted not-detected outright.
-
-Checked by mutation, not by reading: perturbing the port's polyfit
-coefficients by **one part in 10⁷** fails 5 of the 9 tests. A real
-algorithmic divergence cannot slip through this.
-
-### 13.2 What does not exist yet
-
-| Component | State |
-|---|---|
-| Firmware on real silicon | **nothing has been flashed.** See 13.4. |
-| Drivetrain calibration | `ticks_per_rev`, `metres_per_tick`, `track_width_m` are all `0.0`. No metric speed exists until they are measured — §2.6, and **against the 4× decoder**, not the old 2× firmware. |
-| Parity against real field data | impossible here. No recorded ROS 2 run exists in this repository and none ever did (re-verified at tree-removal time). `replay` proves internal consistency and regression-catching, not field parity. §12 criterion 2 stays open. |
-| LoRa link layer | deliberately deferred — §6. Both ESP32s are out of scope by instruction. |
-| LQR / MPC control laws | phase 2 and 3. The `LateralController` trait exists so they are a new file, not a rewrite. |
-
-### 13.2b The ROS 2 tree has been removed
-
-Removed on 2026-09-20 (`chore(rs)!: remove the ROS 2, mROS 2 and embeddedRTPS
-tree`): 919 files, ~137k lines — `ws_rpi`, `ws_jetson`, `ws_base`,
-`common_ifaces`, both `mros2-mbed-*` trees, ten DDS/RTPS/mbed docs, and the
-ROS 2 launch tooling.
-
-This was held until the replay gate passed **and** the lane parity oracle was
-vendored, because until then that tree was the only thing the port could be
-checked against. What it still holds is recoverable: everything deleted was
-tracked and committed, so `git show main:<path>` and this branch's history
-both return it, and it was verified beforehand that no untracked or ignored
-file — and no `runs/`, CSV, bag or video — lived anywhere under it.
-
-Durable knowledge was harvested first, into `docs/HARDWARE.md`. `ws_spresense`
-was left untouched by instruction.
+> **Status lives in two dedicated documents, and they are authoritative over
+> any status claim anywhere else, including this file.**
+>
+> | | |
+> |---|---|
+> | [`STATUS_DONE.md`](STATUS_DONE.md) | What is built, and the evidence for every claim |
+> | [`STATUS_OPEN.md`](STATUS_OPEN.md) | What remains: risks reassessed, open defects, concerns |
+>
+> They were split out because one section mixing accomplishments with blockers
+> made it too easy to read the finished work and miss what it did not say —
+> and because this project has already been bitten by a status document that
+> outlived its accuracy.
+>
+> What stays below is the part that is *not* status and does not rot the same
+> way: why the implementation diverged (§13.3), the narrative behind each
+> design defect (§13.3b), and the hardware-verification debt with its
+> reasoning (§13.4, §13.4a). These explain *why*; the status docs track
+> *where*.
 
 ### 13.3 Deviations from the plan, and why
 
@@ -1051,16 +1004,21 @@ was left untouched by instruction.
 
 ### 13.3b Open design defects found during implementation
 
-Five real flaws, surfaced by building against this plan and then by auditing
+Six real flaws, surfaced by building against this plan and then by auditing
 what was built. **D1-D4 are implemented** — D1 as `[services]` in
 `config/rover.toml`, D2 as `GnssSource` / `GnssFix.source`, D3 as
 `select_navigation_fix` in `crates/rover-navigation/src/mission.rs` (with
 passing tests), D4 as perception's `--csv` flag, off by default (the base
 station only half-follows that decision — see D4).
 
-**D5 is open and is the only one that can make the rover steer the wrong way.**
-It was found by measurement rather than review, is not fixed, and should be
-settled before anything is flashed.
+**D5 and D6 are open, and both are deferred for the same reason:** each
+changes closed-loop behaviour against gains tuned around the current
+behaviour, so neither should be taken without a re-tune on hardware. They
+should be taken together.
+
+**D5 is the only one that can make the rover steer the wrong way**, and should
+be settled before anything is flashed. D6 is a systematic lag the system
+cannot currently even measure.
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
 
@@ -1131,121 +1089,221 @@ operator actually saw, including link gaps the rover's own log cannot show.
 matches the ROS 2 baseline and the capability is there when a comms problem
 needs diagnosing.
 
-**What actually shipped only half-follows that decision.** `perception/main.py`
-does implement it correctly: `--csv` defaults to `None` and logging is opt-in.
-`crates/ground-station/src/main.rs` does not — `--log-file` has a
+**What actually shipped only half-follows that decision.** The perception
+process does implement it correctly: `--csv` defaults to `None` and logging is
+opt-in. `crates/ground-station/src/main.rs` does not — `--runs-dir` has a
 `default_value` and `CsvLogger::spawn` is called unconditionally, so the base
 station logs CSVs on every run with no flag to turn it off.
+
+> Updated when the base station moved to the shared `run_NNN_<stamp>/`
+> convention: the flag is now `--runs-dir` (it was `--log-file`, naming a
+> single flat CSV) and the logger creates its directory and file lazily on
+> first write, so a base station that receives nothing now leaves nothing
+> behind. **That narrows the gap but does not close it** — a run that
+> receives anything at all still logs, with no way to say no. The decision
+> above is still only half-implemented.
 `crates/ground-station/src/csv_log.rs` documents the tension itself (it quotes
 `CSV_LOGGING.md`'s "No CSV logging on base station" line) and resolves it the
 other way, citing the crate's own task brief. So: perception is off by
 default as decided; the base station is on unconditionally, undecided-in-code.
 
-#### D5 — `heading_err_rad`'s sign disagrees with the model that consumes it
+#### D5 — `heading_err_rad`'s sign disagreed with the model consuming it
 
-**Found 2026-09-20 by measurement, not review. Unresolved — decide before
-flashing anything.** This is the only defect in this list that can make the
+**Found 2026-09-20 by measurement, not review. Sign fixed the same day; the
+gain re-tune is still open.** This was the only defect here that could make the
 rover steer the wrong way.
 
-##### The claim that turned out to be half true
+> **Resolution.** `LaneDetector.detect` negates `theta` before it becomes
+> `heading_err_rad`. `compute_lane_params`, `process_frame`, `cross_track_m`,
+> `steer`, `Ekf::correct_camera`, `at_lookahead` and both gains are
+> **unchanged** — the model was right and the data was wrong, so the fix
+> belongs in the detector alone. `perception/tests/test_lane_sign_convention.py`
+> is the regression test that was missing. The parity suite and replay gate are
+> unaffected, which is the evidence the fix landed at the right boundary.
 
-`rover-msgs`'s crate docs, `guide.rs`, §10 and the README all state the same
+##### The claim that was half true
+
+`rover-msgs`' crate docs, `guide.rs`, §10 and the README all stated one
 convention: `cross_track_m`, `heading_err_rad` and `steer` are *all* positive
-when the correct response is "steer right", so both feedback terms carry a
-plus sign. Tested against the real detector, **the `cross_track_m` half is
-right and the `heading_err_rad` half is backwards.**
+when the correct response is "steer right", so both feedback terms carry a plus
+sign. Against the real detector, **the `cross_track_m` half was right and the
+`heading_err_rad` half was backwards.**
 
-##### The measurement
+##### The measurement, and the algebra behind it
 
-Bird's-eye canvas orientation confirmed first, since everything depends on it:
-a marker at the ROI's far edge lands at BEV row 26/340, one at the near edge at
-row 334/340 — **canvas top is ahead**. (Independently: the ROI trapezoid is
-550 px wide at its far edge and 1202 px at its near edge, which is what a
-ground plane in perspective looks like.)
+Canvas orientation confirmed first, since everything depends on it: a marker at
+the ROI's far edge lands at BEV row 26/340, the near edge at 334/340 — **canvas
+top is ahead**. (The ROI trapezoid is 550 px wide far, 1202 px near, which is
+what a ground plane in perspective looks like.)
 
-Feeding `process_frame` a lane that veers **right** as it recedes:
+Feeding `process_frame` a lane veering **right** as it recedes gave
+`theta = -11.662°` against a measured `d(cross_track)/d(distance) = +0.2052`,
+with `tan(theta) = -0.2064` — the negative, to three decimals. Re-measured
+independently on 2026-09-20 with a different frame: `theta = -16.984°` against
+`+0.3065`.
 
-```text
-detector theta = -11.662 deg      detector b = +0.1238 m
+It is structural, not an artifact. `compute_lane_params` fits
+`x = A*y'² + B*y' + C` with `y' = y - height`, so `y'` increases *backwards*
+and forward is `-y'`. Hence `d(cross)/d(distance) = -B` while
+`theta = arctan(B)`.
 
-lane offset at increasing lookahead s:
-  s=0.0 m -> 0.1238    s=0.4 m -> 0.2059    s=0.8 m -> 0.2869
+##### Why that was wrong
 
-measured d(cross_track)/d(distance) = +0.2052
-tan(detector theta)                 = -0.2064
-```
+Two consumers assume the opposite, both with `+l_a`:
 
-`theta` is the **negative** of `d(cross_track)/d(distance)`, to three decimals.
-
-This falls out of the fit's own algebra: `compute_lane_params` fits
-`x = A*y'^2 + B*y' + C` with `y' = y - height`, so `y'` increases *backwards*
-while forward is `-y'`. `theta = arctan(B) = arctan(-dx/d(forward))`.
-
-##### Why that is wrong
-
-Two consumers assume the opposite, both with a `+l_a`:
-
-- `RoverState::at_lookahead` — `cross + l_a * heading_err + 0.5*kappa*l_a^2`
+- `RoverState::at_lookahead` — `cross + l_a*heading_err + 0.5*kappa*l_a²`
 - `Ekf::correct_camera` — `h[(0, HEADING_ERR)] = l_a`
 
-Both encode `d(cross)/d(l) = +heading_err`. So does the error model the ROS 2
-node's own docstring states: `b_dot = v*theta`.
+Both encode `d(cross)/d(l) = +heading_err`, as does the error model in the
+ROS 2 node's own docstring: `b_dot = v*theta`.
 
 ##### Why the rover nevertheless drove
 
-`b` is measured 1.22 m ahead, so it already carries heading information and it
-dominates. For a straight path angled `psi` to the right:
+`b` is measured 1.22 m ahead, so it already carries heading information and
+dominates. For a straight path angled `psi` right:
 
 ```text
-u = k_lat*(1.22*psi) + k_head*(-psi) = 3.857*psi - 2.024*psi = 1.833*psi  deg
-correct would be:                      3.857*psi + 2.024*psi = 5.881*psi  deg
+was:     k_lat*(1.22*psi) + k_head*(-psi) = 3.857*psi - 2.024*psi = 1.833*psi deg
+correct: k_lat*(1.22*psi) + k_head*(+psi) = 3.857*psi + 2.024*psi = 5.881*psi deg
 ```
 
-Still positive, so it steers the right way — at **31 % of the intended
-authority**. The heading term cancels the lookahead's anticipation instead of
-reinforcing it. That is consistent with `k_lat = 181.17` being tuned unusually
-high: the gain was inflated to compensate for a term working against it.
+Still positive, so it steered the right way — at **31 % of the intended
+authority**, the heading term cancelling the lookahead's anticipation instead
+of reinforcing it. Consistent with `k_lat = 181.17` being tuned unusually high
+to compensate for a term working against it.
 
-The clean failure case is `b ~ 0, theta != 0` — on the line but pointed wrong,
-which happens at every line crossing. There the `b` term contributes nothing
-and the heading term alone decides, so the rover steers **away** until `b`
-grows enough to overrule it. A weave, not a divergence.
+The clean failure case was `b ≈ 0, theta ≠ 0` — on the line but pointed wrong,
+which happens at every line crossing. There the `b` term contributes nothing,
+the heading term alone decides, and the rover steered **away** until `b` grew
+enough to overrule it. A weave, not a divergence.
 
-##### Two things that make it worse than it was
+##### Two things that made it worse than it looked
 
-1. **The EKF amplifies it.** The EMA passed `theta` through untouched. The EKF
-   explicitly cross-couples cross-track and heading through `l_a`, so it is now
-   fusing two measurement rows that contradict each other — inflated
-   innovations, a biased heading estimate, and more NIS gating than the data
-   deserves.
-2. **The tests cannot catch it.** `positive_heading_error_steers_right` asserts
-   that the law matches the assumption, which is circular. Nothing anywhere
-   tests the *detector's* convention against the *model's*.
+1. **The EKF amplified it.** The EMA passed `theta` through untouched. The EKF
+   cross-couples cross-track and heading through `l_a`, so it was fusing two
+   measurement rows that contradicted each other — inflated innovations, a
+   biased heading estimate, more NIS gating than the data deserved.
+2. **The tests could not catch it.** `positive_heading_error_steers_right`
+   asserts the law matches the assumption, which is circular. The parity suite
+   compares the port against the frozen ROS 2 oracle — and they agreed
+   perfectly, because *both* disagreed with the model downstream. The one test
+   pinning `detect`'s conversion ran on a centred frame where `theta` is `0.0`,
+   so its sign assertion was vacuous. All three are now fixed or added.
 
-##### Decision: NOT TAKEN
+##### What the fix costs, and what is left open
 
-Deliberately left open. The fix is small — negate `heading_err_rad` where
-`LaneDetector.detect` converts it, leaving `cross_track_m` and `steer` alone —
-but it roughly triples heading authority, and `k_lat` was tuned around the
-cancellation, so it needs re-tuning and a field session, not a code review.
+With `cross_look` pinned to the measured offset (what `correct_camera` actually
+fits), the straight-line response to a path angled `psi`:
 
-Adopting ISO 8855 wholesale is **not** the answer and was considered and
-rejected: it is a relabelling that invalidates every field-tuned gain and buys
-nothing on a single vehicle with no external interop.
+| | response |
+|---|---|
+| before, heading term subtracting | `3.858 - 2.024` = **1.834** deg/deg |
+| after, heading term reinforcing | `3.858 + 2.024` = **5.882** deg/deg |
 
-**Before acting, confirm on hardware** (60 seconds, rover on blocks): show the
-camera a line clearly angled to the right and watch the servo. If it turns
-left, this is confirmed. The geometry above is certain, but it rests on a
-positive `steer` turning the wheels physically right — which must be true,
-since otherwise the dominant `b` term would be destabilising and the rover
-could never have driven at all.
+**A 3.21× increase in straight-line steering authority**, against gains that
+have never run with a correctly-signed heading term. `config/rover.toml`
+records this beside `k_lat`/`k_head`, with `[0.312×, 1.0×]` as the bracket to
+search on the bench — a bracket, not a recommendation. `0.312×` reproduces the
+net authority the ROS 2 rover exhibited but also cuts the pure-lateral response
+to 31 %, which was never wrong, so it is a floor rather than a target.
+
+The gains were deliberately not guessed at: they are field-derived (§10 requires
+bit-exact porting), and `tools/replay` proves the control law bit-exact against
+a frozen oracle, which changing them would break.
+
+**Where the servo direction changes.** The steer sign differs from the old
+behaviour only inside `|b| < k_head * theta_deg / k_lat` — about 11 cm of offset
+at 10° of heading error. That is the "on the line but pointed wrong" case at
+every line crossing, where the old behaviour steered *away*. Outside that band
+the direction is unchanged and only the magnitude grows. Nothing on the
+`steer` → servo path was touched: `steer > 0` still means right, through
+`SteerLimiter`, the wire, `steer_dir()` and `SERVO_CENTER_DEG - angle_deg`.
+
+**Still confirm on hardware** (60 seconds, on blocks): show the camera a line
+angled clearly right and watch the servo. It should turn **right**. This is no
+longer a test of the sign — that is settled and regression-tested — but of the
+one link with no test that has never run: the firmware's `steer > 0` →
+physically-right mapping.
+
+Adopting ISO 8855 wholesale was considered and **rejected**: a relabelling that
+invalidates every field-tuned gain and buys nothing on a single vehicle with no
+external interop.
+
+#### D6 — the camera measurement is timestamped after detection, not at capture
+
+**Found 2026-09-20 by inspection, while answering whether consolidating the
+camera and lane-detection nodes could let a frame go stale. Recorded, not
+fixed** — for the same reason as D5: the fix changes closed-loop behaviour
+against gains that were tuned without it.
+
+##### What the code does
+
+`perception/rover_perception/main.py`'s capture loop:
+
+```python
+result = detector.detect(frame)      # ~30-40 ms per HARDWARE.md §7
+t_us = time.monotonic_ns() // 1000 & 0xFFFFFFFF
+```
+
+The timestamp is taken **after** detection returns. It therefore records when
+the answer was computed, not when the photons arrived, and the entire
+capture-plus-detect latency is erased from it. The D415's own hardware frame
+timestamp is available — `frames.get_timestamp()` in `camera.py` — and is
+discarded.
+
+The consumer completes the omission. `rover-control`'s
+`Estimator::correct_lane` forwards the message straight to
+`Ekf::correct_camera`, which **never reads `t_us`**. There is no latency
+compensation anywhere on the camera path. Contrast `ImuSample.t_us`, which
+`estimate.rs` goes out of its way to use correctly, and documents at length.
+
+##### Why it matters, and why it is not "the frame expired"
+
+It is *not* a staleness problem. `lane_stale_ms` is 500 ms and
+`confidence_speed_scale`'s `AGE_LO_MS` is 500 ms, against a pipeline latency
+plausibly around 70–100 ms. Nothing trips, and `LANE_STALE` will not fire.
+The damage is subtler:
+
+1. **Phase lag in a closed loop.** The EKF applies a correction describing
+   where the rover was ~100 ms ago as though it described now. That eats
+   phase margin, and the error grows with speed — worst exactly where the
+   controller is working hardest.
+2. **The innovation gate may reject good measurements.** A systematically
+   lagged measurement produces systematically larger innovations. With
+   `nis_gate = 11.34` (χ², 3 DoF, 99 %), a tight curve at speed could start
+   rejecting valid camera updates, silencing the camera when it matters most.
+3. **None of this is measurable from a field log.** `achieved_fps` is loop
+   rate, not latency. There is no dropped-frame counter and no
+   capture-to-publish figure anywhere, so the size of the lag — and whether
+   points 1 and 2 actually bite — cannot be established from a recorded run.
+
+##### The fix, when it is taken
+
+Two halves, and the first is useless without the second:
+
+- Stamp `t_us` from the frame's capture time, preferring the D415 hardware
+  timestamp, and publish a capture-to-publish latency and a dropped-frame
+  count alongside it.
+- Have `Ekf::correct_camera` compensate for measurement age.
+
+**Doing the second changes control behaviour**, so it belongs with the D5
+re-tune, on hardware, not before. Adding only the measurement half is safe and
+behaviour-neutral, and would at least turn the estimates above into numbers.
+
+##### Related, same area
+
+`camera.py` never sets the librealsense frame-queue depth explicitly, so
+whether a slow detector drops frames or accumulates latency rests on a library
+default this code does not pin. Worth pinning deliberately when D6 is taken.
 
 ### 13.4 Hardware-verification debt
 
 Nothing in `firmware/` has met silicon. In rough order of risk:
 
 1. **LAN8742A PHY against `GenericPhy`** — §9 step 4, still the hard gate.
-   Standard clause-22 part, but unproven here.
+   Standard clause-22 part, but unproven here. See §13.4a: bring-up is left
+   exactly as Embassy ships it, and the diagnostic gap around it has been
+   closed separately.
 2. **I2C1 on PB8/PB9** — inherited from the mbed target's generic
    `I2C_SDA`/`I2C_SCL` names for `NUCLEO_F767ZI`. Standard Nucleo-144 Arduino
    bus, not confirmed against the physical board.
@@ -1262,25 +1320,155 @@ Nothing in `firmware/` has met silicon. In rough order of risk:
 6. **Watchdog end-to-end** — §12 criterion 3. Cannot be faked in a test.
 7. **Every timing constant** — 200 ms / 300 ms / 500 ms are reasoned, not measured.
 
-### 13.5 Standing blockers
+### 13.4a The PHY question, answered
 
-- **Drivetrain calibration is `0.0`.** `ticks_per_rev`, `metres_per_tick` and
-  `track_width_m` are all unmeasured, so there is still no metric speed
-  anywhere in the system. The estimator disables odometry loudly rather than
-  dividing by zero, and the speed PID works in ticks/sec so it is unaffected —
-  but nothing can report m/s until §2.6 is done. Twenty minutes with a tape
-  measure.
-- **Nothing has been flashed.** Every firmware claim in 13.1 is a claim about
-  a binary that builds, not one that has run. The LAN8742A PHY against
-  Embassy's `GenericPhy` is the gate that decides whether any of it is real.
-  See 13.4 for the full list.
-- **Replay parity is against a synthetic trace and a hand-rolled oracle, not
-  against the rover's past behaviour.** No recorded ROS 2 run exists in this
-  repository and none ever did. The harness prints this caveat itself. §12
-  criterion 2 stays open until a real run is recorded on the new stack and
-  compared against a real ROS 2 run recorded on `main` — which now requires
-  checking out `main` to produce one, since the ROS 2 tree is gone from this
-  branch.
+§13.4 has listed the LAN8742A as the top hardware risk since this branch
+started, without saying what could be done about it. This section closes that.
+The short answer: **a LAN8742A-specific driver is possible and nothing blocks
+it, but replacing the bring-up sequence would be a bad trade. Only the
+diagnostics were added.**
+
+#### Nothing is sealed
+
+`embassy_stm32::eth::Phy` is a public trait with exactly three methods —
+`phy_reset`, `phy_init`, `poll_link` — and `StationManagement`, which is raw
+`smi_read`/`smi_write` over MDIO, is publicly exported. `Ethernet::new_with_phy`
+takes any `P: Phy`. No fork is needed and no sealed trait stands in the way.
+A complete part-specific driver is roughly 150 lines.
+
+#### `GenericPhy` is already half a Microchip driver
+
+Worth knowing before assuming it is a lowest-common-denominator fallback: its
+`phy_init` writes `PHY_REG_WUCSR` at `0x8010` through MMD indirect access
+(`0x0D`/`0x0E`). That is an SMSC/Microchip vendor register, not generic
+clause 22. Embassy wrote it around exactly this family of parts, which is why
+it is the sensible default for a LAN8742A and why bring-up is likely to just
+work.
+
+#### What it genuinely cannot tell you
+
+The diagnostic half, and all three gaps are the silent kind:
+
+- **It never reads PHY ID1/ID2.** The constants are declared and
+  `#[allow(dead_code)]`. A mis-strapped, dead or substituted PHY therefore
+  produces no identity mismatch — it simply fails to link, with no reason
+  given.
+- **`poll_link` returns `bool`**, discarding resolved speed and duplex. This
+  is the real silent failure on this hardware: a marginal cable negotiates
+  **10 Mbit/s half duplex**, `poll_link` reports "up", and the MAC stays
+  configured for 100 full.
+- **No symbol error counter**, which is the number that goes non-zero on a
+  marginal cable long before anyone notices packet loss.
+
+#### The decision
+
+All three gaps are closed by *read-only* register queries, so `Lan8742a<SM>`
+**wraps** `GenericPhy<SM>` and delegates all three `Phy` methods to it
+unchanged, adding queries through `GenericPhy::station_management()`. The
+firmware constructs the inner `GenericPhy` exactly as `Ethernet::new` does
+internally and calls `Ethernet::new_with_phy`, so the write sequence on the
+wire is byte-identical to the one thousands of boards run, and the new code
+cannot affect link establishment.
+
+The rejected alternative was writing a bespoke bring-up sequence from the
+datasheet. That trades a widely-used-but-unverified-here sequence for a
+bespoke-and-also-unverified one — strictly worse, on firmware that has never
+been flashed.
+
+The device is moved into `embassy_net::Runner` and then into `net_task`, so
+`Ethernet::phy_mut()` is unreachable from any other task. The wrapper
+therefore writes its findings into atomics from inside its own `poll_link`,
+which the runner calls every 500 ms, and the diagnostics task reads those.
+
+#### Registers
+
+Verified against the Microchip **LAN8742A/LAN8742Ai datasheet, Revision 1.1
+(05-21-13)** — not from memory. An earlier draft of this work had two of them
+wrong, in a way that would have produced a confidently meaningless number.
+
+| Reg | Contents |
+|-----|----------|
+| `0x02` | PHY Identifier 1, default `0x0007` |
+| `0x03` | PHY Identifier 2, default `0xC130`; bits [15:10] OUI, [9:4] model, **[3:0] revision, which varies between parts — mask it off before comparing** |
+| `0x1A` | Symbol Error Counter |
+| `0x1F` | PHY Special Control/Status; bits **[4:2]** = speed indication: `001` 10-half, `101` 10-full, `010` 100-half, `110` 100-full |
+
+Two properties of `0x1A` that determine how it must be read, quoted from the
+datasheet: *"This field counts up to 65,536 and rolls over to 0 if incremented
+beyond it's maximum value. Note: This register is cleared on reset, but is not
+cleared by reading the register. It does not increment in 10BASE-T mode."*
+
+So it is **free-running, not read-to-clear** — the raw value is reported and
+must never be accumulated across polls, which would multiply the true error
+count by the poll count. And because it does not increment at 10BASE-T,
+`phy_symbol_errors == 0` is **not** evidence of a healthy link when
+`link_speed_mbps` is 10. It means something only at 100 Mbit/s.
+
+Every uncertain read degrades to "unknown" (`0`) rather than a guess. A
+diagnostic that lies is worse than one that says it does not know.
+
+#### The `eth-phy-lan87xx` crate — evaluated, not adopted
+
+[`eth-phy-lan87xx`](https://crates.io/crates/eth-phy-lan87xx) is a `no_std`
+LAN8710A/8720A/8740A/8742A driver over MDIO. It was evaluated 2026-09-20.
+**Not adopted**, for the same reason a bespoke driver was rejected above, and
+one more:
+
+- It does not implement `embassy_stm32::eth::Phy`. It implements
+  `eth_mdio_phy::PhyDriver` over an `eth_mdio_phy::MdioBus`, with ESP32's SMI
+  controller as its reference platform. Using it here means writing two
+  adapters — nothing hard, but two more unproven pieces on the critical path.
+- 0.2.0 was published 2026-05, 0.3.0 2026-06, and total downloads are in the
+  low hundreds. Against that, `GenericPhy` is what every embassy STM32
+  Ethernet board runs. Swapping a widely-used-but-unverified-here bring-up
+  path for a rarely-used-and-also-unverified one is a worse trade, not a
+  better one, on firmware that has never been flashed.
+- Licensing is not the obstacle: `GPL-2.0-or-later OR Apache-2.0`, and the
+  Apache arm matches this workspace.
+
+**Its documentation was still worth the read, and one thing in it changes what
+we do.** It calls out that a `BMCR.RESET` does not restore `ANAR` to
+`0x01E1`, and writes the advertisement explicitly before enabling
+auto-negotiation. That is a real gap here — see below.
+
+#### The `ANAR` / `MODE[2:0]` strap gap
+
+`GenericPhy::phy_init` enables auto-negotiation by writing `BCR`, and **never
+writes `ANAR` (register `0x04`)** — embassy declares `PHY_REG_ANTX` and leaves
+it dead. What the PHY advertises therefore comes entirely from the
+`MODE[2:0]` straps latched at reset. Datasheet Table 3.4:
+
+| MODE[2:0] | Meaning | `ANAR` [8,7,6,5] |
+|---|---|---|
+| `000`–`011` | fixed speed/duplex, **auto-negotiation disabled** | N/A |
+| `100` | 100BASE-TX **half** advertised, auto-neg enabled | `0100` |
+| `101` | repeater mode, 100 half advertised | `0100` |
+| `110` | power-down | N/A |
+| `111` | **all capable**, auto-neg enabled | `1111` |
+
+`ANAR[8,7,6,5]` is 100-full, 100-half, 10-full, 10-half. **If the straps land
+on `100` or `101`, the PHY advertises 100BASE-TX half duplex only, the link
+comes up at 100 half, and `poll_link` still returns `true`.**
+
+That is precisely the silent failure this section already worried about — but
+with a cause far more likely than a marginal cable. And it is plausible on
+*this* board specifically: Table 3.5 multiplexes `MODE[2:0]` onto `RXD0`,
+`RXD1` and `CRS_DV`, which on the Nucleo-F767ZI are STM32 pins **PC4, PC5 and
+PA7**. The strap value depends on what those GPIOs are doing when the PHY
+leaves reset.
+
+**What was done about it:** `Lan8742a` now reads `ANAR` (`0x04`) and the
+Special Modes register (`0x12`, bits [7:5] = the latched `MODE[2:0]`) and logs
+both once over `defmt`, warning if 100-full is not advertised and naming the
+decoded strap value. Read-only; the bring-up write sequence is unchanged.
+
+**What was deliberately *not* done:** writing `ANAR` before auto-negotiation.
+That is a bring-up change, and the rule above stands — it should be an
+evidence-driven decision after the bench shows a bad strap, not a speculative
+fix for a condition nobody has observed on this hardware. It is also `defmt`
+only rather than on the wire, because it is a bench question: a probe is
+attached at first flash, and in the field `PostBits::LINK` and
+`link_speed_mbps` already report the symptom and send you back to the bench.
 
 ## Appendix A — LSM6DSV16X register fallback
 

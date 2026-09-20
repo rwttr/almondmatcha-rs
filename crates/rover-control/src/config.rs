@@ -53,7 +53,7 @@ pub struct AppConfig {
 /// Which [`crate::guide::LateralController`] to build. A closed enum rather
 /// than a free-form string: `Lqr`/`Mpc` are named in the plan (§8) as future
 /// work and deliberately not implemented here (see this crate's top-level
-/// docs and plan §13.2) — naming them as *rejected* variants means a config
+/// docs and `docs/STATUS_OPEN.md` §1) — naming them as *rejected* variants means a config
 /// asking for one fails loudly at startup instead of silently falling back
 /// to `StaticGain`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -464,7 +464,7 @@ mod tests {
                 k_head_deg_per_deg: 2.024,
             })
         );
-        // Shipped standing blocker (plan §13.5): still uncalibrated.
+        // Shipped standing blocker (docs/STATUS_OPEN.md §1.1): still uncalibrated.
         assert_eq!(cfg.metres_per_tick, 0.0);
     }
 }

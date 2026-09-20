@@ -2,14 +2,17 @@
 
 **What this is:** a short account of what branch `rs` did to this project and
 why, for someone who needs the shape of it without reading
-[RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md)'s twelve hundred lines.
+[RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md)'s twelve hundred lines. For
+current status and evidence, see [STATUS_DONE.md](STATUS_DONE.md) and
+[STATUS_OPEN.md](STATUS_OPEN.md) — this document covers architecture and
+rationale, not day-to-day state.
 
-**Status:** complete as software, unproven as a rover. Every component is
-written and tested on a laptop. **Nothing has been flashed to a board, and
-the drivetrain is uncalibrated.** Those two facts govern everything below.
+**Status:** complete as software, unproven as a rover. **Nothing has been
+flashed to a board, and the drivetrain is uncalibrated.** Those two facts
+govern everything below; `STATUS_OPEN.md` has the full accounting.
 
-Dates: designed and built 19–20 September 2026. `main` still holds the
-working ROS 2 rover and is the fallback.
+Designed and built 19–20 September 2026. `main` still holds the working ROS 2
+rover and is the fallback.
 
 ---
 
@@ -65,7 +68,7 @@ framework is a liability rather than leverage.
 |---|---|
 | ROS 2 Humble + Fast-DDS on Linux | Plain UDP datagrams, static routing table in `config/rover.toml` |
 | mROS 2 + embeddedRTPS + lwIP + mbed OS on two MCUs | [Embassy](https://embassy.dev) async Rust, `no_std` |
-| `.msg`/`.srv`/`.action` files + `rosidl` codegen | `crates/rover-msgs` — 16 hand-written types, one shared crate |
+| `.msg`/`.srv`/`.action` files + `rosidl` codegen | `crates/rover-msgs` — 17 hand-written types, one shared crate |
 | Three DDS domains (D4/D5/D6) for isolation | Unicast fan-out from a table. Isolation is not needed when nothing discovers anything. |
 | Multicast discovery, `initialPeersList` | Static addresses. Nothing discovers anything, ever. |
 | `camera_stream_node` → DDS → `lane_detection_node` | One Python process. The hop was 1:1 on the same machine. |
@@ -129,12 +132,11 @@ project later wants a visualisation ecosystem, it will have to build or
 import one.
 
 **No field validation is possible from a desk.** There is no recorded ROS 2
-run anywhere in this repository and there never was — no `runs/` directory,
-no CSV, no bag file. `tools/replay` therefore compares the new pipeline
-against an independently written port of the *old* control law fed synthetic
-traces. That proves internal consistency and that the harness can catch a
-regression. It does **not** prove field parity, and the tool says so itself
-every time it runs.
+run anywhere in this repository and there never was. `tools/replay` compares
+the new pipeline against an independently written, frozen port of the *old*
+control law fed synthetic traces — internal consistency and a harness that
+can catch a regression, not field parity, and the tool says so every time it
+runs. `STATUS_OPEN.md` §1.4 has the detail.
 
 **A known behaviour change.** The old mission monitor navigated on the
 *uncorrected* Spresense GNSS and never read the RTK receiver, against a 20 m
@@ -156,10 +158,13 @@ not a parity failure, but it must not be mistaken for one.
 | ├─ vendored MCU stack | 766 files |
 | └─ docs, launch tooling, `command/`, `.vscode/` | 109 files |
 | Tracked source, before → after | ~12.5 MB → 2.3 MB |
-| Tests | 290 Rust, 82 Python |
-| Message types | 16, plus the frame header — 17 golden byte fixtures |
-| Chassis firmware | 65,048 B flash (3.1 %), 17,724 B RAM (3.4 %) |
-| Sensors firmware | 54,316 B flash (2.6 %), 17,844 B RAM (3.4 %) |
+| Message types | 17, plus the frame header — 18 golden byte fixtures |
+
+Current test counts and firmware flash/RAM figures move as work lands, so
+they live in one place rather than two: `STATUS_DONE.md` §1. (The
+lines-written figures above predate `rover-doctor`, `rover-runs` and the
+board-diagnostics work landed since, so read them as the rewrite's original
+footprint, not today's total.)
 
 ---
 
@@ -170,7 +175,11 @@ not a parity failure, but it must not be mistaken for one.
 correct response is *steer right*, so both feedback terms carry a **plus**
 sign. This is field-derived. "Correcting" it to ISO 8855 without inverting
 every consumer in the same commit turns the lateral controller into positive
-feedback.
+feedback. **This is the convention as designed — it is not a claim that
+`heading_err_rad`'s implementation matched it.** It didn't: see D5 in
+`STATUS_OPEN.md` §1.3, where the detector's sign disagreed with this model
+until it was fixed, and where the pre-existing framing of this note is named
+as part of how that bug hid.
 
 **Tick counts doubled.** The old firmware interrupted on encoder channel A
 only — 2× decoding. The Rust firmware decodes both channels on every edge —
@@ -194,27 +203,23 @@ banner saying so.
 
 ---
 
-## 8. Where it stands
+## 8. Status, in one place
 
-**Done:** all ten Rust crates, both firmware images, the perception process,
-the replay gate. 290 Rust tests and 82 Python tests pass; clippy and `rustfmt`
-are clean; the replay gate exits 0.
+`STATUS_DONE.md` is authoritative on what is built and its evidence;
+`STATUS_OPEN.md` on what remains and what to worry about. In short: all
+twelve crates, both firmware images, the perception process and the replay
+gate are done and tested — 331 Rust tests, 88 Python tests, clippy/rustfmt
+clean. Board self-diagnostics landed most recently: both boards run a
+power-on self-test and report it, along with reset cause and Ethernet link
+state, and `rover-doctor` turns that into a preflight GO/NO-GO. None of it
+has met silicon.
 
-The lane detector port is **proven**, not merely reviewed: the original ROS 2
-detector is vendored verbatim at `perception/tests/oracle/` and compared
-against exactly, with no tolerance. Perturbing the port's polyfit
-coefficients by one part in 10⁷ fails five of nine tests.
-
-**Blocking field use — neither is a coding task:**
-
-1. **Calibrate the drivetrain.** `ticks_per_rev`, `metres_per_tick` and
-   `track_width_m` are all `0.0`. No metric speed exists anywhere in the
-   system until they are measured. Twenty minutes with a tape measure;
-   procedures in plan §2.6. Measure against the **4×** decoder.
-2. **Flash something.** Every firmware claim above is about a binary that
-   builds, not one that has run. The LAN8742A PHY against Embassy's
-   `GenericPhy` is the gate that decides whether any of it is real. Plan
-   §13.4 lists the rest of the hardware-verification debt.
+**Blocking field use — neither is a coding task:** calibrating the
+drivetrain (`ticks_per_rev`, `metres_per_tick`, `track_width_m` are all `0.0`
+in `config/rover.toml`) and flashing the boards for the first time, past the
+LAN8742A PHY gate. `STATUS_OPEN.md` §1.1–§1.2 has the procedures and the
+reasoning; `docs/FIELD_TEST.md` is the end-to-end procedure once they're
+done.
 
 **Deferred by choice:** the two ESP32 LoRa links (out of scope by
 instruction, but the reason there is no TCP anywhere), and the LQR and MPC
@@ -226,7 +231,9 @@ control laws (phase 2 and 3 — the trait exists so they are additions).
 
 | Document | For |
 |---|---|
-| [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) | The full design. **§13 is authoritative** over the rest of the file — everything above it is the plan, §13 is what exists. |
+| [RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) | The full design: architecture, rationale, procedures, defect narratives, hardware debt. |
+| [STATUS_DONE.md](STATUS_DONE.md) | What is built, and the evidence for it. Authoritative over any status claim elsewhere. |
+| [STATUS_OPEN.md](STATUS_OPEN.md) | What remains and what to worry about. Authoritative over any status claim elsewhere. |
 | [HARDWARE.md](HARDWARE.md) | Machines, sensors, both pin maps, calibration status. |
 | [VISION_PIPELINE.md](VISION_PIPELINE.md) | How a camera frame becomes lane geometry. ROS 2 era, still the reference. |
 | [CONTROL_LAW.md](CONTROL_LAW.md) | Steering and speed derivation. ROS 2 era — see the warning above. |

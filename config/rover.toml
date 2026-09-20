@@ -227,7 +227,7 @@ timeout_s          = 2.0
 # line and take the variance of the lane parameters over a few hundred frames.
 # No such recording exists yet -- no ROS 2 runs/ CSVs exist in this repository
 # and none ever did. A run must be produced first before R can be seeded this
-# way. See docs/RUST_REWRITE_PLAN.md §13.5.
+# way. See docs/STATUS_OPEN.md §1.1.
 # ---------------------------------------------------------------------------
 [estimator]
 predict_hz            = 100.0
