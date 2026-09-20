@@ -12,7 +12,7 @@
 //! a stalled disk degrades to a growing queue in memory, never a blocked
 //! caller.
 
-use crate::runs::RunDir;
+use rover_runs::RunDir;
 use std::io::Write;
 use std::sync::mpsc;
 use std::sync::Arc;

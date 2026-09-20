@@ -54,10 +54,11 @@ struct Args {
     #[arg(long, default_value = "config/rover.toml")]
     config: std::path::PathBuf,
 
-    /// Where received telemetry is logged. See `csv_log.rs` for why this
-    /// exists despite the ROS 2 base station never having had one.
-    #[arg(long, default_value = "ground_station_telemetry.csv")]
-    log_file: std::path::PathBuf,
+    /// Root directory under which `run_NNN_<stamp>/` is created — see
+    /// `csv_log.rs` and `rover-runs`. Received telemetry is logged inside it
+    /// as `ground_station_telemetry.csv`, created lazily on first write.
+    #[arg(long, default_value = "runs")]
+    runs_dir: std::path::PathBuf,
 }
 
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
@@ -92,7 +93,14 @@ fn main() {
         });
     let mut bus = Bus::new(link_socket, bus_config);
 
-    let csv_logger = csv_log::CsvLogger::spawn(&args.log_file);
+    // Nothing here creates a directory eagerly -- see `csv_log.rs`'s doc
+    // comment. `create_dir_all` on the *root* only ensures the scan
+    // `RunDir::resolve` does has somewhere to look; it does not create (or
+    // consume a run number for) the run directory itself.
+    std::fs::create_dir_all(&args.runs_dir).ok();
+    let run_dir = rover_runs::RunDir::resolve(&args.runs_dir);
+    let run_dir_path = run_dir.path().display().to_string();
+    let csv_logger = csv_log::CsvLogger::spawn(run_dir);
     let mut sender = CommandSender::default();
 
     let latest_telemetry: Rc<RefCell<Telemetry>> = Rc::new(RefCell::new(Telemetry::default()));
@@ -128,10 +136,7 @@ fn main() {
         }
     });
 
-    log::info!(
-        "ground-station ready, bound {bind_addr}, logging to {}",
-        args.log_file.display()
-    );
+    log::info!("ground-station ready, bound {bind_addr}, logging under {run_dir_path}");
     println!("commands: estop | clearestop | cancel | goal <lat> <lon> | speed <pct> | nop");
 
     let mut next_redraw = Instant::now();

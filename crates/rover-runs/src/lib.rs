@@ -1,5 +1,16 @@
 //! The `runs/run_NNN_<stamp>/` scheme, ported from `rover_monitoring_node.cpp`.
 //!
+//! Split out into its own crate (rather than living in `rover-telemetry`,
+//! where it started) because `ground-station` needs the identical
+//! `run_NNN_<stamp>/` numbering for its own CSV capture — see
+//! `docs/RUST_REWRITE_PLAN.md`'s task brief on why a second, hand-copied
+//! implementation of run numbering is exactly the bug class this project
+//! keeps finding: two run-number scanners that drift apart (off-by-one in
+//! the zero-padding, a different tie-break on a malformed directory name,
+//! ...) would let a base-station capture and a rover capture from the same
+//! session disagree about which run they belong to. One crate, one
+//! implementation, used by both binaries.
+//!
 //! Two behaviours are carried over deliberately:
 //!
 //! - **Files (and the run directory itself) are created on first write, not
@@ -12,6 +23,8 @@
 //!   `get_next_run_number` (`glob("run_*")`, parse the three digits after
 //!   `run_`, take the max, add one) rather than persisting a counter
 //!   anywhere.
+
+#![forbid(unsafe_code)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -37,9 +50,9 @@ pub fn next_run_number(existing_dir_names: &[String]) -> u32 {
 /// Days since the civil epoch, inverted into `(year, month, day)` — Howard
 /// Hinnant's `civil_from_days`, the inverse of the `days_from_civil`
 /// algorithm `rover-navigation`'s `time_utils.rs` uses in the other
-/// direction. The two crates do not share code (there is no common
-/// internal-utility crate in this workspace), so this is a from-scratch,
-/// independently-tested implementation rather than a copy.
+/// direction. The two crates do not share code (this crate has no
+/// dependencies at all, by design — see the `Cargo.toml`), so this is a
+/// from-scratch, independently-tested implementation rather than a copy.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -209,7 +222,7 @@ mod tests {
     #[test]
     fn no_directory_is_created_until_the_first_csv_is_opened() {
         let tmp = std::env::temp_dir().join(format!(
-            "rover-telemetry-test-{}-{}",
+            "rover-runs-test-{}-{}",
             std::process::id(),
             "no_dir_until_first_write"
         ));

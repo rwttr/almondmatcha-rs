@@ -1,6 +1,6 @@
 [package]
-name        = "ground-station"
-description = "Base PC binary: send commands, show live telemetry, log to CSV."
+name        = "rover-doctor"
+description = "Base PC binary: preflight GO/NO-GO check, run once before driving."
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -10,7 +10,8 @@ repository.workspace = true
 rover-msgs = { workspace = true }
 rover-link = { workspace = true }
 rover-bus  = { workspace = true }
-rover-runs = { workspace = true }
 clap       = { version = "4", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
+toml       = "1"
 log        = "0.4"
 env_logger = "0.11"

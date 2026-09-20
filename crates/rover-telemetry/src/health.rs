@@ -11,7 +11,7 @@
 //! this topic" — a link that died five minutes ago still reads `valid`.
 //! Everything here is a genuine age check instead.
 
-use rover_msgs::{ChassisStatus, HealthBits, RoverState};
+use rover_msgs::{BoardDiagnostics, BoardId, ChassisStatus, HealthBits, RoverState};
 
 // ---------------------------------------------------------------------------
 // Staleness thresholds.
@@ -93,6 +93,12 @@ pub struct FeedAges {
 /// the same config key the estimator itself uses to decide the camera feed
 /// has gone stale, so this bit and the estimator's own behaviour can never
 /// disagree about what "stale" means.
+///
+/// `board_bits` is [`BoardHealth::bits`] — this function only folds it in,
+/// it does not recompute it. That keeps `compute_health` a pure function of
+/// its arguments: the latching state that makes `BOARD_POST_FAIL`/
+/// `BOARD_RESET`/`LINK_DEGRADED` "stay set for the run" lives in
+/// `BoardHealth`, which is stateful by necessity, not here.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_health(
     ages: &FeedAges,
@@ -101,6 +107,7 @@ pub fn compute_health(
     chassis_status: Option<&ChassisStatus>,
     stall_detected: bool,
     state: &RoverState,
+    board_bits: HealthBits,
 ) -> HealthBits {
     let mut health = HealthBits::NONE;
 
@@ -128,8 +135,102 @@ pub fn compute_health(
     if state.cross_track_var() > ESTIMATOR_DIVERGED_VAR_M2 {
         health.set(HealthBits::ESTIMATOR_DIVERGED);
     }
+    health.set(board_bits);
 
     health
+}
+
+/// Latched per-board health, driven by [`BoardDiagnostics`].
+///
+/// **Keyed by [`BoardId`], not shared.** A single shared latch would let a
+/// healthy sensors-board sample clear (or simply never show) a fault the
+/// chassis board is still reporting, and vice versa — exactly the failure
+/// mode the task brief calls out. Each board gets its own slot, and only
+/// [`BoardHealth::bits`] ORs them together into the one [`HealthBits`] value
+/// `compute_health` folds in.
+#[derive(Debug, Clone, Copy, Default)]
+struct PerBoard {
+    latched: HealthBits,
+    /// `uptime_s` from the previous sample, so a later sample can tell a
+    /// reboot from a clock that is merely running: see
+    /// [`BoardHealth::observe`].
+    last_uptime_s: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BoardHealth {
+    chassis: PerBoard,
+    sensors: PerBoard,
+}
+
+impl BoardHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn slot(&mut self, board: BoardId) -> &mut PerBoard {
+        match board {
+            BoardId::Chassis => &mut self.chassis,
+            BoardId::Sensors => &mut self.sensors,
+        }
+    }
+
+    /// Feed one `BoardDiagnostics` sample and update that board's latched
+    /// bits. Call this from the `BoardDiagnostics` subscription, once per
+    /// sample received — the order samples arrive in matters, because the
+    /// uptime-went-backwards check compares against whatever this board's
+    /// previous sample said.
+    ///
+    /// See `types.rs`'s doc comments on `BOARD_POST_FAIL`/`BOARD_RESET`/
+    /// `LINK_DEGRADED` for why each condition below is latched rather than
+    /// recomputed fresh from only the latest sample.
+    pub fn observe(&mut self, diag: &BoardDiagnostics) {
+        let slot = self.slot(diag.board);
+
+        if !diag.post_ok() {
+            slot.latched.set(HealthBits::BOARD_POST_FAIL);
+        }
+
+        // A clean power-glitch reboot reports `ResetCause::PowerOn` --
+        // legitimately, it is not lying -- so `reset_cause.is_abnormal()`
+        // alone would miss it. Uptime going backwards between two samples
+        // from the *same* board is the only signal that catches that case,
+        // which is exactly why the task brief calls it essential.
+        let uptime_went_backwards = slot.last_uptime_s.is_some_and(|prev| diag.uptime_s < prev);
+        if diag.reset_cause.is_abnormal() || uptime_went_backwards {
+            slot.latched.set(HealthBits::BOARD_RESET);
+        }
+        slot.last_uptime_s = Some(diag.uptime_s);
+
+        // `link_speed_mbps == 0` is "unknown", not "down" -- see the field's
+        // doc comment. This sample reached us over the very link it
+        // describes, so the link is demonstrably up; a zero can only mean the
+        // board's PHY read failed or had not run yet when it published. This
+        // bit latches for the whole run, so treating unknown as degraded
+        // would pin LINK_DEGRADED on for good the first time a board's POST
+        // publish beat its first PHY poll -- a false alarm on every boot,
+        // which is how a warning bit gets ignored.
+        //
+        // Symbol errors are only meaningful at 100 Mbit/s (the counter does
+        // not increment in 10BASE-T mode), but a link running at 10 is
+        // already caught by the speed test above, so checking them
+        // unconditionally cannot produce a wrong verdict here.
+        let speed_known = diag.link_speed_mbps != 0;
+        if speed_known
+            && (diag.link_speed_mbps != 100 || !diag.link_full_duplex || diag.phy_symbol_errors > 0)
+        {
+            slot.latched.set(HealthBits::LINK_DEGRADED);
+        }
+    }
+
+    /// Both boards' latched bits, ORed together — what `compute_health`
+    /// folds into the run's `HealthBits`.
+    pub fn bits(&self) -> HealthBits {
+        let mut h = HealthBits::NONE;
+        h.set(self.chassis.latched);
+        h.set(self.sensors.latched);
+        h
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +256,15 @@ mod tests {
 
     #[test]
     fn all_fresh_is_no_bits_set() {
-        let h = compute_health(&fresh_ages(), 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert_eq!(h, HealthBits::NONE);
     }
 
@@ -163,7 +272,15 @@ mod tests {
     fn never_seen_chassis_is_stale() {
         let mut ages = fresh_ages();
         ages.chassis_ms = None;
-        let h = compute_health(&ages, 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::CHASSIS_STALE));
     }
 
@@ -171,7 +288,15 @@ mod tests {
     fn old_chassis_age_is_stale() {
         let mut ages = fresh_ages();
         ages.chassis_ms = Some(CHASSIS_STALE_MS + 1);
-        let h = compute_health(&ages, 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::CHASSIS_STALE));
     }
 
@@ -179,15 +304,39 @@ mod tests {
     fn age_exactly_at_threshold_is_not_yet_stale() {
         let mut ages = fresh_ages();
         ages.sensors_ms = Some(SENSORS_STALE_MS);
-        let h = compute_health(&ages, 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(!h.contains(HealthBits::SENSORS_STALE));
     }
 
     #[test]
     fn lane_stale_uses_the_estimator_config_threshold_not_a_constant() {
-        let h = compute_health(&fresh_ages(), 501, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &fresh_ages(),
+            501,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::LANE_STALE));
-        let h = compute_health(&fresh_ages(), 500, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &fresh_ages(),
+            500,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(!h.contains(HealthBits::LANE_STALE));
     }
 
@@ -195,7 +344,15 @@ mod tests {
     fn rtk_and_backup_stale_independently() {
         let mut ages = fresh_ages();
         ages.rtk_ms = Some(RTK_STALE_MS + 1);
-        let h = compute_health(&ages, 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::RTK_STALE));
         assert!(!h.contains(HealthBits::BACKUP_GNSS_STALE));
     }
@@ -213,6 +370,7 @@ mod tests {
             Some(&status),
             false,
             &healthy_state(),
+            HealthBits::NONE,
         );
         assert!(h.contains(HealthBits::WATCHDOG_TRIPPED));
     }
@@ -221,7 +379,15 @@ mod tests {
     fn no_chassis_status_yet_means_no_watchdog_bit() {
         // Absence of data is not evidence of a tripped watchdog -- it is
         // covered by CHASSIS_STALE instead.
-        let h = compute_health(&fresh_ages(), 0, 500, None, false, &healthy_state());
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(!h.contains(HealthBits::WATCHDOG_TRIPPED));
     }
 
@@ -239,13 +405,22 @@ mod tests {
             Some(&status),
             false,
             &healthy_state(),
+            HealthBits::NONE,
         );
         assert!(!h.contains(HealthBits::WATCHDOG_TRIPPED));
     }
 
     #[test]
     fn stall_detected_flows_through() {
-        let h = compute_health(&fresh_ages(), 0, 500, None, true, &healthy_state());
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            true,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::STALL_DETECTED));
     }
 
@@ -255,7 +430,15 @@ mod tests {
             p_diag: [ESTIMATOR_DIVERGED_VAR_M2 + 0.01, 0.0, 0.0, 0.0, 0.0],
             ..Default::default()
         };
-        let h = compute_health(&fresh_ages(), 0, 500, None, false, &diverged);
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &diverged,
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::ESTIMATOR_DIVERGED));
     }
 
@@ -265,7 +448,15 @@ mod tests {
             p_diag: [ESTIMATOR_DIVERGED_VAR_M2, 0.0, 0.0, 0.0, 0.0],
             ..Default::default()
         };
-        let h = compute_health(&fresh_ages(), 0, 500, None, false, &at_threshold);
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &at_threshold,
+            HealthBits::NONE,
+        );
         assert!(!h.contains(HealthBits::ESTIMATOR_DIVERGED));
     }
 
@@ -274,12 +465,214 @@ mod tests {
         let mut ages = fresh_ages();
         ages.chassis_ms = None;
         ages.rtk_ms = None;
-        let h = compute_health(&ages, 999, 500, None, true, &healthy_state());
+        let h = compute_health(
+            &ages,
+            999,
+            500,
+            None,
+            true,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
         assert!(h.contains(HealthBits::CHASSIS_STALE));
         assert!(h.contains(HealthBits::RTK_STALE));
         assert!(h.contains(HealthBits::LANE_STALE));
         assert!(h.contains(HealthBits::STALL_DETECTED));
         assert!(!h.contains(HealthBits::SENSORS_STALE));
+    }
+
+    #[test]
+    fn board_bits_are_folded_in_unchanged() {
+        // compute_health must not recompute or reinterpret board_bits --
+        // just OR it into the result alongside everything else it computes.
+        let mut board_bits = HealthBits::NONE;
+        board_bits.set(HealthBits::BOARD_POST_FAIL);
+        board_bits.set(HealthBits::LINK_DEGRADED);
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            board_bits,
+        );
+        assert!(h.contains(HealthBits::BOARD_POST_FAIL));
+        assert!(h.contains(HealthBits::LINK_DEGRADED));
+        assert!(!h.contains(HealthBits::BOARD_RESET));
+    }
+
+    #[test]
+    fn no_board_bits_leaves_the_rest_of_the_computation_untouched() {
+        let h = compute_health(
+            &fresh_ages(),
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
+        assert_eq!(h, HealthBits::NONE);
+    }
+}
+
+#[cfg(test)]
+mod board_health_tests {
+    use super::*;
+
+    fn healthy_diag(board: BoardId, uptime_s: u32) -> BoardDiagnostics {
+        BoardDiagnostics {
+            board,
+            post_run: rover_msgs::PostBits(0b1111),
+            post_pass: rover_msgs::PostBits(0b1111),
+            reset_cause: rover_msgs::ResetCause::PowerOn,
+            phy_id: 0x0007_C130,
+            link_speed_mbps: 100,
+            link_full_duplex: true,
+            phy_symbol_errors: 0,
+            uptime_s,
+            tx_drops: 0,
+        }
+    }
+
+    #[test]
+    fn healthy_sample_sets_no_bits() {
+        let mut bh = BoardHealth::new();
+        bh.observe(&healthy_diag(BoardId::Chassis, 10));
+        assert_eq!(bh.bits(), HealthBits::NONE);
+    }
+
+    #[test]
+    fn post_failure_sets_board_post_fail_for_that_board_only() {
+        let mut bh = BoardHealth::new();
+        let mut failed = healthy_diag(BoardId::Chassis, 10);
+        failed.post_pass = rover_msgs::PostBits(0b1110); // bit 0 ran but failed
+        bh.observe(&failed);
+        bh.observe(&healthy_diag(BoardId::Sensors, 10));
+        assert!(bh.bits().contains(HealthBits::BOARD_POST_FAIL));
+    }
+
+    #[test]
+    fn a_fault_on_one_board_is_not_hidden_by_a_healthy_sample_from_the_other() {
+        // The whole point of keying BoardHealth by BoardId: a healthy
+        // sensors-board sample must never clear or mask a chassis fault.
+        let mut bh = BoardHealth::new();
+        let mut chassis_failed = healthy_diag(BoardId::Chassis, 10);
+        chassis_failed.post_pass = rover_msgs::PostBits(0b1110);
+        bh.observe(&chassis_failed);
+
+        for uptime in [11, 12, 13] {
+            bh.observe(&healthy_diag(BoardId::Sensors, uptime));
+        }
+
+        assert!(
+            bh.bits().contains(HealthBits::BOARD_POST_FAIL),
+            "a healthy sensors board must not hide the chassis board's POST failure"
+        );
+    }
+
+    #[test]
+    fn abnormal_reset_cause_sets_board_reset() {
+        let mut bh = BoardHealth::new();
+        let mut diag = healthy_diag(BoardId::Sensors, 5);
+        diag.reset_cause = rover_msgs::ResetCause::IndependentWatchdog;
+        bh.observe(&diag);
+        assert!(bh.bits().contains(HealthBits::BOARD_RESET));
+    }
+
+    #[test]
+    fn uptime_going_backwards_with_a_power_on_cause_still_sets_board_reset() {
+        // A clean power-glitch reboot legitimately reports PowerOn -- it is
+        // not lying about the cause. Uptime resetting to a smaller value than
+        // the previous sample from the same board is the only thing that
+        // catches this, which is why the task brief calls it essential.
+        let mut bh = BoardHealth::new();
+        bh.observe(&healthy_diag(BoardId::Chassis, 500));
+        assert!(!bh.bits().contains(HealthBits::BOARD_RESET));
+
+        bh.observe(&healthy_diag(BoardId::Chassis, 3)); // rebooted, uptime reset
+        assert!(bh.bits().contains(HealthBits::BOARD_RESET));
+    }
+
+    #[test]
+    fn increasing_uptime_never_trips_board_reset_on_its_own() {
+        let mut bh = BoardHealth::new();
+        for uptime in [1, 2, 3, 100, 101] {
+            bh.observe(&healthy_diag(BoardId::Sensors, uptime));
+        }
+        assert!(!bh.bits().contains(HealthBits::BOARD_RESET));
+    }
+
+    #[test]
+    fn degraded_link_sets_link_degraded() {
+        let mut bh = BoardHealth::new();
+        let mut slow = healthy_diag(BoardId::Chassis, 10);
+        slow.link_speed_mbps = 10;
+        bh.observe(&slow);
+        assert!(bh.bits().contains(HealthBits::LINK_DEGRADED));
+
+        let mut bh = BoardHealth::new();
+        let mut half_duplex = healthy_diag(BoardId::Chassis, 10);
+        half_duplex.link_full_duplex = false;
+        bh.observe(&half_duplex);
+        assert!(bh.bits().contains(HealthBits::LINK_DEGRADED));
+
+        let mut bh = BoardHealth::new();
+        let mut noisy = healthy_diag(BoardId::Chassis, 10);
+        noisy.phy_symbol_errors = 1;
+        bh.observe(&noisy);
+        assert!(bh.bits().contains(HealthBits::LINK_DEGRADED));
+    }
+
+    #[test]
+    fn unknown_link_speed_does_not_latch_link_degraded() {
+        // `link_speed_mbps == 0` is "the PHY read failed", not "the link is
+        // down" -- the sample arrived over that link. Latching on it would
+        // pin LINK_DEGRADED for the whole run on any board whose first
+        // publish beat its first PHY poll.
+        let mut bh = BoardHealth::new();
+        let mut unknown = healthy_diag(BoardId::Chassis, 10);
+        unknown.link_speed_mbps = 0;
+        unknown.link_full_duplex = false;
+        bh.observe(&unknown);
+        assert!(!bh.bits().contains(HealthBits::LINK_DEGRADED));
+
+        // ...and a later sample that genuinely is degraded still latches.
+        let mut slow = healthy_diag(BoardId::Chassis, 11);
+        slow.link_speed_mbps = 10;
+        bh.observe(&slow);
+        assert!(bh.bits().contains(HealthBits::LINK_DEGRADED));
+    }
+
+    #[test]
+    fn latched_bits_survive_a_later_healthy_sample() {
+        // Latched means latched: a POST failure does not heal, and clearing
+        // it the moment the board stops re-announcing it would hide the
+        // event this bit exists to record.
+        let mut bh = BoardHealth::new();
+        let mut failed = healthy_diag(BoardId::Chassis, 10);
+        failed.post_pass = rover_msgs::PostBits(0b1110);
+        bh.observe(&failed);
+        assert!(bh.bits().contains(HealthBits::BOARD_POST_FAIL));
+
+        bh.observe(&healthy_diag(BoardId::Chassis, 11));
+        assert!(
+            bh.bits().contains(HealthBits::BOARD_POST_FAIL),
+            "a later healthy sample must not clear the latch"
+        );
+    }
+
+    #[test]
+    fn latched_reset_bit_also_survives_a_later_healthy_sample() {
+        let mut bh = BoardHealth::new();
+        let mut diag = healthy_diag(BoardId::Sensors, 500);
+        diag.reset_cause = rover_msgs::ResetCause::BrownOut;
+        bh.observe(&diag);
+        assert!(bh.bits().contains(HealthBits::BOARD_RESET));
+
+        bh.observe(&healthy_diag(BoardId::Sensors, 501));
+        assert!(bh.bits().contains(HealthBits::BOARD_RESET));
     }
 }
 

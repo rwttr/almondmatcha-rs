@@ -10,6 +10,7 @@ repository.workspace = true
 rover-msgs = { workspace = true }
 rover-link = { workspace = true }
 rover-bus  = { workspace = true }
+rover-runs = { workspace = true }
 clap       = { version = "4", features = ["derive"] }
 serde      = { version = "1", features = ["derive"] }
 toml       = "1"

@@ -1,0 +1,9 @@
+[package]
+name        = "rover-runs"
+description = "The run_NNN_<stamp>/ directory scheme, shared by every host binary that logs to CSV."
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]

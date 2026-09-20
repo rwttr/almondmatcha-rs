@@ -10,7 +10,10 @@
 //! table like `gnss_ublox_node.cpp`'s `getFixQuality`. The two can never
 //! drift apart because there is only one source of the name.
 
-use rover_msgs::{ChassisStatus, GnssFix, MissionStatus, PowerSample, RoverState, SpeedLoopDebug};
+use rover_msgs::{
+    BoardDiagnostics, ChassisStatus, GnssFix, MissionStatus, PostBits, PowerSample, RoverState,
+    SpeedLoopDebug,
+};
 
 pub const ROVER_STATE_HEADER: &str =
     "Timestamp_us,Cross_Track_m,Heading_Err_rad,Curvature_inv_m,Speed_mps,\
@@ -93,6 +96,66 @@ pub fn format_speed_loop_debug_row(timestamp_us: u64, d: &SpeedLoopDebug) -> Str
     format!(
         "{timestamp_us},{},{},{},{},{}\n",
         d.measured_left_tps, d.measured_right_tps, d.target_tps, d.error_pct, d.pid_output_pct
+    )
+}
+
+/// Which `PostBits` bit indices name the same check regardless of board
+/// (bits 0-3 and 7 — see `PostBits`'s doc comment table). Bits 4-6 differ per
+/// board and are deliberately **not** named here: the `Board` column is the
+/// only correct way to interpret them, and guessing a name for the wrong
+/// board would be worse than an unlabelled index.
+fn common_post_bit_name(bit: u8) -> Option<&'static str> {
+    match bit {
+        0 => Some("CLOCK"),
+        1 => Some("PHY_ID"),
+        2 => Some("LINK"),
+        3 => Some("NET_BIND"),
+        7 => Some("IWDG"),
+        _ => None,
+    }
+}
+
+/// Human-legible failure list for a `PostBits` mask: named where the name is
+/// unambiguous across both boards, a bare bit index where it is not (4-6 --
+/// look up `board` against `PostBits`'s doc comment table to read those).
+/// Empty string for no failures, so the column reads blank rather than "0x0"
+/// on the common case.
+fn describe_post_failures(failures: PostBits) -> String {
+    (0..8u8)
+        .filter(|bit| failures.0 & (1 << bit) != 0)
+        .map(|bit| {
+            common_post_bit_name(bit)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("bit{bit}"))
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+pub const BOARD_DIAGNOSTICS_HEADER: &str = "Timestamp_us,Board,Post_Run_Mask,Post_Pass_Mask,\
+     Post_Failures_Mask,Post_Failures_Decoded,Reset_Cause,Phy_Id,Link_Speed_Mbps,\
+     Link_Full_Duplex,Phy_Symbol_Errors,Uptime_s,Tx_Drops\n";
+
+/// Enums are decoded to their `name()` strings, not their raw discriminant:
+/// a CSV that says `IWDG` is worth more at 2 a.m. than one that says `4`.
+/// `post_run`/`post_pass`/the failure mask stay in hex, alongside the decoded
+/// failure list, because the raw bits are still the ground truth an operator
+/// may need to cross-check against `PostBits`'s doc comment table.
+pub fn format_board_diagnostics_row(timestamp_us: u64, d: &BoardDiagnostics) -> String {
+    format!(
+        "{timestamp_us},{},0x{:04X},0x{:04X},0x{:04X},{},{},0x{:08X},{},{},{},{},{}\n",
+        d.board.name(),
+        d.post_run.0,
+        d.post_pass.0,
+        d.post_failures().0,
+        describe_post_failures(d.post_failures()),
+        d.reset_cause.name(),
+        d.phy_id,
+        d.link_speed_mbps,
+        d.link_full_duplex,
+        d.phy_symbol_errors,
+        d.uptime_s,
+        d.tx_drops,
     )
 }
 
@@ -214,6 +277,53 @@ mod tests {
         assert_same_column_count(SPEED_LOOP_DEBUG_HEADER, &row);
     }
 
+    fn healthy_diag() -> BoardDiagnostics {
+        BoardDiagnostics {
+            board: rover_msgs::BoardId::Chassis,
+            post_run: PostBits(0b1111),
+            post_pass: PostBits(0b1111),
+            reset_cause: rover_msgs::ResetCause::PowerOn,
+            phy_id: 0x0007_C130,
+            link_speed_mbps: 100,
+            link_full_duplex: true,
+            phy_symbol_errors: 0,
+            uptime_s: 12_345,
+            tx_drops: 0,
+        }
+    }
+
+    #[test]
+    fn board_diagnostics_row_decodes_enums_to_names() {
+        let d = healthy_diag();
+        let row = format_board_diagnostics_row(8_000, &d);
+        assert!(row.starts_with("8000,chassis,"));
+        // "power-on" (ResetCause::name()), not the raw discriminant `1`.
+        assert!(row.contains("power-on"), "row was: {row:?}");
+        assert_same_column_count(BOARD_DIAGNOSTICS_HEADER, &row);
+    }
+
+    #[test]
+    fn board_diagnostics_row_reports_no_failures_when_post_ok() {
+        let d = healthy_diag();
+        let row = format_board_diagnostics_row(8_000, &d);
+        // Post_Failures_Mask is 0x0000 and Post_Failures_Decoded is empty --
+        // two adjacent empty-ish columns, not one column silently missing.
+        assert!(row.contains(",0x0000,,"), "row was: {row:?}");
+    }
+
+    #[test]
+    fn board_diagnostics_row_names_common_post_bits_and_indexes_board_specific_ones() {
+        let mut d = healthy_diag();
+        // Bit 0 (CLOCK, common) and bit 5 (board-specific -- SENSOR_B) both
+        // ran but failed.
+        d.post_pass = PostBits(0b1101_1110);
+        d.post_run = PostBits(0b1111_1111);
+        let row = format_board_diagnostics_row(9_000, &d);
+        assert!(row.contains("CLOCK"), "row was: {row:?}");
+        assert!(row.contains("bit5"), "row was: {row:?}");
+        assert_same_column_count(BOARD_DIAGNOSTICS_HEADER, &row);
+    }
+
     #[test]
     fn every_header_ends_with_a_newline() {
         for header in [
@@ -223,6 +333,7 @@ mod tests {
             GNSS_HEADER,
             CHASSIS_STATUS_HEADER,
             SPEED_LOOP_DEBUG_HEADER,
+            BOARD_DIAGNOSTICS_HEADER,
         ] {
             assert!(header.ends_with('\n'), "{header:?} must end with a newline");
         }

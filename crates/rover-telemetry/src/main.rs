@@ -53,16 +53,15 @@ mod config;
 mod csv_fmt;
 mod csv_writer;
 mod health;
-mod runs;
 
 use csv_writer::CsvLogger;
 use health::stall::StallDetector;
-use health::{compute_health, FeedAges};
+use health::{compute_health, BoardHealth, FeedAges};
 use rover_bus::{Bus, BusConfig, CommandReceiver};
 use rover_link::{PeerId, UdpLink};
 use rover_msgs::{
-    ChassisStatus, CommandFrame, GnssFix, GnssSource, MissionStatus, PowerSample, RoverState,
-    SpeedLoopDebug, Telemetry,
+    BoardDiagnostics, ChassisStatus, CommandFrame, GnssFix, GnssSource, MissionStatus, PowerSample,
+    RoverState, SpeedLoopDebug, Telemetry,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -79,8 +78,8 @@ struct Args {
     config: std::path::PathBuf,
 
     /// Root directory under which `run_NNN_<stamp>/` is created — see
-    /// `runs.rs`. Overridable for bench testing away from the real `runs/`
-    /// tree; `$ROVER_RUN_DIR`, if set, still takes priority (see
+    /// `rover_runs`. Overridable for bench testing away from the real
+    /// `runs/` tree; `$ROVER_RUN_DIR`, if set, still takes priority (see
     /// `RunDir::resolve`).
     #[arg(long, default_value = "runs")]
     runs_dir: std::path::PathBuf,
@@ -153,7 +152,7 @@ fn main() {
     let mut bus = Bus::new(link, bus_config);
 
     std::fs::create_dir_all(&args.runs_dir).ok();
-    let run_dir = Arc::new(runs::RunDir::resolve(&args.runs_dir));
+    let run_dir = Arc::new(rover_runs::RunDir::resolve(&args.runs_dir));
     log::info!("logging to {}", run_dir.path().display());
 
     let rover_state_log = CsvLogger::spawn(
@@ -179,9 +178,15 @@ fn main() {
         "speed_loop_debug.csv",
         csv_fmt::SPEED_LOOP_DEBUG_HEADER,
     );
+    let board_diagnostics_log = CsvLogger::spawn(
+        run_dir.clone(),
+        "board_diagnostics.csv",
+        csv_fmt::BOARD_DIAGNOSTICS_HEADER,
+    );
 
     let state = Rc::new(RefCell::new(SharedState::default()));
     let stall_detector = Rc::new(RefCell::new(StallDetector::new(telemetry_config.stall)));
+    let board_health = Rc::new(RefCell::new(BoardHealth::new()));
     let mut cmd_receiver = CommandReceiver::new();
 
     {
@@ -246,6 +251,13 @@ fn main() {
             state.borrow_mut().stall_detected = stalled;
         });
     }
+    {
+        let board_health = board_health.clone();
+        bus.subscribe::<BoardDiagnostics>(move |d| {
+            board_diagnostics_log.log(csv_fmt::format_board_diagnostics_row(now_us(), &d));
+            board_health.borrow_mut().observe(&d);
+        });
+    }
 
     log::info!("rover-telemetry ready, binding {bind_addr}");
 
@@ -287,6 +299,7 @@ fn main() {
                 s.chassis_status.as_ref(),
                 s.stall_detected,
                 &s.rover_state,
+                board_health.borrow().bits(),
             );
 
             let telemetry = Telemetry {

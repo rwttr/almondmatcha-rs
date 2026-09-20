@@ -20,8 +20,10 @@ members = [
     "crates/rover-tap",
     "crates/rover-control",
     "crates/rover-navigation",
+    "crates/rover-runs",
     "crates/rover-telemetry",
     "crates/ground-station",
+    "crates/rover-doctor",
     "tools/replay",
 ]
 
@@ -38,6 +40,7 @@ rover-bus       = { path = "crates/rover-bus" }
 rover-model     = { path = "crates/rover-model" }
 rover-estimator = { path = "crates/rover-estimator" }
 rover-control   = { path = "crates/rover-control" }
+rover-runs      = { path = "crates/rover-runs" }
 
 [profile.release]
 opt-level     = 3
