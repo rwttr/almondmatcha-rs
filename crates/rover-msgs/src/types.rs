@@ -616,7 +616,18 @@ pub struct LaneMeasurement {
     /// metres before publication. One conversion, one place.
     pub curvature_inv_m: f32,
     /// Heading error relative to the lane tangent, radians. Positive means the
-    /// correct response is to steer right.
+    /// correct response is to steer right, matching `cross_track_m` and
+    /// `steer`.
+    ///
+    /// This convention is *enforced*, not merely documented: the raw fit
+    /// inside the detector produces the opposite sign (a structural
+    /// consequence of the fit's coordinate frame, not a sensor artifact —
+    /// see `docs/RUST_REWRITE_PLAN.md` §13.3b D5), and
+    /// `perception/rover_perception/lane.py`'s `LaneDetector.detect`
+    /// negates it before publication so this field always agrees with the
+    /// convention stated here. `perception/tests/test_lane_sign_convention.py`
+    /// tests that agreement directly, against the model
+    /// (`RoverState::at_lookahead`, `Ekf::correct_camera`) that consumes it.
     pub heading_err_rad: f32,
     /// Lateral offset from lane centre at the lookahead point, metres.
     /// Positive means the correct response is to steer right.
@@ -1325,7 +1336,7 @@ impl ResetCause {
     }
 
     /// True for a cause that means something went wrong, as opposed to a
-    /// normal or operator-initiated boot. Drives `HealthBits::BOARD_FAULT`.
+    /// normal or operator-initiated boot. Drives [`HealthBits::BOARD_RESET`].
     pub fn is_abnormal(self) -> bool {
         matches!(
             self,
@@ -1425,7 +1436,15 @@ pub struct BoardDiagnostics {
     /// reports `0x0007_C130` (OUI `0x0007C0`, model `0x13`, revision in the
     /// low nibble, which is why the low 4 bits vary between parts).
     pub phy_id: u32,
-    /// Negotiated link speed in Mbit/s. `0` = link down or unknown.
+    /// Negotiated link speed in Mbit/s. `0` means **unknown** — the PHY read
+    /// failed or has not happened yet.
+    ///
+    /// It does *not* mean "link down", and a consumer must not treat it as a
+    /// fault. This message only ever arrives over the link it describes, so
+    /// by the time anyone can read this field the link is demonstrably up;
+    /// `0` can only be the board admitting it could not resolve the speed.
+    /// Conflating the two would report a degraded link on every board whose
+    /// first sample beat its first PHY poll.
     ///
     /// Worth reporting separately from "link up" because the silent failure
     /// on this hardware is a link that negotiates 10 Mbit/s half duplex on a
@@ -1433,9 +1452,20 @@ pub struct BoardDiagnostics {
     /// configured for 100 full.
     pub link_speed_mbps: u8,
     pub link_full_duplex: bool,
-    /// PHY symbol-error count since the last read, saturating. Non-zero means
-    /// the physical layer is marginal — a bad cable, a bad connector, or
-    /// interference — long before it becomes packet loss anyone notices.
+    /// PHY symbol-error count, read raw from the LAN8742A's Symbol Error
+    /// Counter (register `0x1A`). Non-zero means the physical layer is
+    /// marginal — a bad cable, a bad connector, or interference — long
+    /// before it becomes packet loss anyone notices.
+    ///
+    /// **Free-running, not read-to-clear.** The datasheet (Rev 1.1,
+    /// 05-21-13) is explicit: *"This register is cleared on reset, but is not
+    /// cleared by reading the register"*, and it rolls over at 65,536. So
+    /// this is a running total since the board booted, and accumulating it
+    /// across samples would multiply the true count by the sample count.
+    ///
+    /// **Meaningless at 10 Mbit/s**: the same datasheet notes the counter
+    /// *"does not increment in 10BASE-T mode"*. A `0` here is only evidence
+    /// of a clean link when [`Self::link_speed_mbps`] is 100.
     pub phy_symbol_errors: u16,
     /// Seconds since this board booted. Compare against the RPi's own uptime
     /// to spot a board that has restarted without anyone noticing.
@@ -1458,7 +1488,13 @@ impl BoardDiagnostics {
 
 impl Wire for BoardDiagnostics {
     const TYPE_ID: u16 = 0x0903;
-    const WIRE_LEN: usize = 19;
+    // board(1) + post_run(2) + post_pass(2) + reset_cause(1) + phy_id(4) +
+    // link_speed_mbps(1) + link_full_duplex(1) + phy_symbol_errors(2) +
+    // uptime_s(4) + tx_drops(2) = 20. (Was declared 19 here before this pass
+    // wired BoardDiagnostics into `[routes]` and the golden/roundtrip
+    // suites -- nothing previously exercised `encode()`'s actual length
+    // against this constant, so the off-by-one went uncaught.)
+    const WIRE_LEN: usize = 20;
     const NAME: &'static str = "BoardDiagnostics";
 
     fn encode(&self, buf: &mut [u8]) -> usize {

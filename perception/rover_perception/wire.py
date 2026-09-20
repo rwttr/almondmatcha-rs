@@ -666,3 +666,102 @@ class EkfDebug:
         _check_len(buf, cls.WIRE_LEN, cls.NAME)
         x, y, z, nis, gated = _EKF_DEBUG_STRUCT.unpack_from(buf, 0)
         return cls((x, y, z), nis, gated)
+
+
+# ===========================================================================
+# 0x0903 -- board self-diagnostics
+# ===========================================================================
+
+
+class BoardId(IntEnum):
+    """Mirrors `rover_msgs::BoardId`. One message type serves both boards --
+    see that type's doc comment for why."""
+
+    CHASSIS = 0
+    SENSORS = 1
+
+    def label(self) -> str:
+        return {BoardId.CHASSIS: "chassis", BoardId.SENSORS: "sensors"}[self]
+
+
+class ResetCause(IntEnum):
+    """Mirrors `rover_msgs::ResetCause`. Read once at boot from `RCC_CSR` and
+    latched for the run -- see that type's doc comment on why this is the
+    single most diagnostic byte either board produces."""
+
+    UNKNOWN = 0
+    POWER_ON = 1
+    PIN = 2
+    SOFTWARE = 3
+    INDEPENDENT_WATCHDOG = 4
+    WINDOW_WATCHDOG = 5
+    LOW_POWER = 6
+    BROWN_OUT = 7
+
+    def is_abnormal(self) -> bool:
+        return self in (
+            ResetCause.INDEPENDENT_WATCHDOG,
+            ResetCause.WINDOW_WATCHDOG,
+            ResetCause.BROWN_OUT,
+        )
+
+
+# board(u8) post_run(u16) post_pass(u16) reset_cause(u8) phy_id(u32)
+# link_speed_mbps(u8) link_full_duplex(bool,1 byte) phy_symbol_errors(u16)
+# uptime_s(u32) tx_drops(u16)
+_BOARD_DIAGNOSTICS_STRUCT = struct.Struct("<BHHBIB?HIH")
+
+
+@dataclass(frozen=True)
+class BoardDiagnostics:
+    """Mirrors `rover_msgs::BoardDiagnostics`. `post_run`/`post_pass` are
+    carried as plain `u16` bitmasks (see `PostBits`) -- their bit meanings
+    are board-specific above bit 3, so decoding them into names belongs to
+    whichever consumer already knows `board`, not to this dumb wire mirror."""
+
+    TYPE_ID: ClassVar[int] = 0x0903
+    WIRE_LEN: ClassVar[int] = 20
+    NAME: ClassVar[str] = "BoardDiagnostics"
+
+    board: BoardId
+    post_run: int
+    post_pass: int
+    reset_cause: ResetCause
+    phy_id: int
+    link_speed_mbps: int
+    link_full_duplex: bool
+    phy_symbol_errors: int
+    uptime_s: int
+    tx_drops: int
+
+    def post_failures(self) -> int:
+        return self.post_run & ~self.post_pass
+
+    def post_ok(self) -> bool:
+        return self.post_failures() == 0
+
+    def encode(self) -> bytes:
+        return _BOARD_DIAGNOSTICS_STRUCT.pack(
+            int(self.board), self.post_run, self.post_pass, int(self.reset_cause),
+            self.phy_id, self.link_speed_mbps, self.link_full_duplex,
+            self.phy_symbol_errors, self.uptime_s, self.tx_drops,
+        )
+
+    @classmethod
+    def decode(cls, buf: bytes) -> "BoardDiagnostics":
+        _check_len(buf, cls.WIRE_LEN, cls.NAME)
+        (board_raw, post_run, post_pass, reset_raw, phy_id, link_speed_mbps,
+         link_full_duplex, phy_symbol_errors, uptime_s, tx_drops) = \
+            _BOARD_DIAGNOSTICS_STRUCT.unpack_from(buf, 0)
+        try:
+            board = BoardId(board_raw)
+        except ValueError:
+            raise DecodeError(f"BoardDiagnostics: invalid discriminant {board_raw} for field `BoardId`")
+        try:
+            reset_cause = ResetCause(reset_raw)
+        except ValueError:
+            raise DecodeError(f"BoardDiagnostics: invalid discriminant {reset_raw} for field `ResetCause`")
+        return cls(
+            board, post_run, post_pass, reset_cause, phy_id, link_speed_mbps,
+            link_full_duplex, phy_symbol_errors, uptime_s, tx_drops,
+        )

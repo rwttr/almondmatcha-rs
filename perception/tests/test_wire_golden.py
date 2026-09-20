@@ -20,6 +20,8 @@ import pathlib
 import pytest
 
 from rover_perception.wire import (
+    BoardDiagnostics,
+    BoardId,
     ChassisCommand,
     ChassisStatus,
     Command,
@@ -37,6 +39,7 @@ from rover_perception.wire import (
     MissionStatus,
     MotionSetpoint,
     PowerSample,
+    ResetCause,
     RoverState,
     SpeedLoopDebug,
     Telemetry,
@@ -232,6 +235,21 @@ INSTANCES = [
     (
         EkfDebug(innovation=(0.012, -0.004, 0.0009), nis=2.87, gated=False),
         "EkfDebug",
+    ),
+    (
+        BoardDiagnostics(
+            board=BoardId.SENSORS,
+            post_run=0b0111_1111,
+            post_pass=0b0110_1011,
+            reset_cause=ResetCause.INDEPENDENT_WATCHDOG,
+            phy_id=0x0007_C130,
+            link_speed_mbps=100,
+            link_full_duplex=True,
+            phy_symbol_errors=17,
+            uptime_s=8_675_309,
+            tx_drops=42,
+        ),
+        "BoardDiagnostics",
     ),
 ]
 

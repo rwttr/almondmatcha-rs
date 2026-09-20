@@ -200,6 +200,18 @@ macro_rules! all_types {
             nis: 2.87,
             gated: false,
         });
+        $mac!(BoardDiagnostics {
+            board: BoardId::Sensors,
+            post_run: PostBits(0b0111_1111),
+            post_pass: PostBits(0b0110_1011),
+            reset_cause: ResetCause::IndependentWatchdog,
+            phy_id: 0x0007_C130,
+            link_speed_mbps: 100,
+            link_full_duplex: true,
+            phy_symbol_errors: 17,
+            uptime_s: 8_675_309,
+            tx_drops: 42,
+        });
     };
 }
 

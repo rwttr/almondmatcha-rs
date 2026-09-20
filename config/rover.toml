@@ -93,6 +93,13 @@ Telemetry       = ["base", "sensors"]
 # (its own last_cmd_seq bookkeeping — see its main.rs doc comment).
 CommandFrame    = ["control", "navigation", "telemetry"]
 SpeedLoopDebug  = ["telemetry"]
+# Both destinations read this directly: rover-telemetry logs it to
+# board_diagnostics.csv and folds it into Telemetry::health (BOARD_POST_FAIL /
+# BOARD_RESET / LINK_DEGRADED), and the base station's preflight tool
+# (rover-doctor) reads it straight off the wire to judge POST/reset/link
+# checks before anyone drives -- it does not wait for rover-telemetry to
+# relay a verdict.
+BoardDiagnostics = ["telemetry", "base"]
 
 # ---------------------------------------------------------------------------
 # Drivetrain
