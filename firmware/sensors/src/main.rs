@@ -13,6 +13,7 @@
 //! | [`diag::publish_task`] | 1 Hz | publishes [`rover_msgs::BoardDiagnostics`]: POST results, reset cause, PHY health |
 //! | [`watchdog::run`] | event + 200 ms pet tick | mirror link watchdog + the one IWDG pet site |
 //! | `net_task` | — | drives the Ethernet interface (spawned inside [`net::init`]) |
+//! | [`encoders::calibration_task`] (`--features calibration` only) | 1 Hz | logs tick counts + deltas over defmt/RTT for bench calibration |
 //!
 //! # Deleted: the GNSS reader
 //!
@@ -109,6 +110,12 @@ async fn main(spawner: Spawner) {
     // for exactly what this does and does not prove.
     post.record(PostBits::SENSOR_B, encoders::post_idle_check().await);
     spawner.spawn(defmt::unwrap!(encoders::publish_task(stack)));
+    // Bench-only 1 Hz tick readout over defmt/RTT — see
+    // `encoders::calibration_task`'s doc comment for why this is a feature
+    // and not always on. With the feature off, this line and the task it
+    // spawns compile to nothing, so the field image is unchanged.
+    #[cfg(feature = "calibration")]
+    spawner.spawn(defmt::unwrap!(encoders::calibration_task()));
 
     // --- Power monitor -------------------------------------------------------
     let (power_dev, power_id_ok) = power::init(p.I2C1, p.PB8, p.PB9);

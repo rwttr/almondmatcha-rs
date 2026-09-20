@@ -278,6 +278,80 @@ pub async fn publish_task(stack: embassy_net::Stack<'static>) -> ! {
 // Compile-time proof the shared tx_socket! buffer can hold this message.
 const _: () = assert!(WheelSensors::WIRE_LEN + rover_msgs::FRAME_HEADER_LEN <= 128);
 
+/// Bench-only 1 Hz tick readout over defmt/RTT — plan §2.6 Procedure A ("jack
+/// up a wheel, turn it by hand ten times, read the tick delta") needs nothing
+/// but a USB ST-Link cable to do this; unlike [`publish_task`] above it does
+/// not need the LAN, the RPi, or `rover-tap` to get a number in front of
+/// whoever is turning the wheel.
+///
+/// # Why this is a feature and not always on
+///
+/// Not to avoid a hang. Checked against the vendored source of `defmt-rtt`
+/// at the exact version this crate pins (`=1.3.0`,
+/// `defmt-rtt-1.3.0/src/{lib,channel}.rs`): its RTT up-channel is initialised
+/// with `flags = MODE_NON_BLOCKING_TRIM` and *only* a debug host (`probe-rs`)
+/// attaching ever rewrites that field to blocking — `Channel::write_all`
+/// picks `blocking_write` vs. `nonblocking_write` by reading that same flag
+/// back (`host_is_connected`). On the field image, which never has a debug
+/// host attached, the flag never moves off trim mode, so a full buffer is
+/// simply overwritten by `nonblocking_write` (it truncates/wraps, it never
+/// spins waiting for a reader). So the field image was never at risk here —
+/// this feature is gated off by default so that image stays byte-identical
+/// to today's and its log stays free of a 1 Hz line nobody in the field is
+/// there to read, not because this readout is hazardous.
+///
+/// (For completeness: `defmt-rtt`'s own doc comment does admit a genuine
+/// block-forever spin, but only for the case where a host *did* attach at
+/// some point — latching the channel to blocking — and then disconnects
+/// mid-run while the buffer keeps filling with nothing draining it. That
+/// requires a debug session to exist in the first place, so it's a bench
+/// consideration for whoever is running this feature with a probe attached,
+/// never a field one.)
+///
+/// # Decoding is identical with or without this feature
+///
+/// This task only *reads* [`TICKS_LEFT`]/[`TICKS_RIGHT`] with
+/// `Ordering::Relaxed` — the same two atomics [`publish_task`] reads and
+/// [`left_task`]/[`right_task`] write. Nothing about the 4x quadrature decode
+/// documented at the top of this module changes when `calibration` is
+/// enabled. A `metres_per_tick` measured against a `--features calibration`
+/// image is therefore valid for the field image unchanged: reflashing
+/// without the feature does not change what a tick means.
+#[cfg(feature = "calibration")]
+#[embassy_executor::task]
+pub async fn calibration_task() -> ! {
+    defmt::info!(
+        "encoders: calibration readout active (1 Hz) -- this is a --features calibration build"
+    );
+
+    // `Ticker`, not `Timer::after`, for the same reason `publish_task` above
+    // uses one: `Timer::after` measures from the moment it is awaited, so
+    // the work done each iteration (a defmt log call) would accumulate into
+    // the period instead of the readout staying locked to wall-clock seconds
+    // — and a calibration operator reading "ticks per second" off this log
+    // needs that second to actually be a second.
+    let mut ticker = Ticker::every(Duration::from_hz(1));
+    let mut prev_l = TICKS_LEFT.load(Ordering::Relaxed);
+    let mut prev_r = TICKS_RIGHT.load(Ordering::Relaxed);
+
+    loop {
+        ticker.next().await;
+        let l = TICKS_LEFT.load(Ordering::Relaxed);
+        let r = TICKS_RIGHT.load(Ordering::Relaxed);
+        let dl = l - prev_l;
+        let dr = r - prev_r;
+        prev_l = l;
+        prev_r = r;
+        defmt::info!(
+            "encoders: L={=i32} R={=i32} dL={=i32} dR={=i32}",
+            l,
+            r,
+            dl,
+            dr
+        );
+    }
+}
+
 /// Duration of the `PostBits::SENSOR_B` idle-check window below - long
 /// enough that a genuinely stuck-toggling GPIO line (a floating input, a
 /// short, a miswired pull) would certainly clock at least one count during

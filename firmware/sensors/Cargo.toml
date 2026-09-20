@@ -87,6 +87,24 @@ embedded-hal      = { version = "=1.0.0" }
 # tree at this exact version before pinning.
 ina226 = { version = "=0.3.0" }
 
+[features]
+default = []
+# 1 Hz defmt/RTT tick-count readout for bench drivetrain calibration (plan
+# §2.6 Procedure A). Default OFF, but not because leaving it on would be
+# unsafe: checked against the vendored source of `defmt-rtt` (pinned
+# `=1.3.0` above, see `defmt-rtt-1.3.0/src/{lib,channel}.rs`), its RTT
+# channel boots in non-blocking/trim mode and stays there unless a debug
+# host (`probe-rs`) actually attaches and latches it to blocking — so on the
+# field image, which never has a debug host attached, a full buffer is just
+# overwritten, never spun on. This feature is off by default to keep that
+# field image byte-identical to today's and its log free of a 1 Hz line
+# nobody in the field reads, not to dodge a hang. See
+# `encoders::calibration_task`'s doc comment for the full finding, including
+# the one case defmt-rtt's own docs *do* warn about (a host attaches, then
+# disconnects mid-run) — a bench-only concern, since it requires a debug
+# session to begin with.
+calibration = []
+
 [profile.release]
 opt-level     = 3
 lto           = "thin"

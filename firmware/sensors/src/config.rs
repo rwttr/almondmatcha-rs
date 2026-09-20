@@ -60,8 +60,22 @@ pub const BASE_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 10), 70
 ///
 /// If wheel ticks are ever wanted on the RPi — recording a calibration run
 /// for plan §2.6 is the obvious reason — add `"telemetry"` to `[routes]`
-/// *and* a subscriber, together. Until then a `[debug] mirror` plus
-/// `rover-tap` sees them without changing firmware.
+/// *and* a subscriber, together. Two things already work today without
+/// either of those changes, and `[debug] mirror` is **not** one of them —
+/// that's implemented only in `crates/rover-bus/src/lib.rs`'s
+/// `Bus::publish`, on the host side; this firmware has its own `net.rs` with
+/// hard-coded destinations and no mirror concept at all, so a `WheelSensors`
+/// datagram this board sends never reaches a mirror. What actually works:
+/// (1) build this firmware with `--features calibration` and read
+/// `TICKS_LEFT`/`TICKS_RIGHT` straight off ST-Link/RTT (see
+/// `encoders::calibration_task`) — the bench path, no LAN or RPi involved at
+/// all; or (2) temporarily give some other machine the `control` address
+/// (`192.168.1.1:7001`, with `rover-control`/the RPi not running) and run
+/// `rover-tap --as control --type WheelSensors` — `rover-tap` binds
+/// `0.0.0.0:<port>` and filters on each datagram's source address, so it
+/// doesn't need to *be* the real RPi, but this board still unicasts to
+/// `192.168.1.1`, so whatever machine stands in for `control` must actually
+/// hold that IP.
 pub const WHEEL_SENSORS_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
 pub const POWER_SAMPLE_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
 
