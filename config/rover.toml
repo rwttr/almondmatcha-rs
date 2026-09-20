@@ -154,6 +154,31 @@ steer_slew_deg_per_s = 180.0  # guard rail, applies to every law
 k_lat  = 181.17               # deg per metre of lateral offset
 k_head = 2.024                # deg per degree of heading error
 
+# --- D5 note: these gains have never been run with a correctly-signed
+# heading term (docs/RUST_REWRITE_PLAN.md §13.3b D5). Do NOT change the
+# values above for this -- they are field-derived and must be ported
+# bit-exactly (§10); tools/replay's gate proves the control law bit-exact
+# against a frozen oracle, and retuning here would break that and
+# substitute an invented number for a measured one. This comment only
+# records why the closed-loop response changed and what to do about it.
+#
+# For a straight path angled psi degrees, with b at the 1.22 m lookahead
+# ~= l_a * psi:
+#   k_lat contributes  181.17 deg/m * 1.22 m * pi/180 = 3.858 deg per deg of psi
+#   k_head contributes                                   2.024 deg per deg of psi
+#
+#                                            | straight-line response
+#   Before the D5 fix (heading term subtracting) | 3.858 - 2.024 = 1.834
+#   After the D5 fix (heading term reinforcing)  | 3.858 + 2.024 = 5.882
+#
+# That is a 3.21x increase in straight-line steering authority. Start the
+# first bench run slow. If it oscillates, scaling BOTH k_lat and k_head down
+# together by 0.312 reproduces the net straight-line authority the ROS 2
+# rover actually exhibited -- so [0.312x, 1.0x] is the bracket to search,
+# not a recommendation to jump to either end. Note 0.312x also cuts the
+# pure-lateral (b-only) response to 31%, which was never wrong, so it is a
+# floor to search down to, not a target to aim for.
+
 [control.lqr]
 # Phase 2. Solved from the shared model in rover-model at startup, per speed
 # bin, because A depends on v. Weights only; gains are derived, never pasted.

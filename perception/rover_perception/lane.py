@@ -46,18 +46,24 @@ changing it here.
   the architecture change, not a relaxation of the detector's tolerance for
   bad input.
 
-# The one deliberate behaviour change: curvature to 1/m at the source
+# The two deliberate behaviour changes
+
+`compute_lane_params` and `process_frame` are unchanged, behaviour-preserving
+ports — see "FIDELITY" above. `LaneDetector.detect` (below), the boundary of
+this module, is where the port diverges from the original on purpose, in two
+independent ways:
+
+## 1. Curvature to 1/m at the source
 
 `compute_lane_params` still returns `curvature` as the raw polyfit
 coefficient `A` in BEV pixels (1/px) — unchanged, because that keeps
 `test_lane_parity.py` comparing like with like against the original.
-`LaneDetector.detect` (below), the boundary of this module, is where the
-port diverges on purpose: it converts to a physical 1/m curvature before
-building the outgoing `LaneMeasurement`, instead of shipping pixels and
-leaving every consumer to fold in `BEV_PX_PER_M` itself (which is what the
-ROS 2 system did — see `docs/RUST_REWRITE_PLAN.md` §3.3 and
-`docs/CONTROL_LAW.md` §1.7, which flags this as an asymmetry against `b`,
-which *was* converted before publication).
+`LaneDetector.detect` converts to a physical 1/m curvature before building
+the outgoing `LaneMeasurement`, instead of shipping pixels and leaving every
+consumer to fold in `BEV_PX_PER_M` itself (which is what the ROS 2 system
+did — see `docs/RUST_REWRITE_PLAN.md` §3.3 and `docs/CONTROL_LAW.md` §1.7,
+which flags this as an asymmetry against `b`, which *was* converted before
+publication).
 
 Derivation, matching `docs/CONTROL_LAW.md`'s `R = 1/(2*A*S)`:
 
@@ -85,6 +91,34 @@ Derivation, matching `docs/CONTROL_LAW.md`'s `R = 1/(2*A*S)`:
     curvature_ema`) -- moving it here doesn't change the arithmetic, only
     where it happens: once, at the source, instead of independently in
     every consumer.
+
+## 2. `heading_err_rad` sign correction (`docs/RUST_REWRITE_PLAN.md` §13.3b D5)
+
+`compute_lane_params` fits `x = A*y'^2 + B*y' + C` with `y' = y - height`, so
+`y'` is zero at the canvas bottom (the fit's own lookahead point) and
+*negative* going forward — the BEV canvas's top row is ahead of the rover
+(see D5's measurement), so increasing forward distance is decreasing `y'`.
+Forward distance is therefore `s = -y'`, which makes
+
+    d(cross_track)/d(distance) = d(x)/d(-y') = -B
+
+while `theta = arctan(B)` is computed straight off the same `B`. So the raw
+`theta` this pipeline fits is the *negative* of the cross-track slope it is
+supposed to describe — a structural property of the fit's coordinate frame,
+confirmed twice by measurement on the real detector (D5), not a calibration
+error in any one frame.
+
+Every consumer of `heading_err_rad` (`RoverState::at_lookahead`,
+`Ekf::correct_camera`) assumes the opposite: `d(cross)/d(l) = +heading_err`,
+matching the documented convention that `heading_err_rad`, `cross_track_m`
+and `steer` are all positive when the correct response is "steer right".
+`cross_track_m` already satisfies that convention (it is `C`, unaffected by
+the `y'` flip); the raw `theta` does not. `LaneDetector.detect` is therefore
+where this port negates `theta` before it becomes `heading_err_rad`, so the
+value leaving this module matches the sign every downstream consumer
+already assumes, instead of fixing the consumers (which are correct as
+written) or the shared fit (which `process_frame` must keep bit-identical
+to the oracle for parity -- see `tests/test_lane_parity.py`).
 """
 
 from __future__ import annotations
@@ -593,12 +627,30 @@ class LaneDetector:
         if not detected:
             return LaneResult(curvature_inv_m=0.0, heading_err_rad=0.0, cross_track_m=0.0, valid=False)
 
-        # ---- The one deliberate behaviour change: convert at the source ----
-        # See module docstring for the derivation. b is already metres from
-        # compute_lane_params; theta is degrees and needs only unit
-        # conversion, not a scale conversion.
+        # ---- The two deliberate behaviour changes: convert at the source ----
+        # See module docstring for both derivations. b is already metres from
+        # compute_lane_params; curvature needs a scale conversion (1/px to
+        # 1/m), theta only a unit conversion (degrees to radians) -- and,
+        # as of D5, a sign correction.
         curvature_inv_m = 2.0 * curvature_px * cfg.BEV_PX_PER_M
-        heading_err_rad = math.radians(theta_deg)
+
+        # Sign convention: heading_err_rad positive means "the lane heads
+        # right, steer right" -- the same convention cross_track_m and
+        # `steer` already use (see rover-msgs's crate docs and
+        # docs/RUST_REWRITE_PLAN.md §13.3b D5). The raw `theta` fitted by
+        # compute_lane_params has the *opposite* sign: its fit frame uses
+        # y' = y - height, which is zero at the canvas bottom and negative
+        # going forward (BEV canvas top is ahead of the rover), so
+        # d(cross_track)/d(distance) = -B while theta = arctan(B) -- a
+        # structural consequence of that coordinate flip, confirmed twice by
+        # measurement on the real detector (D5), not a one-off calibration
+        # error. Negate here, at the module boundary, so what leaves this
+        # detector matches the convention every consumer (RoverState::
+        # at_lookahead, Ekf::correct_camera) assumes. `process_frame`
+        # deliberately keeps the original's (wrong) convention unchanged --
+        # see module docstring section 2 -- so the frozen parity oracle in
+        # tests/test_lane_parity.py still applies at that boundary.
+        heading_err_rad = -math.radians(theta_deg)
 
         return LaneResult(
             curvature_inv_m=curvature_inv_m,

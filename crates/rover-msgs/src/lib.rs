@@ -29,6 +29,21 @@
 //!
 //! Invert this and the controller becomes positive feedback. See
 //! `docs/RUST_REWRITE_PLAN.md` §10.
+//!
+//! **`heading_err_rad` was not always true to this, and the wording above is
+//! why it took so long to notice.** The lane detector's raw fit produces the
+//! *negative* of `d(cross_track)/d(distance)` for structural reasons — it fits
+//! in a frame where increasing `y` runs backwards — so for most of this
+//! branch's life the published `heading_err_rad` contradicted the convention
+//! stated here, while `cross_track_m` and `steer` obeyed it. Because "the sign
+//! convention is inverted on purpose" reads as covering all three, the
+//! disagreement was repeatedly mistaken for the deliberate inversion.
+//!
+//! It is now correct: `LaneDetector.detect` negates the raw fit before
+//! publishing, and `perception/tests/test_lane_sign_convention.py` checks the
+//! detector's output against the geometry the consuming model assumes —
+//! rather than against the detector's own assumption, which is what every
+//! earlier test did. See `docs/RUST_REWRITE_PLAN.md` §13.3b **D5**.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

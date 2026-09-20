@@ -267,21 +267,37 @@ def test_process_frame_matches_oracle_with_search_center_tracking() -> None:
 
 
 def test_lane_detector_detect_diverges_exactly_as_documented() -> None:
-    """Pin the ONE intentional behaviour change `LaneDetector.detect` makes
-    relative to `process_frame` (see `lane.py`'s module docstring, "The one
-    deliberate behaviour change"), so that change itself cannot silently
-    drift even though it is deliberately excluded from the parity comparison
-    above.
+    """Pin the two intentional behaviour changes `LaneDetector.detect` makes
+    relative to `process_frame` (see `lane.py`'s module docstring, "The two
+    deliberate behaviour changes"), so neither can silently drift even
+    though both are deliberately excluded from the parity comparison above.
+
+    Uses `offset_line_frame`, not `straight_centered_frame`: a centred line
+    fits `theta == 0.0`, which makes `heading_err_rad == math.radians(theta)`
+    pass regardless of whether the sign is right -- exactly the gap that let
+    the D5 sign defect (`docs/RUST_REWRITE_PLAN.md` §13.3b D5) go unnoticed
+    by this test. `offset_line_frame`'s line is not just off-centre but
+    angled relative to the fit frame (see its definition), so `theta_deg` is
+    comfortably non-zero and the negation below is a real assertion.
     """
-    frame = straight_centered_frame(seed=8)
+    frame = offset_line_frame(seed=8)
     curvature_px, theta_deg, b_m, detected = port_process_frame(frame)
     assert detected, "test needs a frame process_frame actually detects on"
+    assert abs(theta_deg) > 1.0, (
+        "theta_deg is too close to zero for this test to pin the sign of "
+        "heading_err_rad -- math.radians(theta) == -math.radians(theta) at "
+        "theta == 0, which is exactly the vacuous case this test must avoid "
+        "(see docstring)"
+    )
 
     result = LaneDetector().detect(frame)
 
     assert result.valid
     assert result.curvature_inv_m == 2.0 * curvature_px * LaneConfig.BEV_PX_PER_M
-    assert result.heading_err_rad == math.radians(theta_deg)
+    # D5: heading_err_rad is the NEGATION of the raw fit's theta -- see
+    # lane.py's module docstring and the comment at this conversion in
+    # LaneDetector.detect.
+    assert result.heading_err_rad == -math.radians(theta_deg)
     # b is carried straight through unconverted (already metres) -- not part
     # of the documented divergence, but worth pinning here too since this
     # test already has both values in hand.
