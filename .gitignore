@@ -36,7 +36,13 @@ tools/videocapture/
 
 # ---- Rust rewrite (branch `rs`) ----
 target/
-Cargo.lock
+# Cargo.lock is committed deliberately, in all three places it exists (root
+# workspace + firmware/chassis + firmware/sensors, which are separate
+# workspaces): this is an application/firmware project, not a published
+# library, and reproducible builds matter more than floating to the latest
+# compatible dependency. See firmware/chassis/Cargo.toml's own note on the
+# yanked `bisync` crate for exactly the failure mode a committed lockfile
+# prevents on a fresh clone.
 .venv/
 *.egg-info/
 .pytest_cache/
