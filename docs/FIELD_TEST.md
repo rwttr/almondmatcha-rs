@@ -14,6 +14,65 @@ the procedure.
 
 ---
 
+## Build everything first
+
+There are **four separate build products**, and `cargo build` at the repo root
+produces only the first of them. Nothing in §0 works until all four exist on
+the machine that needs them.
+
+| # | Product | Built where | Command | Artifacts |
+|---|---|---|---|---|
+| 1 | Host binaries | RPi and base station | `cargo build --release` | `target/release/<name>` |
+| 2 | Chassis firmware | any machine with the ARM target | `cd firmware/chassis && cargo build --release` | `firmware/chassis/target/thumbv7em-none-eabihf/release/chassis-fw` |
+| 3 | Sensors firmware | any machine with the ARM target | `cd firmware/sensors && cargo build --release` | `firmware/sensors/target/thumbv7em-none-eabihf/release/sensors-fw` |
+| 4 | Perception package | Jetson | `cd perception && python3 -m venv .venv && .venv/bin/pip install -e .` | `perception/.venv/bin/rover-perception` |
+
+⚠️ **The two firmware crates are deliberately not workspace members.** Each has
+an empty `[workspace]` table in its own `Cargo.toml`, because a Cargo workspace
+cannot hold two different default targets and these build for
+`thumbv7em-none-eabihf` while everything else builds for the host. **`cargo
+build --release` at the repo root does not build them, and never will** — you
+must `cd` into each crate. This catches people every time.
+
+`rust-toolchain.toml` already pins the toolchain and lists
+`thumbv7em-none-eabihf` under `targets`, so rustup installs the cross target
+on its own the first time you build inside the repo.
+
+### Which binaries each machine actually needs
+
+| Machine | Binaries |
+|---|---|
+| RPi `192.168.1.1` | `rover-control`, `rover-navigation`, `rover-telemetry` |
+| Base `192.168.1.10` | `ground-station`, `rover-doctor`, `rover-tap` |
+| Jetson `192.168.1.5` | the `rover-perception` console script (product 4) |
+
+`cargo build --release` builds all twelve crates; if you would rather not,
+`cargo build --release -p rover-control -p rover-navigation -p rover-telemetry`
+is what the RPi launch script tells you to run when it finds a binary missing.
+
+### Getting the code onto the machines
+
+**There is no established deployment story in this repo, and this document is
+not going to invent one.** What is true today:
+
+- The three rover machines are on a closed `192.168.1.0/24` with **no internet**
+  (`docs/HARDWARE.md` §1), so `cargo build` on those machines only works if the
+  Cargo registry cache is already warm or a crates mirror is reachable. All
+  three `Cargo.lock` files are committed, so the dependency set is at least
+  pinned and reproducible.
+- **Binaries cannot simply be copied from a development Mac.** The RPi and the
+  Jetson are `aarch64-unknown-linux-gnu`; an Apple-silicon laptop builds
+  `aarch64-apple-darwin`. Same word size, different platform — the binary will
+  not run. Cross-compiling to the Pi is possible but is not set up here.
+- The realistic path today is **a git clone on each machine, built there**,
+  with the network brought up long enough to fetch crates, or a pre-warmed
+  `~/.cargo` copied across.
+
+If you establish a better answer during a real bring-up, record it here — this
+section is a description of an unsolved problem, not a procedure.
+
+---
+
 ## 0. Before you leave the bench
 
 These are not warm-up steps. Each one is a blocker: if it is not cleared, the
@@ -92,10 +151,52 @@ the full hardware-verification debt list in risk order; the Ethernet PHY is
 the hard gate, and §13.4a explains what the firmware can and cannot tell you
 about it.
 
+`docs/CALIBRATION.md` §§1–3 is the full procedure — probe-rs install, the udev
+rule, identifying the two boards by ST-Link serial, and the exact flash
+commands. Do not duplicate it from memory; this section covers only what is
+specific to a **field departure** rather than a bench calibration session.
+
+**Both ST-Links are on USB at once, so always pass `--probe`.** Without it
+`probe-rs` picks whichever board it enumerates first, and that ordering is not
+stable across replugs — you will eventually flash sensors firmware onto the
+chassis board and spend an hour on it.
+
+| Board | IP | ST-Link serial |
+|---|---|---|
+| Sensors | `192.168.1.6` | `066DFF3932504E3043014542` |
+| Chassis | `192.168.1.2` | ⚠️ never recorded — capture with `probe-rs list`, see `docs/CALIBRATION.md` §1 |
+
 ```sh
-cd firmware/chassis && cargo run --release    # probe-rs, via the on-board ST-LINK
-cd firmware/sensors && cargo run --release
+cd firmware/sensors && cargo build --release
+probe-rs run --chip STM32F767ZITx --probe 0483:374b:066DFF3932504E3043014542 \
+    target/thumbv7em-none-eabihf/release/sensors-fw
+
+cd ../chassis && cargo build --release
+probe-rs run --chip STM32F767ZITx --probe 0483:374b:<chassis-serial> \
+    target/thumbv7em-none-eabihf/release/chassis-fw
 ```
+
+⚠️ **Flash the sensors board WITHOUT `--features calibration`.** That feature
+adds a 1 Hz `defmt` tick readout which exists for `docs/CALIBRATION.md`'s
+Procedure A and is pure noise in a field run. If you have just come from a
+calibration session the board is still carrying the calibration image —
+reflash it with the plain `cargo build --release` above. `docs/CALIBRATION.md`
+§3.2 covers this.
+
+**Watch each board's `defmt` output before you unplug the cable.** The boot
+sequence tells you three things worth reading:
+
+- **The POST result** — a board that fails its power-on self-test still boots
+  and still publishes, degraded and saying so.
+- **The reset cause** — an unexpected watchdog or brown-out reset here is a
+  finding, not noise.
+- ⚠️ **The PHY strap warning.** Both boards log `ANAR` and the decoded
+  `MODE[2:0]` strap once, and warn if 100BASE-TX full duplex is not being
+  advertised. **If that warning fires, stop and read
+  `docs/RUST_REWRITE_PLAN.md` §13.4a** — the link will come up and `poll_link`
+  will return true regardless, so this is the only moment you get told. It is
+  a decision point about whether to write `ANAR` before auto-negotiation, not
+  a nuisance message to scroll past.
 
 Both boards should reach "link up" and start publishing. A board that fails
 its power-on self-test still boots and still publishes — degraded, and saying
@@ -148,34 +249,107 @@ board diagnostics exist to catch, and `rover-doctor` checks for it explicitly.
 Rover first, base last. Each command below assumes you are in the repository
 root on that machine; all of them default to `config/rover.toml`.
 
-### On the RPi (192.168.1.1) — three processes, three terminals
+### On the RPi (192.168.1.1) — one tmux script
 
 ```sh
-cargo run --release -p rover-control                      # estimate → guide → actuate
-cargo run --release -p rover-navigation                   # GNSS ×2, mission state machine
-cargo run --release -p rover-telemetry                    # CSV logging + 5 Hz Telemetry feed
+./tools/launch_rover_tmux.sh
 ```
+
+That is the normal path. It replaces `ws_rpi/launch_rover_tmux.sh` from the
+ROS 2 tree and behaves the same way: one tmux session named `rover`, a titled
+pane per process, and one run directory for the whole launch.
+
+| Pane | Process |
+|---|---|
+| 0 | `rover-control` — estimate → guide → actuate |
+| 1 | `rover-navigation` — GNSS ×2, mission state machine |
+| 2 | `rover-telemetry` — CSV logging + 5 Hz `Telemetry` feed |
+| 3 | spare shell — for `rover-tap`, `ls runs/` |
 
 The RPi runs three processes that each bind their own UDP port. That is design
 defect D1, and it is why `[services]` maps a *process* to a `host:port` rather
-than a machine to a port.
+than a machine to a port. Do not collapse them back into one.
 
-`rover-navigation` takes `--ublox-port` and `--spresense-port` if udev has
-enumerated the receivers somewhere other than the defaults. Check before you
-assume: `/dev/ttyACM0` is an enumeration order, not a stable identity.
+What the script does that matters:
 
-`rover-telemetry` takes `--runs-dir` (default `runs`). See §5.
+- **One shared run directory.** It allocates `runs/run_NNN_<stamp>/` once and
+  exports it as `ROVER_RUN_DIR`, which `rover-runs`' `RunDir::resolve` already
+  prefers over allocating its own. Without this the three processes each pick
+  their own directory and a single launch scatters across three. It exports
+  the variable *into each pane explicitly* rather than relying on inheritance,
+  because tmux only passes the caller's environment through when it also has
+  to start a new server — with a server already running, the panes would see
+  it unset.
+- **Every pane is teed to `$ROVER_RUN_DIR/<name>.log`**, so a process that
+  dies at startup leaves its reason on disk instead of only in a scrollback
+  you are about to kill.
+- ⚠️ **It sets `RUST_LOG=info`.** These binaries use `env_logger`, which is
+  **error-only when `RUST_LOG` is unset** — run them bare and the panes print
+  nothing and look hung. Override with `RUST_LOG=debug ./tools/launch_rover_tmux.sh`.
+- **It refuses to start if the release binaries are missing**, naming the
+  build command, rather than beginning a multi-minute compile in a field.
 
-### On the Jetson (192.168.1.5)
-
-```sh
-python -m rover_perception.main
+```text
+Ctrl+b d                     detach, leaving everything running
+tmux attach -t rover         reattach
+tmux kill-session -t rover   stop the run
+SKIP_ATTACH=1 ./tools/...    build the session without attaching
 ```
 
-Add `--preview` only on the bench — it opens a window and costs frame rate.
-`--video PATH` replays a file instead of the D415, which is how you test the
-pipeline without a camera. `--csv PATH` logs every processed frame and is
-**off by default**; turn it on for a run you intend to analyse frame by frame.
+Serial port overrides go through the environment:
+`ROVER_UBLOX_PORT`, `ROVER_UBLOX_BAUD`, `ROVER_SPRESENSE_PORT`,
+`ROVER_SPRESENSE_BAUD`. Check before you assume — `/dev/ttyACM0` is an
+enumeration order, not a stable identity.
+
+**Running a process by hand** (for debugging one of them in isolation):
+
+```sh
+./target/release/rover-control config/rover.toml          # ⚠️ positional
+./target/release/rover-navigation --config config/rover.toml
+./target/release/rover-telemetry  --config config/rover.toml --runs-dir runs
+```
+
+⚠️ **`rover-control` takes its config as a positional argument**, not
+`--config`, unlike the other two. It reads `std::env::args().nth(1)`. Passing
+it `--config config/rover.toml` makes it try to load a file literally named
+`--config` and exit. This inconsistency is real; the launch script handles it,
+a hand-typed command will not.
+
+Set `RUST_LOG=info` yourself if you run one by hand, for the reason above.
+
+### On the Jetson (192.168.1.5) — one tmux script
+
+```sh
+./tools/launch_jetson_tmux.sh
+```
+
+Session `jetson`: perception in pane 0, a spare shell in pane 1. Same run
+directory convention, same tee'd logs, same `SKIP_ATTACH=1`. It allocates its
+own `run_NNN_<stamp>/` on the Jetson's own filesystem — the two machines have
+separate disks, and §5 is where the halves get reassembled.
+
+Field defaults are CSV logging **on** (a run you cannot analyse afterwards was
+a wasted drive), no preview window, and the throttled heartbeat rather than
+per-frame logging. Overrides, all environment variables:
+
+| Variable | Effect |
+|---|---|
+| `PERCEPTION_PREVIEW=1` | Debug preview window. Bench only — it costs frame rate and fails on a headless box. |
+| `PERCEPTION_VIDEO=PATH` | Replay a video file instead of the D415. How you test without a camera. |
+| `PERCEPTION_SERIAL=...` | Pick a specific D415 by serial. |
+| `PERCEPTION_WIDTH` / `_HEIGHT` / `_FPS` | Capture overrides. |
+| `PERCEPTION_CSV=PATH` | Move the frame log; defaults to `$ROVER_RUN_DIR/lane_detection.csv`. |
+| `PERCEPTION_VERBOSE=1` | Log every frame rather than a heartbeat. |
+
+By hand, if you need it:
+
+```sh
+perception/.venv/bin/rover-perception --config config/rover.toml --csv runs/lane.csv
+```
+
+The console script exists only after `pip install -e .` (build product 4). If
+the package is merely importable, `perception/.venv/bin/python -m
+rover_perception.main` takes the same flags.
 
 ### On the base station (192.168.1.10) — optional
 
@@ -308,8 +482,18 @@ not a field condition, never noise.
 
 ```sh
 rsync -av curry@192.168.1.1:~/almondmatcha/runs/  ./runs-rover/
-rsync -av yupi@192.168.1.5:~/almondmatcha/…       ./runs-jetson/   # if --csv was used
+rsync -av yupi@192.168.1.5:~/almondmatcha/runs/   ./runs-jetson/
 ```
+
+⚠️ **Check the directory name on those two machines before trusting these
+literally.** They hardcode `~/almondmatcha`, but this repository was renamed
+to `almondmatcha-rs`, and a fresh `git clone` on the RPi or the Jetson lands
+in `~/almondmatcha-rs/` instead. Nobody has verified what is actually on those
+hosts' filesystems since the rename, so these two lines are a best guess, not
+a checked fact. (The launch scripts themselves are immune to this: they derive
+the repo root from their own location rather than assuming a path. The run
+directory is always `<repo root>/runs/` on each machine — the launch script
+prints its absolute path at startup, which is the authoritative answer.)
 
 Pull before powering anything down. No video is recorded; if it is ever added
 back, ~83 MB/s at 1280×720/30 fills the Jetson's 128 GB in ~26 minutes

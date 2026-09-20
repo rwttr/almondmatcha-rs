@@ -177,6 +177,8 @@ clean; that is all anyone knows about them.
 | `perception/` | Jetson. Camera capture + lane detection in **one** Python process. Stays Python for PyTorch/TensorRT. `tests/oracle/` holds the ROS 2 detector frozen verbatim as the parity oracle. |
 | `tools/replay` | The §12 gate — replays traces through the real control code against a frozen oracle of the old law. Nothing should drive a motor until this passes. |
 | `tools/capture_d415_rgb.py` | Standalone D415 capture utility, outside the workspace; useful for test video. |
+| `tools/launch_rover_tmux.sh` | Central tmux launcher for the **RPi**: the three rover processes in one titled session, one shared run directory, every pane teed to a log. Successor to `ws_rpi/launch_rover_tmux.sh`. |
+| `tools/launch_jetson_tmux.sh` | The same for the **Jetson**: perception plus a spare shell. |
 | `config/rover.toml` | Single source of truth: `[services]`, `[routes]`, gains, noise, safety timeouts, calibration. Nothing here may be duplicated in code. |
 | `testdata/*.bin` | Golden wire fixtures. Regenerating them is a breaking protocol change. |
 | `ws_spresense/` | Standalone Arduino GNSS sketches. Untouched by the rewrite. |
