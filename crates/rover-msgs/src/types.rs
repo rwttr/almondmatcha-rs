@@ -158,6 +158,21 @@ impl HealthBits {
     pub const STALL_DETECTED: Self = Self(1 << 6);
     /// Estimator covariance exceeded its trust threshold.
     pub const ESTIMATOR_DIVERGED: Self = Self(1 << 7);
+    /// A board reported a power-on self-test failure — see
+    /// [`BoardDiagnostics::post_failures`]. Latched for the run: a POST
+    /// failure does not heal, and clearing it when the board stops
+    /// re-announcing would hide it.
+    pub const BOARD_POST_FAIL: Self = Self(1 << 8);
+    /// A board reported an abnormal reset cause (watchdog or brown-out), or
+    /// its uptime went backwards — meaning it rebooted mid-run. Latched, for
+    /// the same reason: the reboot is the event, and it is over by the time
+    /// anyone reads this.
+    pub const BOARD_RESET: Self = Self(1 << 9);
+    /// A board's Ethernet link negotiated below 100 Mbit/s full duplex, or
+    /// its PHY reported symbol errors. The link still works, which is exactly
+    /// why this needs a bit of its own — nothing else will show it until it
+    /// degrades into packet loss.
+    pub const LINK_DEGRADED: Self = Self(1 << 10);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -1211,6 +1226,270 @@ impl Wire for EkfDebug {
             innovation: r.f32x3(),
             nis: r.f32(),
             gated: r.bool(),
+        })
+    }
+}
+
+// ===========================================================================
+// 0x0903 — board self-diagnostics
+// ===========================================================================
+
+/// Which board a [`BoardDiagnostics`] came from.
+///
+/// One message type serves both boards rather than two near-identical ones,
+/// because every consumer (telemetry CSV, `rover-tap`, the preflight check)
+/// wants to treat them uniformly — the ROS 2 system's `UbloxGNSS`/
+/// `SpresenseGNSS` split is the cautionary example (see [`GnssFix`]). The
+/// POST bits differ per board and are documented on [`PostBits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum BoardId {
+    #[default]
+    Chassis = 0,
+    Sensors = 1,
+}
+
+impl BoardId {
+    pub fn from_u8(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(Self::Chassis),
+            1 => Ok(Self::Sensors),
+            _ => Err(DecodeError::BadDiscriminant {
+                field: "BoardId",
+                value: v,
+            }),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chassis => "chassis",
+            Self::Sensors => "sensors",
+        }
+    }
+}
+
+/// Why the board last reset.
+///
+/// Read once at boot from `RCC_CSR` and latched for the life of the run. This
+/// is the single most diagnostic byte either board produces: a rover that
+/// silently reboots mid-run looks, from the RPi's side, exactly like a brief
+/// link drop — the sequence numbers restart and the feeds come back. Only the
+/// reset cause distinguishes "the watchdog fired" from "somebody nudged the
+/// USB cable".
+///
+/// [`Self::IndependentWatchdog`] in particular means the firmware hung long
+/// enough for the IWDG to fire (500 ms, `[safety] iwdg_timeout_ms`) — that is
+/// a firmware bug, not a field condition, and it must never be dismissed as
+/// noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ResetCause {
+    /// Could not be determined — no flag set, or the register was already
+    /// cleared. Distinct from `PowerOn` on purpose: "I do not know" is not
+    /// the same claim as "this was a clean cold boot".
+    #[default]
+    Unknown = 0,
+    /// Power-on / brown-out. The normal cold boot.
+    PowerOn = 1,
+    /// External reset pin — the Nucleo's black button, or the ST-LINK.
+    Pin = 2,
+    /// Software-requested reset (`SCB::sys_reset`).
+    Software = 3,
+    /// Independent watchdog fired. **Firmware hung.**
+    IndependentWatchdog = 4,
+    /// Window watchdog fired.
+    WindowWatchdog = 5,
+    /// Low-power reset (entered standby without clearing the flag).
+    LowPower = 6,
+    /// Brown-out reset, where the part reports it separately from power-on.
+    BrownOut = 7,
+}
+
+impl ResetCause {
+    pub fn from_u8(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(Self::Unknown),
+            1 => Ok(Self::PowerOn),
+            2 => Ok(Self::Pin),
+            3 => Ok(Self::Software),
+            4 => Ok(Self::IndependentWatchdog),
+            5 => Ok(Self::WindowWatchdog),
+            6 => Ok(Self::LowPower),
+            7 => Ok(Self::BrownOut),
+            _ => Err(DecodeError::BadDiscriminant {
+                field: "ResetCause",
+                value: v,
+            }),
+        }
+    }
+
+    /// True for a cause that means something went wrong, as opposed to a
+    /// normal or operator-initiated boot. Drives `HealthBits::BOARD_FAULT`.
+    pub fn is_abnormal(self) -> bool {
+        matches!(
+            self,
+            Self::IndependentWatchdog | Self::WindowWatchdog | Self::BrownOut
+        )
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::PowerOn => "power-on",
+            Self::Pin => "pin",
+            Self::Software => "software",
+            Self::IndependentWatchdog => "IWDG",
+            Self::WindowWatchdog => "WWDG",
+            Self::LowPower => "low-power",
+            Self::BrownOut => "brown-out",
+        }
+    }
+}
+
+/// Power-on self-test results, one bit per check.
+///
+/// Carried as a **pair** of bitfields — `run` and `pass` — because "this test
+/// did not run" and "this test failed" are different facts and collapsing
+/// them loses the one that matters. A board whose I²C bus is dead cannot run
+/// the IMU identity check at all; reporting that as a plain failure would
+/// send someone looking at the IMU instead of the bus.
+///
+/// **Bit meanings differ per board.** The first four are common; the rest are
+/// board-specific, which is why [`BoardDiagnostics::board`] must be read
+/// before interpreting them.
+///
+/// | Bit | Chassis | Sensors |
+/// |-----|---------|---------|
+/// | 0 | `CLOCK` — PLL reached the configured SYSCLK | same |
+/// | 1 | `PHY_ID` — Ethernet PHY answered with the expected ID | same |
+/// | 2 | `LINK` — link came up at 100 Mbps full duplex | same |
+/// | 3 | `NET_BIND` — UDP socket bound | same |
+/// | 4 | `IMU` — LSM6DSV16X `WHO_AM_I` == `0x70` | `POWER` — INA226 manufacturer ID |
+/// | 5 | `MOTOR_PWM` — TIM1/TIM3 produced output | `ENCODER_IDLE` — both channels readable and quiet at rest |
+/// | 6 | `SERVO_PWM` — TIM2 CH4 produced output | *(unused)* |
+/// | 7 | `IWDG` — independent watchdog armed | same |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PostBits(pub u16);
+
+impl PostBits {
+    pub const NONE: Self = Self(0);
+    pub const CLOCK: Self = Self(1 << 0);
+    pub const PHY_ID: Self = Self(1 << 1);
+    pub const LINK: Self = Self(1 << 2);
+    pub const NET_BIND: Self = Self(1 << 3);
+    /// Chassis: IMU identity. Sensors: INA226 identity.
+    pub const SENSOR_A: Self = Self(1 << 4);
+    /// Chassis: motor PWM. Sensors: encoder idle check.
+    pub const SENSOR_B: Self = Self(1 << 5);
+    /// Chassis: servo PWM. Unused on sensors.
+    pub const SENSOR_C: Self = Self(1 << 6);
+    pub const IWDG: Self = Self(1 << 7);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub fn set(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    pub fn is_clear(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Board self-diagnostics: power-on self-test results plus the runtime facts
+/// that only the board itself can see.
+///
+/// Published once immediately after POST completes, then at a slow heartbeat
+/// rate (1 Hz) so a board that reboots mid-run re-announces itself — the
+/// `reset_cause` on that second announcement is what tells the operator a
+/// reboot happened at all.
+///
+/// # Why this exists
+///
+/// Before it, a failed peripheral init on either board was logged over
+/// `defmt`/RTT and nowhere else. RTT needs a debugger physically attached,
+/// which in a field run it is not. A rover whose IMU failed to initialise
+/// would simply drive with no gyro input to the EKF and no indication
+/// anywhere that anything was wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BoardDiagnostics {
+    pub board: BoardId,
+    /// Which POST checks actually executed. See [`PostBits`].
+    pub post_run: PostBits,
+    /// Which of those passed. `post_run & !post_pass` is the failure set.
+    pub post_pass: PostBits,
+    pub reset_cause: ResetCause,
+    /// PHY identity, `(ID1 << 16) | ID2`, as read over MDIO. `0` means the
+    /// read was not attempted or the PHY did not answer. The LAN8742A
+    /// reports `0x0007_C130` (OUI `0x0007C0`, model `0x13`, revision in the
+    /// low nibble, which is why the low 4 bits vary between parts).
+    pub phy_id: u32,
+    /// Negotiated link speed in Mbit/s. `0` = link down or unknown.
+    ///
+    /// Worth reporting separately from "link up" because the silent failure
+    /// on this hardware is a link that negotiates 10 Mbit/s half duplex on a
+    /// marginal cable: everything reports "up", and the MAC is still
+    /// configured for 100 full.
+    pub link_speed_mbps: u8,
+    pub link_full_duplex: bool,
+    /// PHY symbol-error count since the last read, saturating. Non-zero means
+    /// the physical layer is marginal — a bad cable, a bad connector, or
+    /// interference — long before it becomes packet loss anyone notices.
+    pub phy_symbol_errors: u16,
+    /// Seconds since this board booted. Compare against the RPi's own uptime
+    /// to spot a board that has restarted without anyone noticing.
+    pub uptime_s: u32,
+    /// Frames this board has dropped because a send failed. Saturating.
+    pub tx_drops: u16,
+}
+
+impl BoardDiagnostics {
+    /// POST checks that ran and did not pass.
+    pub fn post_failures(&self) -> PostBits {
+        PostBits(self.post_run.0 & !self.post_pass.0)
+    }
+
+    /// True when every check that ran also passed.
+    pub fn post_ok(&self) -> bool {
+        self.post_failures().is_clear()
+    }
+}
+
+impl Wire for BoardDiagnostics {
+    const TYPE_ID: u16 = 0x0903;
+    const WIRE_LEN: usize = 19;
+    const NAME: &'static str = "BoardDiagnostics";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.u8(self.board as u8);
+        w.u16(self.post_run.0);
+        w.u16(self.post_pass.0);
+        w.u8(self.reset_cause as u8);
+        w.u32(self.phy_id);
+        w.u8(self.link_speed_mbps);
+        w.bool(self.link_full_duplex);
+        w.u16(self.phy_symbol_errors);
+        w.u32(self.uptime_s);
+        w.u16(self.tx_drops);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            board: BoardId::from_u8(r.u8())?,
+            post_run: PostBits(r.u16()),
+            post_pass: PostBits(r.u16()),
+            reset_cause: ResetCause::from_u8(r.u8())?,
+            phy_id: r.u32(),
+            link_speed_mbps: r.u8(),
+            link_full_duplex: r.bool(),
+            phy_symbol_errors: r.u16(),
+            uptime_s: r.u32(),
+            tx_drops: r.u16(),
         })
     }
 }
