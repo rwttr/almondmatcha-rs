@@ -41,8 +41,8 @@ use embassy_time::{Delay, Duration, Instant, Ticker};
 // See the version note in Cargo.toml for why this crate is pinned to v1.
 use lsm6dsv16x_rs::prelude::*;
 use lsm6dsv16x_rs::{from_fs4_to_mg, from_fs500_to_mdps, I2CAddress, Lsm6dsv16x};
-use st_mems_bus::i2c::I2cBus;
 use rover_msgs::{ImuSample, Wire};
+use st_mems_bus::i2c::I2cBus;
 
 use crate::config::{IMU_PUBLISH_HZ, STANDARD_GRAVITY};
 
@@ -63,7 +63,11 @@ pub type Imu = Lsm6dsv16x<I2cBus<I2c<'static, Blocking, Master>>, Delay>;
 /// Bring up the I2C bus and the sensor: reset, wait for it to come back,
 /// enable block-data-update (so a read can never straddle a register update
 /// mid-conversion), and set the ODR/full-scale from the plan's §5.1 sketch.
-pub fn init(i2c1: Peri<'static, I2C1>, scl: Peri<'static, PB8>, sda: Peri<'static, PB9>) -> Option<Imu> {
+pub fn init(
+    i2c1: Peri<'static, I2C1>,
+    scl: Peri<'static, PB8>,
+    sda: Peri<'static, PB9>,
+) -> Option<Imu> {
     let mut cfg = embassy_stm32::i2c::Config::default();
     cfg.frequency = khz(400);
     let i2c = I2c::new_blocking(i2c1, scl, sda, cfg);
@@ -157,6 +161,8 @@ pub async fn task(mut imu: Imu, stack: embassy_net::Stack<'static>) -> ! {
 
         let n = rover_msgs::encode_frame(&sample, seq, &mut buf);
         seq = seq.wrapping_add(1);
-        let _ = socket.send_to(&buf[..n], crate::config::IMU_SAMPLE_DEST).await;
+        let _ = socket
+            .send_to(&buf[..n], crate::config::IMU_SAMPLE_DEST)
+            .await;
     }
 }

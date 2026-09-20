@@ -39,6 +39,7 @@
 //! hang anywhere else in the firmware (a stuck I2C transaction in the IMU
 //! task, for instance) still resets the board even though this task itself
 //! is healthy.
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use defmt::warn;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::peripherals::IWDG;
@@ -46,7 +47,6 @@ use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use rover_msgs::ChassisCommand;
 
 use crate::config::{CMD_EPSILON, CMD_TIMEOUT_MS, RAMP_STEPS, RAMP_TIME_MS};
@@ -116,7 +116,10 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'sta
             }
             Either::Second(_) => {
                 if !tripped {
-                    warn!("watchdog: no ChassisCommand for {}ms, tripping", CMD_TIMEOUT_MS);
+                    warn!(
+                        "watchdog: no ChassisCommand for {}ms, tripping",
+                        CMD_TIMEOUT_MS
+                    );
                 }
                 tripped = true;
                 // Centre first (see module doc comment for why this order
@@ -141,7 +144,11 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'sta
 /// Petting the IWDG partway through matters here: on a real trip this
 /// coroutine runs for the entire 300 ms ramp without yielding to the outer
 /// `select`, and 300 ms is more than half the 500 ms IWDG window.
-async fn ramp_throttle_to_zero(motors: &mut Motors<'static>, iwdg: &mut IndependentWatchdog<'static, IWDG>, from: f32) {
+async fn ramp_throttle_to_zero(
+    motors: &mut Motors<'static>,
+    iwdg: &mut IndependentWatchdog<'static, IWDG>,
+    from: f32,
+) {
     let step_delay = Duration::from_millis(RAMP_TIME_MS / RAMP_STEPS as u64);
     for step in 0..RAMP_STEPS {
         let remaining = 1.0 - (step as f32 / RAMP_STEPS as f32);

@@ -57,7 +57,11 @@ use crate::config::{IWDG_PET_INTERVAL_MS, LINK_TIMEOUT_MS};
 
 /// Runs forever. Owns the status LED, the inbound socket, and the IWDG — the
 /// only place `IndependentWatchdog::pet()` is called in this crate.
-pub async fn run(socket: UdpSocket<'static>, mut iwdg: IndependentWatchdog<'static, IWDG>, led_pin: Peri<'static, PB0>) -> ! {
+pub async fn run(
+    socket: UdpSocket<'static>,
+    mut iwdg: IndependentWatchdog<'static, IWDG>,
+    led_pin: Peri<'static, PB0>,
+) -> ! {
     // LD1 on the Nucleo-144 (green). Doesn't collide with I2C1 (PB8/PB9), the
     // encoder EXTI pins (PA15/PB3/PB4/PB5), or any Ethernet RMII pin.
     let mut led = Output::new(led_pin, Level::Low, Speed::Low);

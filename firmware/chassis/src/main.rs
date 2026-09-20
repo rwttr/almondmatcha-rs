@@ -12,6 +12,7 @@
 //! | [`imu::task`] | 100 Hz | reads the LSM6DSV16X, publishes [`ImuSample`] |
 //! | [`rx_task`] | as they arrive | decodes [`ChassisCommand`] datagrams into the command mailbox |
 //! | [`status_task`] | 5 Hz | publishes [`ChassisStatus`] so the watchdog is observable |
+//! | [`diag::publish_task`] | 1 Hz | publishes [`rover_msgs::BoardDiagnostics`]: POST results, reset cause, PHY health |
 //! | `net_task` | — | drives the Ethernet interface (spawned inside [`net::init`]) |
 //!
 //! # Why the watchdog task owns the motors outright
@@ -36,6 +37,7 @@
 #![no_main]
 
 mod config;
+mod diag;
 mod imu;
 mod motor;
 mod net;
@@ -49,7 +51,9 @@ use embassy_net::udp::UdpSocket;
 use embassy_net::Stack;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Timer};
-use rover_msgs::{frame::encode_frame, ChassisCommand, ChassisStatus, FaultBits, Frame, Wire};
+use rover_msgs::{
+    frame::encode_frame, BoardId, ChassisCommand, ChassisStatus, FaultBits, Frame, PostBits, Wire,
+};
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -70,9 +74,18 @@ fn mark_imu_lost() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Must be the very first statement — see `diag::read_reset_cause`'s doc
+    // comment for why nothing, not even `embassy_stm32::init`, may run
+    // before this reads and latches `RCC_CSR`.
+    let reset_cause = diag::read_reset_cause();
+
     let p = embassy_stm32::init(net::clock_config());
 
     info!("chassis-fw starting: {} MHz sysclk, ip=192.168.1.2", 216);
+    info!("chassis-fw: reset cause = {}", reset_cause.name());
+
+    let mut post = diag::Post::new();
+    post.record(PostBits::CLOCK, diag::check_clock());
 
     // --- Network -----------------------------------------------------------
     let stack = net::init(
@@ -81,9 +94,23 @@ async fn main(spawner: Spawner) {
     );
     net::wait_up(stack).await;
 
+    // By the time `wait_config_up` resolves, `Lan8742a::poll_link` has
+    // already run at least once with the link reported up (see
+    // `net::Lan8742a`'s doc comment and `embassy-net`'s own static-config
+    // application, which is gated on link state) — so the PHY address scan
+    // and register reads it does inline have already happened.
+    let phy = net::phy_status();
+    post.record(PostBits::PHY_ID, diag::check_phy_id(phy.phy_id));
+    post.record(
+        PostBits::LINK,
+        phy.link_speed_mbps == 100 && phy.link_full_duplex,
+    );
+    post.record(PostBits::NET_BIND, diag::check_net_bind(stack));
+
     // --- Sensors -----------------------------------------------------------
     match imu::init(p.I2C1, p.PB8, p.PB9) {
         Some(sensor) => {
+            post.record(PostBits::SENSOR_A, true);
             spawner.spawn(defmt::unwrap!(imu::task(sensor, stack)));
         }
         None => {
@@ -93,6 +120,7 @@ async fn main(spawner: Spawner) {
             // fault bit tells the RPi to stop trusting gyro-based coasting.
             warn!("IMU init failed — continuing without it, FaultBits::IMU_LOST set");
             mark_imu_lost();
+            post.record(PostBits::SENSOR_A, false);
         }
     }
 
@@ -102,17 +130,41 @@ async fn main(spawner: Spawner) {
     spawner.spawn(defmt::unwrap!(status_task(stack)));
 
     // --- Actuation ----------------------------------------------------------
-    let motors = motor::Motors::new(
+    let mut motors = motor::Motors::new(
         p.TIM2, p.PA3, p.TIM3, p.PA6, p.TIM1, p.PE11, p.PF12, p.PD15, p.PF13, p.PE9,
     );
+    let motor_post = motors.post_check();
+    post.record(PostBits::SENSOR_B, motor_post.motor_pwm_ok);
+    post.record(PostBits::SENSOR_C, motor_post.servo_pwm_ok);
 
     // `IndependentWatchdog` is clocked from the LSI, which keeps running
     // through a hung task, a spinning interrupt, or a deadlocked bus — which
     // is exactly the point. It is unleashed inside `watchdog::run` and petted
     // only there.
     let iwdg = IndependentWatchdog::new(p.IWDG, IWDG_TIMEOUT_US);
+    // `IndependentWatchdog::unleash()` (called at the top of `watchdog::run`,
+    // below) is a single unconditional register write with no failure mode
+    // the STM32F7 exposes back to software — there is no IWDG status
+    // register that reports "started", only PVU/RVU/WVU busy flags for the
+    // separate prescaler/reload-write handshake. So this bit means "the
+    // enable sequence will unconditionally be issued", not an independently
+    // verified hardware confirmation that the counter is running - recorded
+    // here, before the call, because `watchdog::run` never returns and this
+    // is the last point at which anything else in `main` still executes.
+    post.record(PostBits::IWDG, true);
 
-    info!("chassis-fw ready: motors armed, watchdog {} ms", config::CMD_TIMEOUT_MS);
+    spawner.spawn(defmt::unwrap!(diag::publish_task(
+        stack,
+        BoardId::Chassis,
+        reset_cause,
+        post.run,
+        post.pass,
+    )));
+
+    info!(
+        "chassis-fw ready: motors armed, watchdog {} ms",
+        config::CMD_TIMEOUT_MS
+    );
     watchdog::run(motors, iwdg).await
 }
 
@@ -178,7 +230,11 @@ async fn status_task(stack: Stack<'static>) -> ! {
         let n = encode_frame(&status, seq, &mut buf);
         seq = seq.wrapping_add(1);
 
-        if socket.send_to(&buf[..n], CHASSIS_STATUS_DEST).await.is_err() {
+        if socket
+            .send_to(&buf[..n], CHASSIS_STATUS_DEST)
+            .await
+            .is_err()
+        {
             // A full transmit buffer or an unreachable peer. Telemetry is
             // best-effort by design — the next frame is 200 ms away and
             // carries the same state, so dropping this one costs nothing.

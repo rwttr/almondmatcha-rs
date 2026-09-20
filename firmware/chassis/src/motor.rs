@@ -37,11 +37,13 @@
 use embassy_stm32::gpio::{Level, Output, OutputType, Speed};
 use embassy_stm32::peripherals::{PA3, PA6, PD15, PE11, PE9, PF12, PF13, TIM1, TIM2, TIM3};
 use embassy_stm32::time::hz;
-use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
+use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm, SimplePwmChannel};
+use embassy_stm32::timer::GeneralInstance4Channel;
 use embassy_stm32::Peri;
 
 use crate::config::{
-    CMD_EPSILON, MOTOR_PWM_HZ, SERVO_CENTER_DEG, SERVO_DUTY_MAX, SERVO_DUTY_MIN, SERVO_PWM_HZ, STEER_MAX_DEG,
+    CMD_EPSILON, MOTOR_PWM_HZ, SERVO_CENTER_DEG, SERVO_DUTY_MAX, SERVO_DUTY_MIN, SERVO_PWM_HZ,
+    STEER_MAX_DEG,
 };
 
 /// `fdr_msg` from the old wire, reconstructed from `sign(steer)`. Named
@@ -180,7 +182,8 @@ impl<'d> Motors<'d> {
         }
         .clamp(0.0, 180.0);
 
-        let duty_fraction = SERVO_DUTY_MIN + (target_angle / 180.0) * (SERVO_DUTY_MAX - SERVO_DUTY_MIN);
+        let duty_fraction =
+            SERVO_DUTY_MIN + (target_angle / 180.0) * (SERVO_DUTY_MAX - SERVO_DUTY_MIN);
         const DENOM: u32 = 10_000;
         let num = (duty_fraction.clamp(0.0, 1.0) * DENOM as f32) as u32;
         self.servo_pwm.ch4().set_duty_cycle_fraction(num, DENOM);
@@ -209,6 +212,76 @@ impl<'d> Motors<'d> {
         self.right_pwm.ch1().set_duty_cycle_percent(duty_percent);
         self.left_pwm.ch2().set_duty_cycle_percent(duty_percent);
     }
+
+    /// Power-on self-test for `PostBits::SENSOR_B` (motor PWM) and
+    /// `PostBits::SENSOR_C` (servo PWM).
+    ///
+    /// # This is a configuration check, not an output check
+    ///
+    /// Nothing in this firmware can observe whether a GPIO pin actually
+    /// drove a waveform onto a wire - there is no ADC or loopback wired
+    /// back to any PWM pin on this board. What *is* checkable from
+    /// software, and what this function checks, is that each channel's
+    /// configuration is self-consistent: the channel is enabled
+    /// (`CCER.CCx`), a duty-cycle value written to its compare register
+    /// reads back unchanged, and - for the motor channels specifically,
+    /// since they alone live on TIM1, the one advanced-control timer in
+    /// this crate (see this module's doc comment) - TIM1's main-output
+    /// enable (`BDTR.MOE`) is set, without which an advanced timer's
+    /// channels stay electrically off no matter what their compare
+    /// registers say. None of this proves a motor spun or a servo moved.
+    ///
+    /// Called once, from `main`, right after construction and before any
+    /// real command can arrive - every channel's duty is 0 at this point
+    /// (the hardware reset value; `SimplePwm::new` never sets one), so a
+    /// transient non-zero test value and its restoration back to 0 below
+    /// are invisible to the drivetrain, which is additionally held stopped
+    /// by the forward/backward enable GPIOs both being low.
+    pub fn post_check(&mut self) -> MotorPost {
+        let servo_ok = duty_roundtrip_ok(&mut self.servo_pwm.ch4());
+        let right_ok = duty_roundtrip_ok(&mut self.right_pwm.ch1());
+        let left_ok = duty_roundtrip_ok(&mut self.left_pwm.ch2());
+        // See this function's doc comment: TIM1 is advanced-control, and
+        // `enable_channel` (what `.ch2().enable()` called in `new` above
+        // boils down to) only ever touches CCER, never BDTR.MOE. MOE is set
+        // once, at `SimplePwm::new`, by its own unconditional
+        // `enable_outputs()` call - this reads that bit back rather than
+        // assuming it stuck.
+        let moe_ok = embassy_stm32::pac::TIM1.bdtr().read().moe();
+
+        MotorPost {
+            motor_pwm_ok: right_ok && left_ok && moe_ok,
+            servo_pwm_ok: servo_ok,
+        }
+    }
+}
+
+/// Result of [`Motors::post_check`].
+#[derive(Debug, Clone, Copy)]
+pub struct MotorPost {
+    pub motor_pwm_ok: bool,
+    pub servo_pwm_ok: bool,
+}
+
+/// Write a distinctive test duty cycle to `ch`, read it back, and restore
+/// the channel to 0% duty (this crate's resting state - see
+/// `Motors::post_check`'s doc comment). Returns `false` immediately,
+/// without touching the compare register, if the channel isn't even
+/// enabled.
+fn duty_roundtrip_ok<T: GeneralInstance4Channel>(ch: &mut SimplePwmChannel<'_, T>) -> bool {
+    if !ch.is_enabled() {
+        return false;
+    }
+    const TEST_NUM: u32 = 1;
+    const TEST_DENOM: u32 = 4;
+    // Computed the same way `set_duty_cycle_fraction` computes it
+    // internally, so this comparison is exact rather than tolerant of a
+    // rounding difference between two independently-written formulas.
+    let expected = TEST_NUM * ch.max_duty_cycle() / TEST_DENOM;
+    ch.set_duty_cycle_fraction(TEST_NUM, TEST_DENOM);
+    let ok = u32::from(ch.current_duty_cycle()) == expected;
+    ch.set_duty_cycle_fully_off();
+    ok
 }
 
 fn level(high: bool) -> Level {

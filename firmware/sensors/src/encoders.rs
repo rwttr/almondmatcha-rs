@@ -86,8 +86,8 @@ use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pull;
 use embassy_stm32::peripherals::{EXTI15, EXTI3, EXTI4, EXTI5, PA15, PB3, PB4, PB5};
 use embassy_stm32::{bind_interrupts, Peri};
-use embassy_time::{Duration, Instant, Ticker};
-use rover_msgs::{encode_frame, Wire, WheelSensors};
+use embassy_time::{Duration, Instant, Ticker, Timer};
+use rover_msgs::{encode_frame, WheelSensors, Wire};
 
 use crate::config::{ENCODER_PUBLISH_HZ, WHEEL_SENSORS_DEST};
 
@@ -146,9 +146,16 @@ struct QuadChannel {
 }
 
 impl QuadChannel {
-    fn new(ch_a: ExtiInput<'static, embassy_stm32::mode::Async>, ch_b: ExtiInput<'static, embassy_stm32::mode::Async>) -> Self {
+    fn new(
+        ch_a: ExtiInput<'static, embassy_stm32::mode::Async>,
+        ch_b: ExtiInput<'static, embassy_stm32::mode::Async>,
+    ) -> Self {
         let last_state = state(ch_a.is_high(), ch_b.is_high());
-        Self { ch_a, ch_b, last_state }
+        Self {
+            ch_a,
+            ch_b,
+            last_state,
+        }
     }
 
     /// Run forever: wait for an edge on either channel, decode the
@@ -270,3 +277,49 @@ pub async fn publish_task(stack: embassy_net::Stack<'static>) -> ! {
 
 // Compile-time proof the shared tx_socket! buffer can hold this message.
 const _: () = assert!(WheelSensors::WIRE_LEN + rover_msgs::FRAME_HEADER_LEN <= 128);
+
+/// Duration of the `PostBits::SENSOR_B` idle-check window below - long
+/// enough that a genuinely stuck-toggling GPIO line (a floating input, a
+/// short, a miswired pull) would certainly clock at least one count during
+/// it, short enough not to meaningfully delay boot: this runs once, in
+/// series with nothing else, before any other task is spawned.
+const POST_IDLE_WINDOW_MS: u64 = 20;
+
+/// `PostBits::SENSOR_B` on this board: "both channels readable and quiet at
+/// rest."
+///
+/// # What this does and does not prove
+///
+/// GPIO reads never fail in the way an I2C or MDIO transaction can, so
+/// "readable" is not the interesting half of this check - it always
+/// trivially passes. The check that actually means something is "quiet":
+/// sample both tick counters, wait [`POST_IDLE_WINDOW_MS`], and confirm
+/// neither has moved. A healthy encoder that is not physically spinning
+/// produces zero edges in that window; a floating or shorted input line
+/// tends to chatter continuously and would almost certainly produce at
+/// least one.
+///
+/// This does **not** verify correct quadrature decoding, direction sign, or
+/// tick scale - only that the inputs aren't glitching at rest. It also does
+/// not distinguish "encoder is broken" from "someone bumped the wheel
+/// during boot": a wheel nudged by hand in this 20ms window would fail this
+/// check exactly like a wiring fault would, which is a **false failure**
+/// this check cannot rule out, not a false pass - a rover reported as
+/// "encoder idle check failed" immediately after being carried to its start
+/// position is not necessarily broken.
+///
+/// Called from `main`, after `Encoders::spawn` but before anything else is
+/// spawned, so the only tasks that can move the counters during the window
+/// are `left_task`/`right_task` themselves.
+pub async fn post_idle_check() -> bool {
+    let before = (
+        TICKS_LEFT.load(Ordering::Relaxed),
+        TICKS_RIGHT.load(Ordering::Relaxed),
+    );
+    Timer::after(Duration::from_millis(POST_IDLE_WINDOW_MS)).await;
+    let after = (
+        TICKS_LEFT.load(Ordering::Relaxed),
+        TICKS_RIGHT.load(Ordering::Relaxed),
+    );
+    before == after
+}

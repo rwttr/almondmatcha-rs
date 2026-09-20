@@ -33,6 +33,11 @@ pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 
 /// `watchdog.rs`.
 pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
 
+/// `[base]` - the base-station PC. On the same `/24` as every other host on
+/// this closed LAN (`SELF_IP`'s static config carries no gateway at all -
+/// see `net.rs::init`), so it's directly reachable with no routing hop.
+pub const BASE_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 10), 7030);
+
 /// Per-message-type destination table.
 ///
 /// Every message this board publishes has exactly one destination, so each
@@ -59,6 +64,13 @@ pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1)
 /// `rover-tap` sees them without changing firmware.
 pub const WHEEL_SENSORS_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
 pub const POWER_SAMPLE_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
+
+/// `[routes] BoardDiagnostics = ["telemetry", "base"]` - the one message
+/// this board publishes to *two* destinations, not one: `rover-telemetry`'s
+/// health-tracking and the base-station operator both need this board's
+/// self-test/reset-cause/PHY-health report, and neither should have to
+/// relay it to the other. See `diag::publish_task`.
+pub const BOARD_DIAGNOSTICS_DESTS: [(Ipv4Address, u16); 2] = [TELEMETRY_ADDR, BASE_ADDR];
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed), same scheme as
 /// `firmware/chassis/src/config.rs` - last octet mirrors the host part of

@@ -42,6 +42,11 @@ pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 
 /// `[services] telemetry` address.
 pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
 
+/// `[base]` - the base-station PC. On the same `/24` as every other host on
+/// this closed LAN (`SELF_IP`'s static config carries no gateway at all -
+/// see `net.rs::init`), so it's directly reachable with no routing hop.
+pub const BASE_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 10), 7030);
+
 /// Per-message-type destination table. No message this board publishes needs
 /// more than one destination, so each is a single address rather than a
 /// list — but naming them by message type (not by host) is what makes it
@@ -50,6 +55,13 @@ pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1)
 /// needs two) a one-line change here rather than a call-site rewrite.
 pub const IMU_SAMPLE_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
 pub const CHASSIS_STATUS_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
+
+/// `[routes] BoardDiagnostics = ["telemetry", "base"]` - the one message
+/// this board publishes to *two* destinations, not one: `rover-telemetry`'s
+/// health-tracking and the base-station operator both need this board's
+/// self-test/reset-cause/PHY-health report, and neither should have to
+/// relay it to the other. See `diag::publish_task`.
+pub const BOARD_DIAGNOSTICS_DESTS: [(Ipv4Address, u16); 2] = [TELEMETRY_ADDR, BASE_ADDR];
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed) - there is no vendor
 /// assignment to collide with on a closed LAN with five fixed hosts. The last

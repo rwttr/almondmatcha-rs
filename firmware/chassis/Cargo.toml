@@ -42,7 +42,16 @@ embassy-net = { version = "=0.9.1", features = ["defmt", "udp", "medium-ethernet
 # `time-driver-any`, which could silently pick TIM2 - our steering timer -
 # or TIM3 - our right motor timer - depending on embassy's internal
 # preference order) avoids a peripheral collision that would only show up
-# as a HardFault or silently-wrong PWM at runtime.
+# as a HardFault or silently-wrong PWM at runtime. `unstable-pac`: without
+# it, `embassy_stm32::pac` is `pub(crate)` inside embassy-stm32 itself and
+# unreachable from here at all; board self-diagnostics (`diag.rs`, `net.rs`'s
+# `Lan8742a`, `motor.rs`'s POST check) read `RCC_CSR`, `TIM1_BDTR`, and raw
+# PHY-adjacent registers directly, none of which embassy-stm32's safe HAL
+# exposes an accessor for. "unstable" describes the PAC's own API-stability
+# guarantee (stm32-metapac's register layout can change across embassy-stm32
+# versions without a semver bump on embassy-stm32 itself), not a claim that
+# reading a register is unsafe or unreliable - the version is pinned exactly
+# (`=0.6.0`) precisely so that risk is fixed for the life of this Cargo.lock.
 embassy-stm32 = { version = "=0.6.0", default-features = false, features = [
     "defmt",
     "stm32f767zi",
@@ -50,6 +59,7 @@ embassy-stm32 = { version = "=0.6.0", default-features = false, features = [
     "time-driver-tim5",
     "single-bank",
     "exti",
+    "unstable-pac",
 ] }
 
 # --- Boot / panic / logging -------------------------------------------------

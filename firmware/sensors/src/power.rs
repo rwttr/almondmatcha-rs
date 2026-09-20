@@ -27,7 +27,7 @@ use embassy_stm32::peripherals::{I2C1, PB8, PB9};
 use embassy_stm32::time::khz;
 use embassy_stm32::Peri;
 use embassy_time::{Duration, Ticker};
-use ina226::{Config, INA226, AVG, MODE, VBUSCT, VSHCT};
+use ina226::{Config, AVG, INA226, MODE, VBUSCT, VSHCT};
 use rover_msgs::{encode_frame, PowerSample, Wire};
 
 use crate::config::{INA226_ADDR, POWER_PUBLISH_HZ, POWER_SAMPLE_DEST, SHUNT_OHMS};
@@ -36,6 +36,13 @@ use crate::config::{INA226_ADDR, POWER_PUBLISH_HZ, POWER_SAMPLE_DEST, SHUNT_OHMS
 /// (unlike the LSM6DSV16X driver on the chassis board, the INA226 crate needs
 /// no vendor bus-wrapper type), so this alias is just the concrete I2C type.
 pub type Power = INA226<I2c<'static, Blocking, Master>>;
+
+/// Expected value of the INA226's Manufacturer ID register (`0xFE`) — the TI
+/// datasheet's documented, fixed value, ASCII "TI" (`0x54` 'T', `0x49` 'I').
+/// Used only as a `PostBits::SENSOR_A` identity check, the same role
+/// `lsm6dsv16x_rs::ID`/`WHO_AM_I` plays for the chassis board's IMU — it is
+/// not read again after `init` and plays no part in normal operation.
+const MANUFACTURER_ID: u16 = 0x5449;
 
 /// Bring up I2C1 at 400 kHz and put the INA226 into continuous shunt+bus
 /// conversion mode explicitly.
@@ -47,12 +54,35 @@ pub type Power = INA226<I2c<'static, Blocking, Master>>;
 /// crate exposes `set_configuration` for exactly that kind of manual probing)
 /// should not silently keep reading stale data forever after a firmware
 /// restart that didn't power-cycle the sensor.
-pub fn init(i2c1: Peri<'static, I2C1>, scl: Peri<'static, PB8>, sda: Peri<'static, PB9>) -> Option<Power> {
+///
+/// Returns both the usable device (if configuration succeeded) and whether
+/// the identity check passed, as two independent facts — see
+/// `diag::Post`'s doc comment for why `PostBits` keeps "did it run" and "did
+/// it pass" separate. The identity read happens first, before
+/// `set_configuration`, so it still runs (and can still fail) even when the
+/// configuration write itself fails.
+pub fn init(
+    i2c1: Peri<'static, I2C1>,
+    scl: Peri<'static, PB8>,
+    sda: Peri<'static, PB9>,
+) -> (Option<Power>, bool) {
     let mut cfg = embassy_stm32::i2c::Config::default();
     cfg.frequency = khz(400);
     let i2c = I2c::new_blocking(i2c1, scl, sda, cfg);
 
     let mut dev = INA226::new(i2c, INA226_ADDR);
+
+    let id_ok = match dev.manufacturer_id() {
+        Ok(MANUFACTURER_ID) => true,
+        Ok(other) => {
+            warn!("power: unexpected INA226 manufacturer id 0x{:x}", other);
+            false
+        }
+        Err(_) => {
+            warn!("power: INA226 manufacturer id read failed");
+            false
+        }
+    };
 
     let config = Config {
         avg: AVG::_1,
@@ -62,10 +92,10 @@ pub fn init(i2c1: Peri<'static, I2C1>, scl: Peri<'static, PB8>, sda: Peri<'stati
     };
     if dev.set_configuration(&config).is_err() {
         warn!("power: INA226 configuration write failed");
-        return None;
+        return (None, id_ok);
     }
 
-    Some(dev)
+    (Some(dev), id_ok)
 }
 
 /// Publish [`PowerSample`] at [`POWER_PUBLISH_HZ`] (5 Hz) — the rate the
@@ -83,7 +113,10 @@ pub async fn publish_task(mut power: Power, stack: embassy_net::Stack<'static>) 
 
         // `PowerSample` carries no timestamp field (see `rover-msgs`) — the
         // 5 Hz `Ticker` cadence itself is the timing reference consumers use.
-        let (bus_mv, shunt_uv) = match (power.bus_voltage_millivolts(), power.shunt_voltage_microvolts()) {
+        let (bus_mv, shunt_uv) = match (
+            power.bus_voltage_millivolts(),
+            power.shunt_voltage_microvolts(),
+        ) {
             (Ok(bus_mv), Ok(shunt_uv)) => (bus_mv, shunt_uv),
             _ => {
                 warn!("power: I2C read failed, skipping sample");
