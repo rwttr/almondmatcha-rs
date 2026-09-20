@@ -12,10 +12,13 @@
 How a camera frame becomes the three numbers the steering loop consumes.
 This document ends where [CONTROL_LAW.md](CONTROL_LAW.md) begins — at the
 `tpc_rover_nav_lane` topic. The D4/D5/D6 domain topology and the `tpc_*`
-schemas this document references were deleted with the ROS 2 tree —
-`git show main:docs/DOMAINS.md` and `git show main:docs/TOPICS.md` still have
-them. For current wire types see `crates/rover-msgs`; for the machines and IPs
-those domains used to run on see [HARDWARE.md](HARDWARE.md).
+schemas this document references were deleted with the ROS 2 tree — recover
+them from the ROS 2 fallback repository, `RoboticsGG/almondmatcha`'s `main`
+branch (this repository's `origin` has no `main` at all):
+`git show roboticsgg-almondmatcha/main:docs/DOMAINS.md` and
+`git show roboticsgg-almondmatcha/main:docs/TOPICS.md`, naming that remote
+explicitly. For current wire types see `crates/rover-msgs`; for the machines
+and IPs those domains used to run on see [HARDWARE.md](HARDWARE.md).
 
 **Files:**
 `ws_jetson/src/vision_navigation/vision_navigation/lane_detector.py` (the
@@ -154,10 +157,12 @@ inside the ROI, so it costs no fitting accuracy.
 
 **`regenerate_roi.py` was deleted with the ROS 2 tree** (it lived at
 `ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py`).
-Recover it with:
+Recover it from the ROS 2 fallback repository, `RoboticsGG/almondmatcha`'s
+`main` branch — this repository's `origin` has no `main` branch, so name the
+other remote explicitly:
 
 ```
-git show main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py
+git show roboticsgg-almondmatcha/main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py
 ```
 
 It took the physical mount as CLI arguments (defaults to the then-shipped

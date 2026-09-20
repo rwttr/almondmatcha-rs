@@ -357,4 +357,5 @@ will rot before that one does.
    fixed.
 4. Replay parity is against a synthetic trace only. No recorded ROS 2 run
    exists in this repository and none ever did; producing a real baseline
-   means checking out `main`.
+   means checking out `main` in the ROS 2 fallback repository,
+   `RoboticsGG/almondmatcha` — this repository's `origin` has no `main`.

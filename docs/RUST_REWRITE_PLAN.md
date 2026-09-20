@@ -5,7 +5,10 @@
 **Scope:** full replacement of the ROS 2 / DDS / mros2 stack with a Rust workspace,
 adding state estimation (EKF), a pluggable control law, a firmware command
 watchdog, metric speed, and a link layer that survives the base station leaving
-the LAN for LoRa. Big-bang rewrite on a branch; `main` is preserved untouched.
+the LAN for LoRa. Big-bang rewrite on a branch; `main` was preserved
+untouched. (This branch has since become its own repository — `main` now
+lives only in `RoboticsGG/almondmatcha`; this repository's `origin` has no
+`main`.)
 
 **Rev 3 adds §13, an implementation status table.** Everything above it is the
 plan; §13 is what actually exists on branch `rs`. Where the two disagree, §13
@@ -31,7 +34,7 @@ currently unused), §8 pluggable controller trait for LQR/MPC.
 | New: control | **Pluggable** `LateralController`: static-gain (current) → LQR → MPC. |
 | New: safety | **Firmware command watchdog** on both STM32 boards. |
 | New: comms | **Link abstraction** — Ethernet today, LoRa for the base link tomorrow. |
-| Migration style | **Big bang** on a branch. `main` keeps the working ROS 2 rover. |
+| Migration style | **Big bang** on a branch. `main` kept the working ROS 2 rover — now only in `RoboticsGG/almondmatcha`. |
 
 **The fact that makes this viable:** Embassy ships a working STM32F7 Ethernet
 example built against `stm32f777zi` — the same die as the F767ZI with crypto
@@ -169,7 +172,9 @@ Runs free every time the rover pauses.
 - Ship as a **pure library** (`rover-estimator`), no I/O, driven by `tools/replay`
   over existing `runs/*.csv`. Must be tunable on a laptop. (No such `runs/*.csv`
   exists in this repository, nor ever did — `STATUS_OPEN.md` §1.4. This is not merely
-  open: a run must first be produced on `main` before it is achievable.)
+  open: a run must first be produced on `main` in the ROS 2 fallback
+  repository, `RoboticsGG/almondmatcha` — this repository's `origin` has no
+  `main` — before it is achievable.)
 
 ### 2.4 Heading observability — and what the magnetometer does about it
 
@@ -182,7 +187,9 @@ camera. With the lane lost, heading drifts at the residual gyro bias rate — ex
 **Yes — the X-NUCLEO-IKS4A1 carries a LIS2MDL 3-axis magnetometer.** Confirmed
 both by ST's product page and by the vendored
 `libs/X-Nucleo-IKS4A1_mbedOS/README.md`, which lists it (that path no longer
-exists on this branch — see Appendix A; `git show main:<path>` still has it).
+exists on this branch — see Appendix A;
+`git show roboticsgg-almondmatcha/main:<path>` still has it, since this
+repository's `origin` has no `main` of its own).
 The board also carries
 LSM6DSO16IS, LIS2DUXS12, SHT40-AD1B, LPS22DF and STTS22H. Your firmware
 includes
@@ -242,33 +249,31 @@ metres_per_tick     = 0.39270 / ticks_per_revolution
 speed_mps           = ticks_per_second * metres_per_tick
 ```
 
-**Procedure A — ticks per revolution (answers your actual question, ~5 min).**
-Preferred: it isolates the constant and absorbs gear ratio automatically.
+**Procedure A (ticks per revolution) and Procedure B (metres per tick,
+authoritative)** are both real, run-it-now procedures — the full step-by-step
+lives in `docs/CALIBRATION.md`: which ST-Link goes to which board, the exact
+`cargo`/`probe-rs` build-and-flash commands, the defmt log line to read, and
+the direction-sign check. That document replaced the mechanical steps this
+section used to give directly, which had gone stale — they cited logging to
+`chassis_sensors.csv`, a ROS 2 filename, and this stack does not log encoders
+to CSV at all (`docs/CSV_LOGGING.md`). The reasoning above (why the constant
+isn't in this repo, the 2×/4× trap, the maths) still belongs here; the how-to
+does not.
 
-1. Jack the drive wheel clear of the ground. Mark the tyre and the chassis.
-2. Log `chassis_sensors.csv`, note the starting tick count.
-3. Rotate the wheel **by hand**, forward, exactly **10 full revolutions**.
-4. Note the ending count. `ticks_per_revolution = (end - start) / 10`.
-5. Repeat for the other wheel. They should agree within a few percent; if not,
-   you have a wiring or mounting asymmetry worth finding before you go further.
-
-> **Expect roughly 15,000 counts for the ten turns** (~1500 ticks/rev at this
-> firmware's 4× decoding). See `docs/HARDWARE.md` §3 for where that figure
-> comes from — a recollection of the ROS 2 system, not a measurement, recorded
-> so this procedure has something to agree or disagree with. **~7,500 counts
-> means the board is still decoding at 2×**, which is the failure this section
-> warns about, caught before it doubles every logged speed.
-
-**Procedure B — metres per tick directly (~10 min, do this too).**
-Absorbs tyre compression and real rolling radius, which Procedure A does not.
-
-1. On the actual field surface, mark a **10.00 m** straight line.
-2. Drive the rover open-loop along it, logging `chassis_sensors.csv`.
-3. `metres_per_tick = 10.00 / mean(total_ticks_left, total_ticks_right)`.
-4. Three trials, average.
+In outline: **A** jacks one drive wheel clear of the ground and turns it by
+hand, forward, exactly ten revolutions, reading the tick count before and
+after — `ticks_per_revolution = (end - start) / 10`, repeated for the other
+wheel, which should agree within a few percent. Expect roughly 15,000 counts
+for the ten turns (~1500 ticks/rev at this firmware's 4× decoding —
+`docs/HARDWARE.md` §3 has the full context: a recollection of the ROS 2
+system, not a measurement). ~7,500 means the board is still decoding at 2×:
+stop and fix that before going further. **B** marks a real 10.00 m line on
+the field surface, drives the rover open-loop along it, and takes
+`metres_per_tick = 10.00 / mean(total_ticks_left, total_ticks_right)` over
+three trials, averaged.
 
 Use **B** for `metres_per_tick` in production; use **A** to sanity-check it and to
-have the number you asked for. If they disagree by more than ~5%, suspect slip.
+have ticks-per-revolution on its own. If they disagree by more than ~5%, suspect slip.
 
 Store in `config/rover.toml`:
 
@@ -484,7 +489,8 @@ CHASSIS_CMD = struct.Struct("<ffH")
 Use [`lsm6dsv16x-rs`](https://crates.io/crates/lsm6dsv16x-rs) v2.1.0 — `no_std`,
 BSD-3-Clause, `embedded-hal` 1.0, same vendor and register abstraction as the C
 driver already vendored in `libs/` (that path no longer exists on this branch —
-see Appendix A; `git show main:<path>` still has it).
+see Appendix A; `git show roboticsgg-almondmatcha/main:<path>` still has it,
+since this repository's `origin` has no `main` of its own).
 
 ```rust
 let mut imu = Lsm6dsv16x::new_i2c(i2c, I2CAddress::I2cAddH, delay)?;
@@ -731,10 +737,13 @@ has to do.
 
 ## 7. Repository layout
 
-New work on branch `rs`. `main` keeps the ROS 2 system.
+New work on branch `rs`. `main` kept the ROS 2 system — at the time in the
+same repository. This branch has since become its own repository; `main` now
+lives only in `RoboticsGG/almondmatcha`, and this repository's `origin` has
+no `main` at all.
 
 ```
-almondmatcha/
+almondmatcha-rs/
 ├── Cargo.toml                   # workspace: firmware + host, one message crate
 ├── rust-toolchain.toml
 ├── config/
@@ -748,7 +757,9 @@ almondmatcha/
 │   ├── rover-control/           # bin  (RPi)  estimate + guide + actuate
 │   ├── rover-navigation/        # bin  (RPi)  GNSS + mission + RTCM injection
 │   ├── rover-telemetry/         # bin  (RPi)  CSV + link encode
+│   ├── rover-runs/              # run_NNN_<stamp>/ convention, shared by telemetry + ground-station
 │   ├── ground-station/          # bin  (Base)
+│   ├── rover-doctor/            # bin  (Base)  preflight GO/NO-GO, 9 checks
 │   └── rover-tap/               # bin  debug CLI — replaces `ros2 topic echo`
 ├── firmware/
 │   ├── chassis/                 # no_std, thumbv7em-none-eabihf
@@ -893,8 +904,10 @@ offset.
 `StaticGain` from existing `runs/*.csv` and match recorded ROS 2 behaviour within
 tolerance. No motor turns until that passes. **No such `runs/*.csv` exists, and
 none ever did (`STATUS_OPEN.md` §1.4).** This is not merely open — it requires first
-checking out `main` and recording a run there, since the ROS 2 tree that could
-produce one is gone from this branch.
+checking out `main` in the ROS 2 fallback repository,
+`RoboticsGG/almondmatcha` (this repository's `origin` has no `main`) and
+recording a run there, since the ROS 2 tree that could produce one is gone
+from this branch.
 
 ---
 
@@ -911,7 +924,7 @@ produce one is gone from this branch.
 | **EKF tuning eats time** | Medium | Seed `R` from measured variance of lane params, stationary, facing a straight line. No such CSVs exist yet (`STATUS_OPEN.md` §1.4) — this means recording one first, not pulling from an existing log. Log innovations from day one. |
 | **Magnetometer disappoints** | Low | Optional, behind a flag, after step 13. §2.5 says why to expect little. |
 | **Jetson Python bus drifts from Rust** | Medium | Shared golden-byte fixtures (§4.3) |
-| **No ROS 2 escape hatch** | Medium | Accepted. `main` keeps the working system. |
+| **No ROS 2 escape hatch** | Medium | Accepted. `main` keeps the working system, now in `RoboticsGG/almondmatcha` — this repository's `origin` has no `main`. |
 
 ---
 
@@ -922,7 +935,8 @@ produce one is gone from this branch.
 2. `tools/replay` reproduces recorded ROS 2 steering output from
    `runs/*/lane_detection.csv` within tolerance. **No recorded run exists in
    this repository and none ever did (`STATUS_OPEN.md` §1.4); this criterion cannot be
-   attempted until one is produced on `main`.**
+   attempted until one is produced on `main` in the ROS 2 fallback repository,
+   `RoboticsGG/almondmatcha` (this repository's `origin` has no `main`).**
 3. **Watchdog:** rover on blocks, driving, Ethernet pulled → throttle ramps to zero
    within 200 ms + 300 ms, steering centres, `watchdog_tripped` observable.
 4. **IWDG:** artificially hang the control task → board resets, PWM safe.
@@ -1476,8 +1490,10 @@ Transcribed from `libs/X-Nucleo-IKS4A1_mbedOS/plt_lsm6dsv16x/registers.h` in
 the mbed firmware. That path no longer exists on this branch — it lived under
 `mros2-mbed-chassis-dynamics`, removed in `chore(rs)!: remove the ROS 2,
 mROS 2 and embeddedRTPS tree`. The table below is the reason it did not need
-to survive; if more of it is ever wanted, `git show main:<path>` still has
-the header. This is the fallback for talking to the part directly, should
+to survive; if more of it is ever wanted,
+`git show roboticsgg-almondmatcha/main:<path>` still has the header — this
+repository's `origin` has no `main` of its own. This is the fallback for
+talking to the part directly, should
 `lsm6dsv16x-rs` prove unusable on hardware:
 
 | Register | Addr | Use |
@@ -1500,7 +1516,8 @@ Sensitivity conversions mirror the C driver's `from_fsN_to_mg` /
 
 Your firmware uses **one** of these. Confirmed against ST's product page and the
 vendored `libs/X-Nucleo-IKS4A1_mbedOS/README.md` (that path no longer exists on
-this branch — see Appendix A; `git show main:<path>` still has it):
+this branch — see Appendix A; `git show roboticsgg-almondmatcha/main:<path>`
+still has it, since this repository's `origin` has no `main` of its own):
 
 | Part | Function | Used today? | Rust driver |
 |---|---|---|---|

@@ -221,7 +221,7 @@ cargo build --release -p rover-control      # also: -p rover-navigation,
 # Perception (first time: create the venv the tests expect)
 cd perception
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/ -q        # 82 tests
+.venv/bin/python -m pytest tests/ -q        # 88 tests
 
 # The parity gate — `run` needs a trace; `synthetic` makes one
 cargo run -p replay -- synthetic --out /tmp/trace.csv
@@ -257,7 +257,9 @@ Docker, no CMake, no mbed.
       field data exists in this repository and none ever did, so the gate
       compares against a hand-rolled oracle of the old law rather than the
       rover's actual past behaviour. Producing a real baseline now means
-      running the old ROS 2 stack to record one.
+      running the old ROS 2 stack, which lives on `main` in
+      `RoboticsGG/almondmatcha` — this repository's `origin` has no `main`
+      branch at all.
 
 ---
 
@@ -266,11 +268,12 @@ Docker, no CMake, no mbed.
 | File | What it is |
 |---|---|
 | [`REWRITE_SUMMARY.md`](docs/REWRITE_SUMMARY.md) | **Start here.** What the rewrite did, why, what it cost, what blocks it. |
-| [`RUST_REWRITE_PLAN.md`](docs/RUST_REWRITE_PLAN.md) | The design document: architecture, rationale, calibration procedures (§2.6), defect narratives (§13.3b), hardware-verification debt (§13.4). |
+| [`RUST_REWRITE_PLAN.md`](docs/RUST_REWRITE_PLAN.md) | The design document: architecture, rationale, calibration reasoning (§2.6), defect narratives (§13.3b), hardware-verification debt (§13.4). |
 | [`STATUS_DONE.md`](docs/STATUS_DONE.md) | What is built, and the evidence for each claim. |
 | [`STATUS_OPEN.md`](docs/STATUS_OPEN.md) | What remains, the risk register reassessed, and open concerns. **Read before planning a field run.** |
 | [`FIELD_TEST.md`](docs/FIELD_TEST.md) | How to run a field test end to end, and where the data lands. |
 | [`HARDWARE.md`](docs/HARDWARE.md) | Machines, sensors, both pin maps, calibration status. |
+| [`CALIBRATION.md`](docs/CALIBRATION.md) | Step-by-step drivetrain encoder calibration: which ST-Link is which board, build/flash commands, Procedures A and B. |
 | [`VISION_PIPELINE.md`](docs/VISION_PIPELINE.md) | Camera frame → lane geometry. ROS 2 era, still the reference. |
 | [`CONTROL_LAW.md`](docs/CONTROL_LAW.md) | Steering and speed derivation. ROS 2 era — see its banner. |
 | [`CSV_LOGGING.md`](docs/CSV_LOGGING.md) | Log schemas and analysis guidance. ROS 2 era. |

@@ -80,8 +80,11 @@ Notes that cost a field session to rediscover:
 | Metres per tick | ⚠️ **unmeasured** (expected ~0.000262) | `[drivetrain] metres_per_tick = 0.0` |
 
 **Until those three are measured there is no metric speed anywhere in the
-system.** Both procedures are in `RUST_REWRITE_PLAN.md` §2.6 — a tape measure
-and about twenty minutes.
+system.** The step-by-step for both procedures — which ST-Link goes to which
+board, exact build/flash commands, the log line to read — is
+`docs/CALIBRATION.md`; `RUST_REWRITE_PLAN.md` §2.6 is the reasoning behind
+them (why the constant isn't in this repo, the 2×/4× decoding trap, the
+maths). A tape measure and about twenty minutes.
 
 ⚠️ **Calibrate against this firmware, not the old one.** The ROS 2 firmware
 interrupted on channel A only (rise + fall) — 2× decoding. The Rust firmware
@@ -93,7 +96,9 @@ old firmware, pasted here, reads exactly **double** the true speed.
 One full turn of a drive wheel produced **about 750 counts** on the ROS 2
 system. That is a recollection offered in conversation on 2026-09-20, not a
 figure recovered from a log, a config file or a datasheet — nothing of the
-kind survives anywhere in this repository or on `main`.
+kind survives anywhere in this repository or on `main` in
+`RoboticsGG/almondmatcha` (this repository's `origin` has no `main` of its
+own).
 
 It is recorded here for one purpose: **as the answer Procedure A should be
 expected to produce**, so that a calibration run either confirms it or

@@ -11,8 +11,9 @@ rationale, not day-to-day state.
 flashed to a board, and the drivetrain is uncalibrated.** Those two facts
 govern everything below; `STATUS_OPEN.md` has the full accounting.
 
-Designed and built 19–20 September 2026. `main` still holds the working ROS 2
-rover and is the fallback.
+Designed and built 19–20 September 2026. The ROS 2 rover still runs on `main`
+in `RoboticsGG/almondmatcha`, the fallback — this repository's `origin` has
+no `main` branch of its own.
 
 ---
 
@@ -198,8 +199,8 @@ without the hardware guarantee that a count can never be missed under load.
 **`docs/CONTROL_LAW.md` describes a law the code never implemented.** It
 documents a full PID (`k_e1`, `k_e2`, `k_p`, `k_i`, `k_d`, `k_ff`); the
 actual ROS 2 node had no PID at all. The port followed the code. This drift
-predates the rewrite and exists on `main` too — the document now carries a
-banner saying so.
+predates the rewrite and exists on `main` in `RoboticsGG/almondmatcha` too —
+the document now carries a banner saying so.
 
 ---
 
@@ -239,6 +240,9 @@ control laws (phase 2 and 3 — the trait exists so they are additions).
 | [CONTROL_LAW.md](CONTROL_LAW.md) | Steering and speed derivation. ROS 2 era — see the warning above. |
 | [CSV_LOGGING.md](CSV_LOGGING.md) | Log schemas. ROS 2 era. |
 
-The ROS 2 tree itself was removed from this branch on 20 September 2026 once
-the replay gate passed and the parity oracle was vendored. It survives in
-full on `main` and in this branch's history: `git show main:<path>`.
+The ROS 2 tree itself was removed from this repository on 20 September 2026
+once the replay gate passed and the parity oracle was vendored. It survives
+in full on `main` in the ROS 2 fallback repository, `RoboticsGG/almondmatcha`
+— this repository's `origin` has no `main` branch — and in this repository's
+own history from before the split:
+`git show roboticsgg-almondmatcha/main:<path>`.

@@ -9,8 +9,9 @@ the thing that would have failed if it were false. `RUST_REWRITE_PLAN.md`
 perception pipeline nor the control law has ever driven the actual rover.**
 Every result below came from a developer laptop. The Raspberry Pi, both
 NUCLEO-F767ZI boards, the Jetson and the drivetrain are all still running
-whatever `main` was running last — nothing from this branch has been flashed
-or deployed. The rover is not ready to drive, and nothing below changes that.
+whatever the ROS 2 `main` was running last — that branch now lives only in
+`RoboticsGG/almondmatcha`, not in this repository — nothing from this branch
+has been flashed or deployed. The rover is not ready to drive, and nothing below changes that.
 
 Three kinds of confidence appear below and must not be blurred: **proven**
 (a test exists that fails if the claim is false, and it ran), **built and
@@ -40,7 +41,8 @@ builds, and it passes tests on a laptop.
 
 ## 2. Component status
 
-Carried over from `RUST_REWRITE_PLAN.md` §13.1, re-verified for this
+Carried over from the status table `RUST_REWRITE_PLAN.md` §13 used to hold
+(now split into this file and `STATUS_OPEN.md`), re-verified for this
 document. The **Evidence** column is the point: every "done" names the test
 or artefact that backs it, not just an assertion that it exists.
 
@@ -60,9 +62,9 @@ or artefact that backs it, not just an assertion that it exists.
 | `rover-runs` | **done** | the `run_NNN_<stamp>/` convention, shared by `rover-telemetry` and `ground-station` rather than copy-pasted into each. |
 | `rover-doctor` | **done** | preflight GO/NO-GO over 9 checks; verdict logic is a pure function over observations, 25 tests. Distinguishes NOT SEEN from NO-GO and never reports GO on missing data. |
 | `tools/replay` | **done** | **the §12 gate.** Synthetic trace + `legacy.rs` oracle. PASS at the 3.0° tolerance (rmse 1.349°, 267 rows compared); deliberately verified to FAIL at 0.5°, so the harness demonstrably has teeth. |
-| `perception/wire.py` | **done** | 54 tests green against the Rust fixtures — the two languages provably agree on every byte. |
-| `perception/lane.py` | **done** | behaviour-preserving port, **parity proven** — see §3. |
-| `perception/{camera,bus,main}.py` | **done** | one process replacing `camera_stream_node` + `lane_detection_node`. End-to-end verified: 20 frames in, 20 `LaneMeasurement` out, seq monotonic, decoded by `wire.py`, clean exit. |
+| `perception/rover_perception/wire.py` | **done** | 54 tests green against the Rust fixtures — the two languages provably agree on every byte. |
+| `perception/rover_perception/lane.py` | **done** | behaviour-preserving port, **parity proven** — see §3. |
+| `perception/rover_perception/{camera,bus,main}.py` | **done** | one process replacing `camera_stream_node` + `lane_detection_node`. End-to-end verified: 20 frames in, 20 `LaneMeasurement` out, seq monotonic, decoded by `wire.py`, clean exit. |
 | `firmware/chassis` | **builds** | 69,928 B flash (3.3%), 18,480 B RAM (3.5%). Clippy clean. POST + reset cause + PHY diagnostics incl. ANAR/strap check. **Never run on hardware.** |
 | `firmware/sensors` | **builds** | 58,932 B flash (2.8%), 18,648 B RAM (3.6%). Clippy clean. POST + reset cause + PHY diagnostics incl. ANAR/strap check. **Never run on hardware.** |
 
@@ -70,7 +72,7 @@ or artefact that backs it, not just an assertion that it exists.
 
 ## 3. Why the lane detector port is believable
 
-`perception/lane.py` is the one component where "ported carefully" isn't
+`perception/rover_perception/lane.py` is the one component where "ported carefully" isn't
 enough evidence, because the C++/rclpy node it replaces no longer exists in
 this repo to compare against by eye. What makes it **proven** rather than
 merely **believed** is `perception/tests/test_lane_parity.py` (9 tests, all
@@ -109,7 +111,7 @@ envelope wrapping every message, not itself a `Wire` type but given its own
 fixture because framing bugs are exactly what this check exists to catch —
 that's **18 golden fixtures** in `testdata/*.bin`. Each is generated once
 from Rust and checked from both ends: Rust's own round-trip and
-golden-fixture tests decode, re-encode and compare bytes; `perception/wire.py`'s
+golden-fixture tests decode, re-encode and compare bytes; `perception/rover_perception/wire.py`'s
 54 tests decode the same files independently and check the resulting field
 values. Both sides agreeing with a byte file neither wrote at test time is
 what makes this cross-language rather than two languages testing themselves.
@@ -185,9 +187,11 @@ along with the code.
 Nothing is actually gone: everything removed was tracked and committed
 first — verified beforehand that no untracked or ignored file, and no
 `runs/`, CSV, bag or video, lived under the tree — so it's recoverable via
-`git show main:<path>` or this branch's own history. Durable knowledge was
-harvested first into `docs/HARDWARE.md`. `ws_spresense` was left untouched,
-by instruction, and still exists on this branch.
+`git show roboticsgg-almondmatcha/main:<path>` (this repository's `origin`
+has no `main`; that remote is the ROS 2 fallback, `RoboticsGG/almondmatcha`)
+or this branch's own history. Durable knowledge was harvested first into
+`docs/HARDWARE.md`. `ws_spresense` was left untouched, by instruction, and
+still exists on this branch.
 
 ---
 

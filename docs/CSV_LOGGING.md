@@ -224,8 +224,9 @@ otherwise computed and discarded these values internally with no external trace.
 | `PID_Output_Pct` | float32 | % duty | Final output (feedforward + PID trim) before the operator safety cap — compare against `chassis_cmd.csv`'s `SPD_Msg`, which is this value *after* the cap |
 
 Used to tune `speed_kp`/`speed_ki`/`speed_kd` and `max_ticks_per_sec` in
-`ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml` by
-plotting `Target_TPS` vs `Measured_Avg_TPS` and `Error_Pct` over time.
+`ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml`
+(deleted with the ROS 2 tree) by plotting `Target_TPS` vs `Measured_Avg_TPS`
+and `Error_Pct` over time.
 
 `PID_Output_Pct - target_speed_pct` is the trim the loop was applying: near
 zero meant the feedforward alone was right; persistently large meant the
@@ -374,9 +375,11 @@ Both RPi and Jetson used synchronized run numbering:
 
 None of the commands below run on branch `rs` — `ws_rpi/`, `ws_jetson/`,
 `ws_base/` and the launch scripts they reference were all removed in the ROS
-2 tree deletion. Recover them with, for example,
-`git show main:ws_rpi/launch_rover_tmux.sh`, or `git checkout main` to run
-them for real.
+2 tree deletion. Recover them from the ROS 2 fallback repository,
+`RoboticsGG/almondmatcha`'s `main` branch — this repository's `origin` has no
+`main` at all — with, for example,
+`git show roboticsgg-almondmatcha/main:ws_rpi/launch_rover_tmux.sh`, or clone
+that repository and check out its `main` to run them for real.
 
 ### RPi (ws_rpi)
 

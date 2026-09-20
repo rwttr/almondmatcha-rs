@@ -300,11 +300,13 @@ fn health_bits_check(obs: &Observations) -> CheckResult {
 
 /// **This check fails today, on purpose.** `config/rover.toml`'s
 /// `[drivetrain] metres_per_tick` is `0.0` — the drivetrain has never been
-/// calibrated (`docs/RUST_REWRITE_PLAN.md` §2.6). That is correct behaviour,
-/// not a bug in this tool: `speed_mps` everywhere downstream is meaningless
-/// until Procedures A and B in that section are run, and there is no flag to
-/// skip this check, because a silenced calibration warning is worse than a
-/// GO nobody should trust.
+/// calibrated. `docs/CALIBRATION.md` is the step-by-step procedure;
+/// `docs/RUST_REWRITE_PLAN.md` §2.6 is the reasoning behind it (why the
+/// constant isn't in this repo, the 2×/4× decoding trap, the maths). That is
+/// correct behaviour, not a bug in this tool: `speed_mps` everywhere
+/// downstream is meaningless until `docs/CALIBRATION.md`'s procedures are
+/// run, and there is no flag to skip this check, because a silenced
+/// calibration warning is worse than a GO nobody should trust.
 fn drivetrain_check(cfg: &DoctorConfig) -> CheckResult {
     if cfg.drivetrain.metres_per_tick > 0.0 {
         CheckResult {
@@ -320,9 +322,10 @@ fn drivetrain_check(cfg: &DoctorConfig) -> CheckResult {
             name: "drivetrain calibrated",
             verdict: Verdict::NoGo,
             detail: "metres_per_tick = 0.0 in [drivetrain] -- the drivetrain has never been \
-                     calibrated. Run Procedures A and B in docs/RUST_REWRITE_PLAN.md \
-                     section 2.6 before trusting speed_mps or driving autonomously. \
-                     There is no override for this check."
+                     calibrated. Run the procedures in docs/CALIBRATION.md before trusting \
+                     speed_mps or driving autonomously (the reasoning behind them is in \
+                     docs/RUST_REWRITE_PLAN.md section 2.6). There is no override for \
+                     this check."
                 .to_string(),
         }
     }
@@ -651,6 +654,7 @@ mod tests {
         let results = evaluate(&healthy_observations(), &cfg);
         let r = find(&results, "drivetrain calibrated");
         assert_eq!(r.verdict, Verdict::NoGo);
+        assert!(r.detail.contains("docs/CALIBRATION.md"));
         assert!(r.detail.contains("RUST_REWRITE_PLAN.md"));
         assert!(r.detail.contains("2.6"));
     }

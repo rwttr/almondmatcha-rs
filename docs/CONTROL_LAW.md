@@ -11,7 +11,7 @@
 > `k_d`, `k_ff`) that `rover_kinematic_control_node.py` never actually
 > implemented.** The port in `crates/rover-control/src/guide.rs` follows the
 > code, not this document. That drift predates the rewrite and exists on
-> `main` too — see `REWRITE_SUMMARY.md` §7.
+> `main` in `RoboticsGG/almondmatcha` too — see `REWRITE_SUMMARY.md` §7.
 
 
 Steering and speed control law implemented across the vision (Jetson, D6/D5)
@@ -63,8 +63,8 @@ flowchart LR
 
 ## 1. Steering Control Law
 
-**File:** `ws_jetson/src/vision_navigation/vision_navigation/rover_kinematic_control_node.py`
-**Config:** `ws_jetson/src/vision_navigation/config/rover_kinematic_control_params.yaml`
+**File:** `ws_jetson/src/vision_navigation/vision_navigation/rover_kinematic_control_node.py` (deleted with the ROS 2 tree)
+**Config:** `ws_jetson/src/vision_navigation/config/rover_kinematic_control_params.yaml` (deleted with the ROS 2 tree)
 
 Feedback (PID on heading + lateral error) combined with feedforward
 (proportional to curve sharpness ahead), so the rover starts steering into a
@@ -203,9 +203,11 @@ show `curvature_ema` is clean and stable through the bends.
 
 > Recomputed 2026-08-04 for the corrected wheelbase (48.75 cm, was
 > documented as 50 cm). `regenerate_roi.py` (formerly in
-> `ws_jetson/src/vision_navigation/vision_navigation/`, its `compute_k_ff()`
-> did this recomputation) was deleted with the ROS 2 tree —
-> `git show main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py`
+> `ws_jetson/src/vision_navigation/vision_navigation/`, deleted with the ROS 2
+> tree, its `compute_k_ff()` did this recomputation) survives only on the
+> ROS 2 fallback repository, `RoboticsGG/almondmatcha`'s `main` branch — this
+> repository's `origin` has no `main` at all:
+> `git show roboticsgg-almondmatcha/main:ws_jetson/src/vision_navigation/vision_navigation/regenerate_roi.py`
 > recovers it. If the wheelbase or `BEV_PX_PER_M` changes again, the formula
 > above is for **checking** a redone value by hand, not a substitute for
 > running the script.
@@ -244,8 +246,8 @@ details in §3).
 
 ### 2.2 Stage 2 — closed-loop duty correction (RPi)
 
-**File:** `ws_rpi/src/chassis_control/src/chassis_controller_node.cpp`
-**Config:** `ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml`
+**File:** `ws_rpi/src/chassis_control/src/chassis_controller_node.cpp` (deleted with the ROS 2 tree)
+**Config:** `ws_rpi/src/chassis_control/config/chassis_speed_control_params.yaml` (deleted with the ROS 2 tree)
 
 `v_cmd` is first clamped by the operator safety cap (`srv_spd_limit`):
 

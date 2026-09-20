@@ -106,7 +106,8 @@ BoardDiagnostics = ["telemetry", "base"]
 #
 # ⚠️  NOT YET CALIBRATED. The ROS 2 system had no metric speed anywhere and no
 #     record of encoder counts per revolution. Run both procedures in
-#     docs/RUST_REWRITE_PLAN.md §2.6 before trusting speed_mps.
+#     docs/CALIBRATION.md before trusting speed_mps — docs/RUST_REWRITE_PLAN.md
+#     §2.6 has the reasoning behind them.
 #
 # ⚠️  `decoding` MUST match the firmware. The mbed firmware attached interrupts
 #     to channel A only (rise + fall), giving 2x counts. Hardware quadrature
@@ -116,8 +117,8 @@ BoardDiagnostics = ["telemetry", "base"]
 [drivetrain]
 wheel_diameter_m = 0.125      # measured
 decoding         = "quadrature_4x"
-ticks_per_rev    = 0.0        # TODO: §2.6 Procedure A
-metres_per_tick  = 0.0        # TODO: §2.6 Procedure B — authoritative
+ticks_per_rev    = 0.0        # TODO: docs/CALIBRATION.md Procedure A
+metres_per_tick  = 0.0        # TODO: docs/CALIBRATION.md Procedure B — authoritative
 track_width_m    = 0.0        # TODO: measure; gives a second yaw-rate estimate
 wheelbase_m      = 0.4875     # measured, carried over from the ROS 2 system
 

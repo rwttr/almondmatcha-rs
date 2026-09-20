@@ -85,8 +85,9 @@ It does **not** prove field parity.
 
 No recorded ROS 2 run exists in this repository and none ever did — re-verified
 when the ROS 2 tree was removed. Producing a real baseline means checking out
-`main`, running the old stack, and recording one. Acceptance criterion 2 stays
-open until then.
+`main` in the ROS 2 fallback repository, `RoboticsGG/almondmatcha` — this
+repository's `origin` has no `main` branch at all — running the old stack, and
+recording one. Acceptance criterion 2 stays open until then.
 
 ---
 
@@ -106,7 +107,7 @@ they actually stand:
 | **EKF tuning eats time** | **Open.** "Seed `R` from measured variance" still requires a recording that does not exist. The other half — "log innovations from day one" — *is* done, via `EkfDebug`. |
 | **Magnetometer disappoints** | Deferred by design, behind an off-by-default flag. Not a concern. |
 | **Jetson Python bus drifts from Rust** | **Closed.** Golden-byte fixtures checked from both languages, both directions. |
-| **No ROS 2 escape hatch** | Accepted. `main` is intact. Criterion 10 ("`main` still builds") has not been re-verified recently. |
+| **No ROS 2 escape hatch** | Accepted. `main` is intact in `RoboticsGG/almondmatcha` (not this repository). Criterion 10 ("`main` still builds") has not been re-verified recently. |
 
 **Three closed or mostly closed out of ten, and the largest is untouched.**
 That is not a failure of the rewrite — most of these were always going to close
@@ -255,6 +256,8 @@ are met.
 4. **Re-tune for D5 and D6 together**, on hardware, once the boards run. D5's
    fix alone is a 3.21× authority increase — this is the step that matters
    most now, not a formality.
-5. **Record a real baseline on `main`** (§1.4) if criterion 2 is to ever close.
+5. **Record a real baseline on `roboticsgg-almondmatcha/main`** (§1.4) if
+   criterion 2 is to ever close — that remote is the ROS 2 fallback; this
+   repository's `origin` has no `main`.
 
 `docs/FIELD_TEST.md` is the end-to-end procedure once steps 1–3 are done.
