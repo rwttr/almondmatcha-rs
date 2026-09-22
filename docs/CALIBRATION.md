@@ -31,9 +31,19 @@ PC.
 | Board | IP | ST-Link serial |
 |---|---|---|
 | Sensors (encoders live here) | `192.168.1.6` | `066DFF3932504E3043014542` |
-| Chassis | `192.168.1.2` | **⚠️ not recorded — capture it below** |
+| Chassis | `192.168.1.2` | `066AFF3932504E3043101915` |
 
-The sensors-board serial above is recovered from the old ROS 2 history on the
+Both serials above are recovered from the user's own local shell aliases
+(`flash_chassis` / `flash_sensors`, OpenOCD-based, still targeting the old
+`mros2-mbed-*` build outputs), not from a fresh `probe-rs list` capture on
+this repo's toolchain — but they name the same physical boards, since the
+ST-Link serial lives in the debugger hardware, not the firmware. The sensors
+value matches the one already recovered from git history below, which is a
+useful cross-check. The chassis value has no other corroborating source in
+this repo's history (see below) — if it misflashes at the bench, re-capture
+it with `probe-rs list` as originally planned and correct this table.
+
+The sensors-board serial is also recovered from the old ROS 2 history on the
 `roboticsgg-almondmatcha` remote. The citation worth knowing is still live at
 the current tip of that remote's `main`:
 
@@ -54,11 +64,15 @@ Two further copies exist in the history but have since been dropped from
 `adapter serial` spelling rather than `hla_serial` (see the footnote below).
 
 `066DFF3932504E3043014542` is the *only* ST-Link serial that appears anywhere
-in that history: every commit was grepped for any bare 24-hex-character
+in that git history: every commit was grepped for any bare 24-hex-character
 ST-Link serial and exactly one distinct value came back. The chassis board
-was always flashed as "the default ST-LINK", with no serial ever written
-down. Do not invent one; capture it the first time both boards are on the
-bench together:
+was always flashed there as "the default ST-LINK", with no serial ever
+written down in-repo — `066AFF3932504E3043101915` above comes from the
+user's local `flash_chassis` alias instead, not from this repo's history.
+
+If the bench session hasn't confirmed it yet, treat the chassis row as
+unverified and capture it directly the first time both boards are on the
+bench together, as a sanity check against the alias value:
 
 ```sh
 # Unplug the sensors board (or note both serials and match by elimination).
@@ -66,12 +80,11 @@ bench together:
 probe-rs list
 ```
 
-Record the 24-hex-character serial that comes back into the table above.
-Once you have it, everything below that flashes "the chassis board" should
-name it explicitly with `--probe`, for the same reason the sensors board's
-serial matters: with both boards plugged in, `probe-rs run` with no `--probe`
-picks whichever one it enumerates first, and that is not guaranteed to be
-stable across replugging.
+Everything below that flashes "the chassis board" should name the serial
+explicitly with `--probe`, for the same reason the sensors board's serial
+matters: with both boards plugged in, `probe-rs run` with no `--probe` picks
+whichever one it enumerates first, and that is not guaranteed to be stable
+across replugging.
 
 > Footnote for anyone cross-referencing the old OpenOCD-era notes: OpenOCD
 > renamed this option between versions — `hla_serial` in older notes,
