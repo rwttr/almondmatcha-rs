@@ -575,15 +575,11 @@ placed at known ground coordinates, then projected into the image:
   *something* red and *something* white-on-red to split against — a
   different track color scheme would need re-deriving which channel
   discriminates it, not just new numbers.
-- **§2 is validated against the D415, but only under overcast light.** It was
-  *designed* against a mobile-phone photo (no D415 footage existed then) and
-  later validated against two D415 recordings on 2026-08-06 — see §2's
-  "Validated against real D415 footage". Two things are still open from that
-  validation: `SEGMENTATION_MORPH_KERNEL_PX` and `MIN_LINE_COMPONENT_AREA_PX`
-  are still picked by eye against the phone photo rather than re-derived from
-  a D415 measurement, and only one lighting condition (overcast) has been
-  exercised. Re-check under strong directional sun before trusting it
-  unattended.
+- **§2 is validated against the D415, but only under overcast light**, and
+  `SEGMENTATION_MORPH_KERNEL_PX` / `MIN_LINE_COMPONENT_AREA_PX` are still
+  picked by eye against the original phone photo rather than re-derived from a
+  D415 measurement. §2's "Validated against real D415 footage" has both in
+  full. Re-check under strong directional sun before trusting it unattended.
 - **A sun-glare patch on the track can still cost partial detection.** The
   color stage cannot separate a bright, desaturated glare reflection from
   real white paint when the two are genuinely close in color — confirmed on

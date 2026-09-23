@@ -29,10 +29,13 @@ are measured. The estimator disables odometry rather than divide by zero, and
 the speed PID works in ticks/sec so it is unaffected — but every `speed_mps`
 in every log is meaningless, and acceptance criterion 6 cannot be attempted.
 
-Procedures A and B in `RUST_REWRITE_PLAN.md` §2.6. About twenty minutes with a
-tape measure. `docs/HARDWARE.md` §3 records the expected answer (~1500
-ticks/rev at this firmware's 4× decoding) so the run confirms or contradicts
-something rather than producing a number with nothing to check it against.
+`docs/CALIBRATION.md` is the step-by-step for Procedures A and B — probe-rs
+setup, which ST-Link is which board, the exact flash commands, the log line to
+read; `RUST_REWRITE_PLAN.md` §2.6 is the reasoning behind them. About twenty
+minutes with a tape measure. `docs/HARDWARE.md` §3 records the expected answer
+(~1500 ticks/rev at this firmware's 4× decoding) so the run confirms or
+contradicts something rather than producing a number with nothing to check it
+against.
 
 ⚠️ Calibrate against **4×** decoding. A constant measured against the old 2×
 firmware reads exactly double the true speed.

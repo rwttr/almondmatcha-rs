@@ -110,9 +110,12 @@ BoardDiagnostics = ["telemetry", "base"]
 #     §2.6 has the reasoning behind them.
 #
 # ⚠️  `decoding` MUST match the firmware. The mbed firmware attached interrupts
-#     to channel A only (rise + fall), giving 2x counts. Hardware quadrature
-#     timer mode gives 4x. Switching modes DOUBLES every tick count and halves
-#     metres_per_tick. Calibrate after choosing, never before.
+#     to channel A only (rise + fall), giving 2x counts. This firmware decodes
+#     every edge on all four channels: 4x. A constant measured against the old
+#     firmware and pasted in reads exactly double the true speed. (Hardware
+#     quadrature timer mode would give the same 4x for free, but it is
+#     impossible on this harness -- docs/HARDWARE.md §5, docs/RUST_REWRITE_PLAN.md
+#     §5.4 -- so there is no mode to choose, only the one to calibrate against.)
 # ---------------------------------------------------------------------------
 [drivetrain]
 wheel_diameter_m = 0.125      # measured

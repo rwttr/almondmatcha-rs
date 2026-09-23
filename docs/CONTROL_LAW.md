@@ -77,13 +77,13 @@ curve before heading/offset error alone would build up enough to react.
 | `κ` | curvature | Parabola coefficient A of the fitted lane, `x = A·y² + B·y + C`, in the fit's native BEV pixels (1/px) — NOT converted to a real 1/m arc on the wire. Metric: `R = 1/(2·A·S)`, `S` = 200 px/m |
 | `θ` | theta_deg | Heading error, real degrees (+ = needs right turn) |
 | `b` | b_offset | Lateral offset from lane center, **metres** (converted from the fit's native BEV pixels by `lane_detector.py` before publishing — unlike `κ`, which is left in pixels for consumers to convert) |
+| `detected` | detected_flag | Raw vision detection validity |
 
 `θ` and `b` are physical quantities, not canvas-dependent numbers — the
 bird's-eye view is isotropic. See [VISION_PIPELINE.md](VISION_PIPELINE.md)
 for how they are produced. Note that `b` and `κ` are measured at a **1.22 m
 lookahead ahead of the front axle**, not at the rover, so they encode partly
 the same information; tune `k_p` on `θ` first, then `k_e2`, then `k_ff`.
-| `detected` | detected_flag | Raw vision detection validity |
 
 Each raw input is clamped before filtering to keep a single bad frame from
 spiking the low-pass state: `θ ∈ [-35°, 35°]`, `b ∈ [-0.50, 0.50] m`.

@@ -86,8 +86,9 @@ are all `0.0`. Until they are measured there is **no metric speed anywhere in
 the system**: the estimator disables odometry rather than dividing by zero,
 and every `speed_mps` in every log is meaningless.
 
-Run both procedures in `docs/RUST_REWRITE_PLAN.md` §2.6 — about twenty minutes
-with a tape measure. Procedure A gives ticks per revolution; Procedure B gives
+Run both procedures in `docs/CALIBRATION.md` — about twenty minutes with a
+tape measure (`docs/RUST_REWRITE_PLAN.md` §2.6 is the reasoning behind them,
+not the steps). Procedure A gives ticks per revolution; Procedure B gives
 metres per tick on the actual field surface, and B is the one that goes into
 production.
 
@@ -164,7 +165,12 @@ chassis board and spend an hour on it.
 | Board | IP | ST-Link serial |
 |---|---|---|
 | Sensors | `192.168.1.6` | `066DFF3932504E3043014542` |
-| Chassis | `192.168.1.2` | ⚠️ never recorded — capture with `probe-rs list`, see `docs/CALIBRATION.md` §1 |
+| Chassis | `192.168.1.2` | `066AFF3932504E3043101915` |
+
+The chassis serial comes from the old OpenOCD flashing aliases, not from a
+`probe-rs list` capture — `docs/CALIBRATION.md` §1 has the provenance. If a
+flash lands on the wrong board, re-capture both with `probe-rs list` and
+correct §1's table.
 
 ```sh
 cd firmware/sensors && cargo build --release
@@ -172,7 +178,7 @@ probe-rs run --chip STM32F767ZITx --probe 0483:374b:066DFF3932504E3043014542 \
     target/thumbv7em-none-eabihf/release/sensors-fw
 
 cd ../chassis && cargo build --release
-probe-rs run --chip STM32F767ZITx --probe 0483:374b:<chassis-serial> \
+probe-rs run --chip STM32F767ZITx --probe 0483:374b:066AFF3932504E3043101915 \
     target/thumbv7em-none-eabihf/release/chassis-fw
 ```
 

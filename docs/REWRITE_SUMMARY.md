@@ -2,8 +2,8 @@
 
 **What this is:** a short account of what branch `rs` did to this project and
 why, for someone who needs the shape of it without reading
-[RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md)'s twelve hundred lines. For
-current status and evidence, see [STATUS_DONE.md](STATUS_DONE.md) and
+[RUST_REWRITE_PLAN.md](RUST_REWRITE_PLAN.md) in full. For current status and
+evidence, see [STATUS_DONE.md](STATUS_DONE.md) and
 [STATUS_OPEN.md](STATUS_OPEN.md) — this document covers architecture and
 rationale, not day-to-day state.
 
@@ -236,6 +236,8 @@ control laws (phase 2 and 3 — the trait exists so they are additions).
 | [STATUS_DONE.md](STATUS_DONE.md) | What is built, and the evidence for it. Authoritative over any status claim elsewhere. |
 | [STATUS_OPEN.md](STATUS_OPEN.md) | What remains and what to worry about. Authoritative over any status claim elsewhere. |
 | [HARDWARE.md](HARDWARE.md) | Machines, sensors, both pin maps, calibration status. |
+| [CALIBRATION.md](CALIBRATION.md) | The drivetrain calibration procedure — probe-rs setup, which ST-Link is which board, Procedures A and B. |
+| [FIELD_TEST.md](FIELD_TEST.md) | Bench to logged field run, and getting the data back. |
 | [VISION_PIPELINE.md](VISION_PIPELINE.md) | How a camera frame becomes lane geometry. ROS 2 era, still the reference. |
 | [CONTROL_LAW.md](CONTROL_LAW.md) | Steering and speed derivation. ROS 2 era — see the warning above. |
 | [CSV_LOGGING.md](CSV_LOGGING.md) | Log schemas. ROS 2 era. |

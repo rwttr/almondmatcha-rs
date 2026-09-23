@@ -10,9 +10,10 @@ untouched. (This branch has since become its own repository — `main` now
 lives only in `RoboticsGG/almondmatcha`; this repository's `origin` has no
 `main`.)
 
-**Rev 3 adds §13, an implementation status table.** Everything above it is the
-plan; §13 is what actually exists on branch `rs`. Where the two disagree, §13
-is right and the plan text is aspirational.
+**Rev 3 added §13, the record of how the implementation actually diverged from
+this plan.** Everything above it is the plan; §13 and the status documents it
+points to are what exists on branch `rs`. Where the two disagree, §13 is right
+and the plan text is aspirational.
 
 **Rev 2 changes:** §2.6 metric speed calibration (encoder spec is *not* in the
 repo — measurement procedure supplied), §5.2 full watchdog specification, §6 new
@@ -171,10 +172,8 @@ Runs free every time the rover pauses.
 - `nalgebra` `SMatrix<f32, 5, 5>` — no allocation, `no_std` capable.
 - Ship as a **pure library** (`rover-estimator`), no I/O, driven by `tools/replay`
   over existing `runs/*.csv`. Must be tunable on a laptop. (No such `runs/*.csv`
-  exists in this repository, nor ever did — `STATUS_OPEN.md` §1.4. This is not merely
-  open: a run must first be produced on `main` in the ROS 2 fallback
-  repository, `RoboticsGG/almondmatcha` — this repository's `origin` has no
-  `main` — before it is achievable.)
+  has ever existed here — §12 criterion 2 and `STATUS_OPEN.md` §1.4 for what
+  producing one would take.)
 
 ### 2.4 Heading observability — and what the magnetometer does about it
 
@@ -223,25 +222,23 @@ requirement for first field runs.
 
 ### 2.6 Metric speed — the encoder constant is NOT in this repo
 
-You asked me to check the docs for ticks per wheel revolution. **It is not recorded
-anywhere.** I searched `docs/`, `ws_rpi/`, the firmware tree and all READMEs: no
-PPR, no CPR, no gear ratio, no motor part number. The only related constant is
-`max_ticks_per_sec: 1000.0` in `chassis_speed_control_params.yaml`, explicitly
-labelled `PLACEHOLDER`, with `use_closed_loop_speed: false` as the shipped default.
-There is no metric speed anywhere in the system today.
+Ticks per wheel revolution is **not recorded anywhere** — not in this repo, not
+in the ROS 2 tree it replaced: no PPR, no CPR, no gear ratio, no motor part
+number. The only related constant was `max_ticks_per_sec: 1000.0` in the old
+`chassis_speed_control_params.yaml`, explicitly labelled `PLACEHOLDER`, with
+`use_closed_loop_speed: false` as the shipped default. There is still no metric
+speed anywhere in the system.
 
-**One thing I *can* tell you from the code, and it matters:** the current firmware
-is **2× decoding, not 4×**. In `encoder_control.cpp` only channel A has interrupts
-attached (`rise` + `fall`); channel B is read only as a direction input. So you get
-2 counts per quadrature cycle.
+> ⚠️ **The 2×/4× trap.** The mros2 firmware attached interrupts to channel A
+> only (`rise` + `fall`) and read channel B purely as a direction input — 2
+> counts per quadrature cycle. **This firmware decodes every edge on all four
+> channels: 4×, so every tick count doubles.** A constant measured against the
+> old firmware and pasted in reads exactly double the true speed. Record which
+> mode the constant belongs to in `config/rover.toml` — `decoding =
+> "quadrature_4x"`. (Hardware quadrature timer mode would give the same 4× for
+> free, but it is impossible on this harness; §5.4 has the pin analysis.)
 
-> ⚠️ **If you move to STM32 hardware quadrature timer mode (recommended, §5.4),
-> you get 4× decoding and every tick count doubles.** Calibrate *after* choosing
-> the decoding mode, and record which mode the constant belongs to in
-> `config/rover.toml`. Getting this wrong makes the rover run at half or double
-> the commanded speed.
-
-**The maths, with your 12.5 cm wheel:**
+**The maths, with the 12.5 cm wheel:**
 
 ```
 wheel_circumference = pi * 0.125 m           = 0.39270 m / revolution
@@ -249,46 +246,15 @@ metres_per_tick     = 0.39270 / ticks_per_revolution
 speed_mps           = ticks_per_second * metres_per_tick
 ```
 
-**Procedure A (ticks per revolution) and Procedure B (metres per tick,
-authoritative)** are both real, run-it-now procedures — the full step-by-step
-lives in `docs/CALIBRATION.md`: which ST-Link goes to which board, the exact
-`cargo`/`probe-rs` build-and-flash commands, the defmt log line to read, and
-the direction-sign check. That document replaced the mechanical steps this
-section used to give directly, which had gone stale — they cited logging to
-`chassis_sensors.csv`, a ROS 2 filename, and this stack does not log encoders
-to CSV at all (`docs/CSV_LOGGING.md`). The reasoning above (why the constant
-isn't in this repo, the 2×/4× trap, the maths) still belongs here; the how-to
-does not.
-
-In outline: **A** jacks one drive wheel clear of the ground and turns it by
-hand, forward, exactly ten revolutions, reading the tick count before and
-after — `ticks_per_revolution = (end - start) / 10`, repeated for the other
-wheel, which should agree within a few percent. Expect roughly 15,000 counts
-for the ten turns (~1500 ticks/rev at this firmware's 4× decoding —
-`docs/HARDWARE.md` §3 has the full context: a recollection of the ROS 2
-system, not a measurement). ~7,500 means the board is still decoding at 2×:
-stop and fix that before going further. **B** marks a real 10.00 m line on
-the field surface, drives the rover open-loop along it, and takes
-`metres_per_tick = 10.00 / mean(total_ticks_left, total_ticks_right)` over
-three trials, averaged.
-
-Use **B** for `metres_per_tick` in production; use **A** to sanity-check it and to
-have ticks-per-revolution on its own. If they disagree by more than ~5%, suspect slip.
-
-Store in `config/rover.toml`:
-
-```toml
-[drivetrain]
-wheel_diameter_m   = 0.125
-decoding           = "quadrature_4x"   # or "edge_2x" — MUST match the firmware
-ticks_per_rev      = 0.0               # from Procedure A
-metres_per_tick    = 0.0               # from Procedure B  <- authoritative
-track_width_m      = 0.0               # measure: needed for differential yaw rate
-```
-
-`track_width_m` is worth measuring at the same time — with left/right tick rates
-you get a second yaw-rate estimate, which is a useful cross-check against the gyro
-and costs nothing.
+**The procedures themselves live in `docs/CALIBRATION.md`** — Procedure A
+(ticks per revolution, on the bench) and Procedure B (metres per tick on the
+real surface, authoritative), with the ST-Link serials, the build-and-flash
+commands, the defmt log line to read, the counts to expect, and the
+direction-sign check. This section is the reasoning; that document is the
+how-to. Use **B** for `metres_per_tick` in production and **A** to sanity-check
+it; disagreement beyond ~5% suggests slip. `track_width_m` is worth measuring
+in the same pass — left/right tick rates then give a second yaw-rate estimate
+to cross-check the gyro, and it costs nothing.
 
 **This blocks the estimator.** Do it early; it is twenty minutes of work.
 
@@ -903,11 +869,8 @@ offset.
 **Required before hardware:** `tools/replay` must drive `rover-estimator` and
 `StaticGain` from existing `runs/*.csv` and match recorded ROS 2 behaviour within
 tolerance. No motor turns until that passes. **No such `runs/*.csv` exists, and
-none ever did (`STATUS_OPEN.md` §1.4).** This is not merely open — it requires first
-checking out `main` in the ROS 2 fallback repository,
-`RoboticsGG/almondmatcha` (this repository's `origin` has no `main`) and
-recording a run there, since the ROS 2 tree that could produce one is gone
-from this branch.
+none ever did** — §12 criterion 2 has what producing one would take, and
+`STATUS_OPEN.md` §1.4 is authoritative on where it stands.
 
 ---
 
