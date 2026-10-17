@@ -78,7 +78,7 @@ impl UdpLink {
 
     /// Look up which configured peer a datagram's source address belongs to.
     ///
-    /// A linear scan over five entries; a `HashMap<SocketAddr, PeerId>` would
+    /// A linear scan over a handful of entries (one per [`PeerId`]); a `HashMap<SocketAddr, PeerId>` would
     /// be the "correct" reverse index for a bigger table, but at this size it
     /// would just be a second collection to keep in sync with `peers`.
     fn peer_of(&self, addr: SocketAddr) -> Option<PeerId> {
@@ -146,7 +146,18 @@ impl Link for UdpLink {
         // reborrow for `recv_from` has already ended by the time a later
         // iteration reads the buffer back. Two steps sidesteps the question
         // instead of fighting it.
-        let (peer, n) = self.recv_one()?;
+        //
+        // A datagram from a known peer that is too short to hold a header is
+        // skipped, not returned as `None`: `None` means "nothing waiting", and
+        // a caller polling once per tick would stop draining on it and leave
+        // every good frame queued behind the runt for a whole tick (or for
+        // good, if the runt repeats).
+        let (peer, n) = loop {
+            let (peer, n) = self.recv_one()?;
+            if Frame::parse(&self.buf[..n]).is_ok() {
+                break (peer, n);
+            }
+        };
         Frame::parse(&self.buf[..n]).ok().map(|frame| (peer, frame))
     }
 
@@ -210,6 +221,34 @@ mod tests {
         assert_eq!(peer, PeerId::Control);
         assert_eq!(seq, 7);
         assert_eq!(decoded, msg);
+    }
+
+    /// Regression for bug G: a runt datagram (shorter than a frame header)
+    /// from a known peer used to make `recv` return `None`, ending the
+    /// caller's drain with a good frame still queued behind it.
+    #[test]
+    fn recv_skips_a_runt_datagram_and_returns_the_frame_behind_it() {
+        let (a, mut b) = linked_pair();
+        let to = b.local_addr().unwrap();
+        a.socket.send_to(&[1, 2, 3], to).unwrap();
+        let mut buf = [0u8; rover_msgs::frame::MAX_FRAME_LEN];
+        let msg = ImuSample {
+            accel_mps2: [1.0; 3],
+            gyro_radps: [0.0; 3],
+            t_us: 9,
+        };
+        let n = encode_frame(&msg, 3, &mut buf);
+        a.socket.send_to(&buf[..n], to).unwrap();
+
+        let mut seq = None;
+        for _ in 0..200 {
+            if let Some((_, frame)) = b.recv() {
+                seq = Some(frame.header.seq);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(seq, Some(3), "frame behind the runt was never returned");
     }
 
     #[test]

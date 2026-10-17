@@ -142,6 +142,22 @@ def test_loads_the_real_repo_config():
     assert cfg.mirror() is None
 
 
+def test_route_key_that_is_not_a_message_name_is_rejected():
+    # Mirrors rover-bus's `route_key_that_is_not_a_message_name_is_rejected`:
+    # a typo'd message name used to route nothing, silently.
+    bad = SAMPLE.replace("LaneMeasurement = ", "LaneMeasurment = ")
+    with pytest.raises(ConfigError, match="LaneMeasurment"):
+        BusConfig.parse(bad)
+
+
+def test_shipped_config_has_doctor_service_and_distinct_addresses():
+    cfg = BusConfig.load(find_config_path())
+    assert cfg.addr_of("doctor") == ("192.168.1.10", 7031)
+    assert cfg.addr_of("doctor") != cfg.addr_of("base")
+    addrs = list(cfg.services.values())
+    assert len(addrs) == len(set(addrs)) == 8
+
+
 # ===========================================================================
 # Bus.publish -- real loopback UDP sockets
 # ===========================================================================

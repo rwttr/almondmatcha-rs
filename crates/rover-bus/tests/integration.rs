@@ -50,11 +50,13 @@ fn command_handshake_and_stream_complete_over_real_udp_sockets() {
     let mut base_bus = Bus::new(base_link, config);
 
     // Base: queue a command. It will retransmit this at its configured
-    // interval until `Telemetry::last_cmd_seq` echoes it back.
+    // interval until `Telemetry::{last_cmd_session, last_cmd_seq}` acks it. (Real
+    // acks come from the consumers' `CommandAck`s via rover-telemetry; this
+    // test stands in the rover's own receiver for that whole path.)
     let mut cmd_tx = CommandSender::new(Duration::from_millis(20));
     cmd_tx.set(Command::SetSpeedLimit(42));
 
-    // Rover: applies whatever command frame shows up, newest-by-cmd_seq-wins.
+    // Rover: applies whatever command frame shows up, newest-by-(session, cmd_seq)-wins.
     let mut cmd_rx = CommandReceiver::new();
 
     let mut stream_seen = false;
@@ -70,7 +72,7 @@ fn command_handshake_and_stream_complete_over_real_udp_sockets() {
         }
         base_bus.poll();
         if let Some(telemetry) = base_bus.latest::<Telemetry>() {
-            cmd_tx.on_telemetry(telemetry.last_cmd_seq);
+            cmd_tx.on_telemetry(telemetry.last_cmd_session, telemetry.last_cmd_seq);
         }
         if base_bus.latest::<ImuSample>().is_some() {
             stream_seen = true;
@@ -103,7 +105,8 @@ fn command_handshake_and_stream_complete_over_real_udp_sockets() {
                 power: PowerSample::default(),
                 rtk: GnssFix::default(),
                 backup: GnssFix::default(),
-                last_cmd_seq: cmd_rx.last_applied(),
+                last_cmd_session: cmd_rx.ack().session,
+                last_cmd_seq: cmd_rx.ack().cmd_seq,
                 health: HealthBits::default(),
             })
             .expect("rpi -> base send");
@@ -131,7 +134,7 @@ fn command_handshake_and_stream_complete_over_real_udp_sockets() {
     );
     assert_eq!(
         cmd_rx.last_applied(),
-        cmd_tx.cmd_seq(),
+        Some((cmd_tx.session(), cmd_tx.cmd_seq())),
         "rover applied a different cmd_seq than the base thinks it acked"
     );
 

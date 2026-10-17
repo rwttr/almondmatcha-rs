@@ -38,17 +38,18 @@
 //!    guessing from `FixQuality` (the old `gnss_source::classify` heuristic,
 //!    now deleted).
 //!
-//! # A remaining gap
+//! # Command acknowledgement
 //!
-//! **`last_cmd_seq` is computed independently, not shared via IPC.** This
-//! process runs its own `rover_bus::CommandReceiver`, fed by whatever
-//! `CommandFrame`s it itself receives (routed to `telemetry` alongside
-//! `control` and `navigation` — see `config/rover.toml`). `CommandReceiver::
-//! apply` is a pure function of the sequence of frames seen so far, so as
-//! long as every process observes the same frames, they all agree on
-//! `last_applied` without talking to each other — no shared state needed for
-//! *this* value specifically.
+//! **`last_cmd_session`/`last_cmd_seq` come from the consumers, not from this
+//! process.** This process used to run its own `CommandReceiver` on its own
+//! copy of every `CommandFrame` and echo that, which acked commands
+//! `rover-control` and `rover-navigation` might never have received. It no
+//! longer receives `CommandFrame` at all. Instead each consumer publishes a
+//! `CommandAck` of what it applied, and [`ack::AckTracker`] reports an ack in
+//! `Telemetry` only when both are fresh (< 2 s) and in the same session,
+//! carrying the older of the two sequence numbers — see its docs.
 
+mod ack;
 mod config;
 mod csv_fmt;
 mod csv_writer;
@@ -57,10 +58,10 @@ mod health;
 use csv_writer::CsvLogger;
 use health::stall::StallDetector;
 use health::{compute_health, BoardHealth, FeedAges};
-use rover_bus::{Bus, BusConfig, CommandReceiver};
+use rover_bus::{Bus, BusConfig};
 use rover_link::{PeerId, UdpLink};
 use rover_msgs::{
-    BoardDiagnostics, ChassisStatus, CommandFrame, GnssFix, GnssSource, MissionStatus, PowerSample,
+    BoardDiagnostics, ChassisStatus, CommandAck, GnssFix, GnssSource, MissionStatus, PowerSample,
     RoverState, SpeedLoopDebug, Telemetry,
 };
 use std::cell::RefCell;
@@ -112,7 +113,7 @@ struct SharedState {
     chassis_status: Option<ChassisStatus>,
     rtk_fix: GnssFix,
     backup_fix: GnssFix,
-    last_cmd_seq: u16,
+    acks: ack::AckTracker,
     stall_detected: bool,
 
     chassis_seen: Option<Instant>,
@@ -187,7 +188,6 @@ fn main() {
     let state = Rc::new(RefCell::new(SharedState::default()));
     let stall_detector = Rc::new(RefCell::new(StallDetector::new(telemetry_config.stall)));
     let board_health = Rc::new(RefCell::new(BoardHealth::new()));
-    let mut cmd_receiver = CommandReceiver::new();
 
     {
         let state = state.clone();
@@ -259,6 +259,13 @@ fn main() {
         });
     }
 
+    {
+        let state = state.clone();
+        bus.subscribe_from::<CommandAck>(move |peer, a| {
+            state.borrow_mut().acks.observe(peer, a, Instant::now());
+        });
+    }
+
     log::info!("rover-telemetry ready, binding {bind_addr}");
 
     let mut next_publish = Instant::now();
@@ -267,19 +274,13 @@ fn main() {
     loop {
         bus.poll();
 
-        if let Some(frame) = bus.latest::<CommandFrame>() {
-            // See gap 3 in the module doc comment: applied purely for its
-            // sequence-number bookkeeping, not to act on the command.
-            let _ = cmd_receiver.apply(frame);
-        }
-        state.borrow_mut().last_cmd_seq = cmd_receiver.last_applied();
-
         let now = Instant::now();
         if now >= next_publish {
             next_publish = now + TELEMETRY_INTERVAL;
             seq = seq.wrapping_add(1);
 
             let s = state.borrow();
+            let (last_cmd_session, last_cmd_seq) = s.acks.merged(now);
             let ages = FeedAges {
                 chassis_ms: s
                     .chassis_seen
@@ -310,7 +311,8 @@ fn main() {
                 power: s.power,
                 rtk: s.rtk_fix,
                 backup: s.backup_fix,
-                last_cmd_seq: s.last_cmd_seq,
+                last_cmd_session,
+                last_cmd_seq,
                 health,
             };
             drop(s);

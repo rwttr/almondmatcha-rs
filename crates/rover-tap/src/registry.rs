@@ -7,10 +7,11 @@
 //! is — because a sniffer that only understood one hard-coded message type
 //! would not replace `ros2 topic echo`.
 //!
-//! This list is hand-kept in step with `rover_msgs::types` (the same way
-//! `rover-msgs/tests/roundtrip.rs` keeps its own `all_types!` list in step);
-//! there is no way to enumerate `impl Wire` at runtime in Rust, so a new
-//! message type needs one line added here to show up in `rover-tap`.
+//! This list is hand-kept in step with `rover_msgs::types`; there is no way
+//! to enumerate `impl Wire` at runtime in Rust, so a new message type needs
+//! one line added here to show up in `rover-tap`. It used to silently fall
+//! behind (`BoardDiagnostics` was never added), so a test now checks every
+//! entry of `rover_msgs::ALL_MESSAGES` is registered.
 
 use rover_msgs::*;
 
@@ -27,13 +28,19 @@ pub struct Decoded {
 /// this build *does* know but whose body failed to decode (a truncated or
 /// corrupt frame). Either way there is nothing sensible to print.
 pub fn decode(type_id: u16, body: &[u8]) -> Option<Decoded> {
+    decode_known(type_id, body)?.ok()
+}
+
+/// Like [`decode`] but distinguishes "no such type registered" (`None`) from
+/// "registered, but the body did not decode" (`Some(Err)`).
+fn decode_known(type_id: u16, body: &[u8]) -> Option<Result<Decoded, DecodeError>> {
     macro_rules! try_type {
         ($t:ty) => {
             if type_id == <$t as Wire>::TYPE_ID {
-                return <$t as Wire>::decode(body).ok().map(|v| Decoded {
+                return Some(<$t as Wire>::decode(body).map(|v| Decoded {
                     name: <$t as Wire>::NAME,
                     rendered: format!("{v:?}"),
-                });
+                }));
             }
         };
     }
@@ -50,9 +57,11 @@ pub fn decode(type_id: u16, body: &[u8]) -> Option<Decoded> {
     try_type!(MissionGoal);
     try_type!(MissionStatus);
     try_type!(CommandFrame);
+    try_type!(CommandAck);
     try_type!(Telemetry);
     try_type!(SpeedLoopDebug);
     try_type!(EkfDebug);
+    try_type!(BoardDiagnostics);
     None
 }
 
@@ -71,6 +80,20 @@ mod tests {
         let decoded = decode(PowerSample::TYPE_ID, &buf).expect("PowerSample must be registered");
         assert_eq!(decoded.name, "PowerSample");
         assert!(decoded.rendered.contains("12.6"));
+    }
+
+    /// Regression for bug E: `BoardDiagnostics` was missing, and nothing
+    /// noticed. Every message type the crate defines must be decodable here.
+    #[test]
+    fn every_message_type_is_registered() {
+        for &(type_id, name) in ALL_MESSAGES {
+            let known = decode_known(type_id, &[0u8; 256]).unwrap_or_else(|| {
+                panic!("`{name}` (0x{type_id:04X}) is not registered in rover-tap")
+            });
+            if let Ok(d) = known {
+                assert_eq!(d.name, name);
+            }
+        }
     }
 
     #[test]

@@ -964,44 +964,74 @@ impl Command {
     }
 }
 
+/// Wrap-aware "`a` is strictly newer than `b`" for `u16` sequence numbers.
+///
+/// Treats the nearer half of the sequence space as "newer", the standard
+/// approach for wrapping counters: a value more than 32767 ahead is read as
+/// stale rather than as an enormous jump forward. Shared by the command
+/// receiver, the command sender's ack check and the telemetry ack merge so
+/// all three agree on what "newer" means.
+pub fn seq_is_newer(a: u16, b: u16) -> bool {
+    a != b && a.wrapping_sub(b) < 0x8000
+}
+
 /// A command from the base station, carried as an idempotent datagram.
 ///
 /// There is no request/response handshake and no connection. The base
-/// retransmits the same frame at about 1 Hz until it sees `cmd_seq` echoed
-/// back in [`Telemetry::last_cmd_seq`]; the rover applies any frame newer than
-/// the last one it applied and ignores repeats.
+/// retransmits the same frame at about 1 Hz until it sees it acknowledged in
+/// [`Telemetry::last_cmd_session`] / [`Telemetry::last_cmd_seq`] (which the
+/// telemetry node builds from the [`CommandAck`]s both consumers publish); the
+/// rover applies a frame that is new by `(session, cmd_seq)` and ignores
+/// repeats.
 ///
 /// This replaces the ROS 2 service and action clients. It is loss-tolerant,
 /// stateless, and works unchanged over a link that cannot carry TCP — which
 /// the LoRa base link cannot.
+///
+/// # Why `session`
+///
+/// `cmd_seq` alone is only ordered within one ground-station process. A
+/// restarted station begins again at 1 while the rovers remember some
+/// `last_applied = L`, so every command in `1..=L` looked stale and was
+/// dropped — including an EStop — while command `L` got a false ack. The
+/// station now picks a random non-zero `session` at start; a receiver applies
+/// a frame whose session differs from the last one it applied (a new session
+/// is a new ordering), and orders by `cmd_seq` only within a session. This
+/// costs two bytes and no handshake: the first frame of a new session is
+/// self-describing. **Session `0` is reserved for "none"** (nothing applied
+/// yet, in acks and telemetry); a sender must never use it and a receiver
+/// ignores frames carrying it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CommandFrame {
-    /// Monotonic per base-station session. Wrapping is handled by comparing
-    /// with wrapping arithmetic, so a long session does not break the ordering.
+    /// Random per ground-station process, never `0`. See the type docs.
+    pub session: u16,
+    /// Monotonic within a `session`. Wrapping is handled by comparing with
+    /// wrapping arithmetic ([`seq_is_newer`]), so a long session does not
+    /// break the ordering. Any value, including `0`, is a valid `cmd_seq`:
+    /// "nothing applied" is carried by `session == 0`, not by a sentinel
+    /// sequence number.
     pub cmd_seq: u16,
     pub body: Command,
 }
 
 impl CommandFrame {
-    /// Whether this frame is newer than the last applied sequence number,
-    /// tolerant of `u16` wraparound.
-    ///
-    /// Treats the nearer half of the sequence space as "newer", the standard
-    /// approach for wrapping counters: a frame more than 32767 ahead is read as
-    /// stale rather than as an enormous jump forward.
+    /// Whether this frame's `cmd_seq` is newer than `last_applied`, tolerant
+    /// of `u16` wraparound. Compares sequence numbers only — whether the two
+    /// belong to the same session is the receiver's business.
     pub fn is_newer_than(&self, last_applied: u16) -> bool {
-        self.cmd_seq != last_applied && self.cmd_seq.wrapping_sub(last_applied) < 0x8000
+        seq_is_newer(self.cmd_seq, last_applied)
     }
 }
 
 impl Wire for CommandFrame {
     const TYPE_ID: u16 = 0x0802;
-    // cmd_seq(2) + tag(1) + fixed payload area(16)
-    const WIRE_LEN: usize = 3 + Command::PAYLOAD_LEN;
+    // session(2) + cmd_seq(2) + tag(1) + fixed payload area(16)
+    const WIRE_LEN: usize = 5 + Command::PAYLOAD_LEN;
     const NAME: &'static str = "CommandFrame";
 
     fn encode(&self, buf: &mut [u8]) -> usize {
         let mut w = Writer::new(buf);
+        w.u16(self.session);
         w.u16(self.cmd_seq);
         w.u8(self.body.tag());
 
@@ -1030,6 +1060,7 @@ impl Wire for CommandFrame {
     fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
         check_len(buf, Self::WIRE_LEN)?;
         let mut r = Reader::new(buf);
+        let session = r.u16();
         let cmd_seq = r.u16();
         let tag = r.u8();
         let body = match tag {
@@ -1049,7 +1080,54 @@ impl Wire for CommandFrame {
                 })
             }
         };
-        Ok(Self { cmd_seq, body })
+        Ok(Self {
+            session,
+            cmd_seq,
+            body,
+        })
+    }
+}
+
+/// "I applied this command": published by each command consumer
+/// (`rover-control`, `rover-navigation`) to `rover-telemetry`.
+///
+/// [`CommandFrame`] reaches the rover as three separate unicast datagrams
+/// (control, navigation, telemetry). Previously telemetry ran its own
+/// receiver and echoed *its* copy, so a lost or dead-consumer copy was still
+/// acknowledged and the base stopped retransmitting — an EStop could be acked
+/// without ever reaching the safety gate. Now each consumer acknowledges what
+/// *it* applied, and telemetry reports an ack only when both agree (see
+/// [`Telemetry::last_cmd_session`]).
+///
+/// `session == 0` means "nothing applied yet" (`cmd_seq` is then meaningless,
+/// sent as 0). Published right after applying and repeated at 2 Hz, so one
+/// lost datagram delays the ack by at most half a second. Stateless and
+/// idempotent like everything else on the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommandAck {
+    pub session: u16,
+    pub cmd_seq: u16,
+}
+
+impl Wire for CommandAck {
+    const TYPE_ID: u16 = 0x0803;
+    const WIRE_LEN: usize = 4;
+    const NAME: &'static str = "CommandAck";
+
+    fn encode(&self, buf: &mut [u8]) -> usize {
+        let mut w = Writer::new(buf);
+        w.u16(self.session);
+        w.u16(self.cmd_seq);
+        w.len()
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        check_len(buf, Self::WIRE_LEN)?;
+        let mut r = Reader::new(buf);
+        Ok(Self {
+            session: r.u16(),
+            cmd_seq: r.u16(),
+        })
     }
 }
 
@@ -1073,8 +1151,19 @@ pub struct Telemetry {
     pub rtk: GnssFix,
     /// Spresense, as a cross-check and fallback.
     pub backup: GnssFix,
-    /// Most recent [`CommandFrame::cmd_seq`] the rover applied. This is the
-    /// acknowledgement the base station retransmits until it sees.
+    /// [`CommandFrame::session`] of the acknowledged command; `0` when there is
+    /// no acknowledgement to report. The base matches this against its own
+    /// session before trusting `last_cmd_seq`, so a previous station run's
+    /// leftover echo can never ack a new command.
+    pub last_cmd_session: u16,
+    /// The acknowledgement the base station retransmits until it sees.
+    /// `rover-telemetry` fills `(last_cmd_session, last_cmd_seq)` from the
+    /// [`CommandAck`]s of BOTH command consumers (control and navigation, each
+    /// fresh within 2 s and in the same session), taking the OLDER of the two
+    /// sequence numbers: the rover has applied everything up to this seq on
+    /// every consumer. Otherwise both are `0`. Because the base acks "this
+    /// seq or newer", an ack is never a claim about a command only some of
+    /// the consumers have applied.
     pub last_cmd_seq: u16,
     pub health: HealthBits,
 }
@@ -1087,6 +1176,7 @@ impl Wire for Telemetry {
         + MissionStatus::WIRE_LEN
         + PowerSample::WIRE_LEN
         + GnssFix::WIRE_LEN * 2
+        + 2
         + 2
         + 2;
     const NAME: &'static str = "Telemetry";
@@ -1103,6 +1193,7 @@ impl Wire for Telemetry {
         n += self.rtk.encode(&mut buf[n..]);
         n += self.backup.encode(&mut buf[n..]);
         let mut w = Writer::new(&mut buf[n..]);
+        w.u16(self.last_cmd_session);
         w.u16(self.last_cmd_seq);
         w.u16(self.health.0);
         n + w.len()
@@ -1135,6 +1226,7 @@ impl Wire for Telemetry {
             power,
             rtk,
             backup,
+            last_cmd_session: r.u16(),
             last_cmd_seq: r.u16(),
             health: HealthBits(r.u16()),
         })
@@ -1527,5 +1619,85 @@ impl Wire for BoardDiagnostics {
             uptime_s: r.u32(),
             tx_drops: r.u16(),
         })
+    }
+}
+
+/// Declares [`ALL_MESSAGES`] and [`validate_body`] from one list of types, so
+/// the two can never disagree with each other.
+macro_rules! message_table {
+    ($($ty:ident),+ $(,)?) => {
+        /// Every message type this crate defines, as `(TYPE_ID, NAME)`.
+        ///
+        /// One list that config validation (`rover-bus` rejects a `[routes]`
+        /// key that names no message — a typo'd name otherwise routes
+        /// nothing, silently) and `rover-tap`'s decoder registry are both
+        /// checked against. A new `Wire` type must be added to the
+        /// `message_table!` invocation below;
+        /// `tests/roundtrip.rs::all_messages_lists_every_type` fails if it is
+        /// missing, because that test compares this list against the types
+        /// `all_types!` exercises.
+        pub const ALL_MESSAGES: &[(u16, &str)] = &[$(($ty::TYPE_ID, $ty::NAME)),+];
+
+        /// Check that `body` decodes as the message type `type_id`, without
+        /// keeping the result. `None` if `type_id` is not a known type.
+        ///
+        /// For callers that hold bodies undecoded (`rover-bus`'s newest-wins
+        /// slots) but must not let a malformed one displace a good one.
+        pub fn validate_body(type_id: u16, body: &[u8]) -> Option<Result<(), DecodeError>> {
+            $(
+                if type_id == $ty::TYPE_ID {
+                    return Some($ty::decode(body).map(|_| ()));
+                }
+            )+
+            None
+        }
+    };
+}
+
+message_table!(
+    ImuSample,
+    MagSample,
+    ChassisStatus,
+    ChassisCommand,
+    WheelSensors,
+    PowerSample,
+    GnssFix,
+    LaneMeasurement,
+    RoverState,
+    MotionSetpoint,
+    MissionGoal,
+    MissionStatus,
+    CommandFrame,
+    CommandAck,
+    Telemetry,
+    SpeedLoopDebug,
+    EkfDebug,
+    BoardDiagnostics,
+);
+
+#[cfg(test)]
+mod seq_tests {
+    use super::*;
+
+    #[test]
+    fn seq_is_newer_is_wrap_aware_and_strict() {
+        assert!(seq_is_newer(2, 1));
+        assert!(!seq_is_newer(1, 1));
+        assert!(!seq_is_newer(1, 2));
+        assert!(seq_is_newer(0, u16::MAX));
+        assert!(!seq_is_newer(u16::MAX, 0));
+        // Exactly half the space ahead is read as behind.
+        assert!(seq_is_newer(0x7FFF, 0));
+        assert!(!seq_is_newer(0x8000, 0));
+    }
+
+    #[test]
+    fn validate_body_checks_length_and_discriminants() {
+        assert_eq!(validate_body(CommandAck::TYPE_ID, &[0; 4]), Some(Ok(())));
+        assert!(matches!(
+            validate_body(CommandAck::TYPE_ID, &[0; 3]),
+            Some(Err(DecodeError::TooShort { .. }))
+        ));
+        assert!(validate_body(0xFFFF, &[]).is_none());
     }
 }

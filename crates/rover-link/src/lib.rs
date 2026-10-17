@@ -54,7 +54,10 @@ pub trait Link {
     ///
     /// Never blocks: a control loop calls this once per tick and moves on
     /// whether or not anything was there. `None` means "nothing waiting right
-    /// now", not an error.
+    /// now", not an error — so an implementation must skip a malformed
+    /// datagram (too short for a frame header) and keep looking rather than
+    /// return `None` for it, or a caller that stops draining at `None` loses
+    /// the rest of its tick.
     ///
     /// The returned [`Frame`] borrows an internal buffer owned by the link,
     /// so a caller decodes it (or copies out the fields it wants) before
@@ -80,9 +83,9 @@ pub trait Link {
     /// This exists for exactly one caller: `rover-bus`'s debug firehose
     /// mirror (`BusConfig::mirror`, plan-adjacent but not itself in the plan
     /// — see `config/rover.toml`'s `[debug]` section). A mirror destination
-    /// is an ad hoc debugging address with no place in the fixed seven-service
-    /// [`PeerId`] table every other `send` call routes through, so it needs
-    /// its own escape hatch rather than a sixth, not-really-a-host `PeerId`
+    /// is an ad hoc debugging address with no place in the fixed [`PeerId`]
+    /// service table every other `send` call routes through, so it needs
+    /// its own escape hatch rather than a not-really-a-service `PeerId`
     /// variant.
     ///
     /// The default implementation returns [`LinkError::Unsupported`]. That

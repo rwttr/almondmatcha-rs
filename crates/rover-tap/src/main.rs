@@ -35,11 +35,13 @@ struct Args {
     config: PathBuf,
 
     /// Which service's traffic to observe (e.g. "control", "telemetry",
-    /// "chassis" — see `config/rover.toml`'s `[services]`). Routing is
+    /// "doctor" — see `config/rover.toml`'s `[services]`). Routing is
     /// unicast fan-out, not multicast (plan §4.1), so this tool only sees
     /// what is actually addressed to that service — pick the one that
     /// receives what you care about; check `[routes]` for which service a
-    /// type goes to. Ignored if `--mirror` is given.
+    /// type goes to. Only receives anything if run on the host that owns
+    /// that service's IP (with the real service stopped); from any other
+    /// machine use `--mirror`. Ignored if `--mirror` is given.
     #[arg(long = "as", default_value = "control")]
     as_host: String,
 
@@ -101,12 +103,18 @@ fn plan_listen(config: &BusConfig, args: &Args) -> Result<Listen, TapError> {
         .ok_or(TapError::NoAddress(self_id))?
         .port();
 
-    // Bind on every interface rather than the exact address `rover.toml`
-    // gives that service: `rover-tap` is a laptop-run debug tool, not the
-    // real process for that service, and it has no reason to require
-    // running on the same machine that owns that IP. Only the *port* — and
-    // the peer addresses below, checked against each datagram's source —
-    // need to match the config for anything to be recognised.
+    // Bind on every interface (0.0.0.0) rather than the exact address
+    // `rover.toml` gives that service, so the tool starts on any machine
+    // without needing that address configured locally. **That does not make
+    // `--as` work from just any laptop:** unicast datagrams for
+    // `192.168.1.1:7001` are only delivered to the host that owns
+    // 192.168.1.1, so from another machine this binds fine and then sees
+    // nothing. To watch a service's traffic from elsewhere, either run this
+    // on the host that owns that IP (with the real service stopped — it
+    // cannot co-bind the port), or use `--mirror`, which has every
+    // publisher send a copy to an address of your choosing. Only the *port*
+    // — and the peer addresses below, checked against each datagram's
+    // source — need to match the config for anything to be recognised.
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
 
     let mut peers = HashMap::new();
@@ -191,14 +199,14 @@ fn run_hz(mut link: UdpLink, filter: Option<&str>) -> Result<(), TapError> {
     let report_every = Duration::from_secs(1);
 
     loop {
-        while let Some((_peer, frame)) = link.recv() {
+        while let Some((peer, frame)) = link.recv() {
             let Some(decoded) = registry::decode(frame.header.type_id, frame.body) else {
                 continue;
             };
             if filter.is_some_and(|f| f != decoded.name) {
                 continue;
             }
-            tracker.record(frame.header.type_id, decoded.name, frame.header.seq);
+            tracker.record(peer, frame.header.type_id, decoded.name, frame.header.seq);
         }
 
         if tracker.elapsed() >= report_every {
@@ -235,7 +243,14 @@ impl fmt::Display for TapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TapError::Config(e) => write!(f, "loading config: {e}"),
-            TapError::UnknownHost(h) => write!(f, "`{h}` is not a known service (see PeerId::ALL)"),
+            TapError::UnknownHost(h) => {
+                let all: Vec<&str> = PeerId::ALL.iter().map(|p| p.as_str()).collect();
+                write!(
+                    f,
+                    "`{h}` is not a known service (one of: {})",
+                    all.join(", ")
+                )
+            }
             TapError::NoAddress(p) => write!(f, "no address configured for `{p}` in [services]"),
             TapError::Link(e) => write!(f, "{e}"),
             TapError::MirrorNotConfigured => write!(

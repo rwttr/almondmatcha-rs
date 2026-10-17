@@ -36,11 +36,15 @@ chassis    = "192.168.1.2:7010"
 sensors    = "192.168.1.6:7011"
 perception = "192.168.1.5:7020"
 base       = "192.168.1.10:7030"
+# rover-doctor is its own service, not a second bind of `base`: it runs on the
+# same base PC as ground-station, and two processes on one address is
+# EADDRINUSE (D1 again).
+doctor     = "192.168.1.10:7031"
 
 # ---------------------------------------------------------------------------
 # Routing: which services receive each message type.
 #
-# Unicast fan-out from a static table, NOT multicast. With seven services and
+# Unicast fan-out from a static table, NOT multicast. With eight services and
 # sub-200-byte messages the duplication costs nothing, and it removes the IGMP
 # dependency that forced a hand-maintained initialPeersList in the ROS 2 system.
 #
@@ -70,7 +74,10 @@ mirror = ""                   # e.g. "192.168.1.100:7099"
 # ImuSample/WheelSensors/LaneMeasurement feed the estimator and speed loop,
 # both in rover-control.
 ImuSample       = ["control"]
-ChassisStatus   = ["telemetry"]
+# ChassisStatus also goes to rover-control: the chassis boots tripped and only
+# re-arms on a zero-throttle ChassisCommand, so control must see
+# watchdog_tripped (and its absence) to know whether it is really driving.
+ChassisStatus   = ["telemetry", "control"]
 ChassisCommand  = ["chassis"]
 WheelSensors    = ["control"]
 PowerSample     = ["telemetry"]
@@ -86,20 +93,25 @@ MissionStatus   = ["control", "telemetry"]
 # to time out on. Telemetry is its liveness heartbeat — without it its mirror
 # watchdog (plan §5.2) would read as permanently tripped, which is exactly the
 # false alarm that teaches people to ignore a warning LED.
-Telemetry       = ["base", "sensors"]
-# Every process that runs its own rover_bus::CommandReceiver needs the same
-# CommandFrame stream: rover-control (applies Command to the safety gate /
-# speed limit), rover-navigation (mission state machine), and rover-telemetry
-# (its own last_cmd_seq bookkeeping — see its main.rs doc comment).
-CommandFrame    = ["control", "navigation", "telemetry"]
+# Also to "doctor": rover-doctor's preflight reads it straight off the wire.
+Telemetry       = ["base", "sensors", "doctor"]
+# Every process that acts on commands runs its own rover_bus::CommandReceiver:
+# rover-control (safety gate / speed limit) and rover-navigation (mission
+# state machine). rover-telemetry does NOT receive CommandFrame: it used to
+# echo its own copy as the ack, which acked commands the consumers never got.
+CommandFrame    = ["control", "navigation"]
+# Each consumer says what IT applied; rover-telemetry folds both into
+# Telemetry::{last_cmd_session, last_cmd_seq} (only when both are fresh and
+# agree), so the base stops retransmitting only once both have the command.
+CommandAck      = ["telemetry"]
 SpeedLoopDebug  = ["telemetry"]
-# Both destinations read this directly: rover-telemetry logs it to
+# Every destination reads this directly: rover-telemetry logs it to
 # board_diagnostics.csv and folds it into Telemetry::health (BOARD_POST_FAIL /
-# BOARD_RESET / LINK_DEGRADED), and the base station's preflight tool
-# (rover-doctor) reads it straight off the wire to judge POST/reset/link
-# checks before anyone drives -- it does not wait for rover-telemetry to
-# relay a verdict.
-BoardDiagnostics = ["telemetry", "base"]
+# BOARD_RESET / LINK_DEGRADED), ground-station (`base`) shows it, and the
+# preflight tool (rover-doctor, its own `doctor` service) reads it straight
+# off the wire to judge POST/reset/link checks before anyone drives -- it does
+# not wait for rover-telemetry to relay a verdict.
+BoardDiagnostics = ["telemetry", "base", "doctor"]
 
 # ---------------------------------------------------------------------------
 # Drivetrain

@@ -37,15 +37,20 @@
 #![forbid(unsafe_code)]
 
 use rover_bus::{Bus, BusConfig, CommandReceiver};
-use rover_control::actuate::{Actuator, ActuatorConfig, SafetyGate, IMU_STALE_TIMEOUT_S};
+use rover_control::actuate::{
+    Actuator, ActuatorConfig, ChassisArm, ChassisState, SafetyGate, CHASSIS_STATUS_STALE_S,
+    IMU_STALE_TIMEOUT_S,
+};
 use rover_control::config::{AppConfig, ControllerLaw};
 use rover_control::estimate::Estimator;
 use rover_control::guide::{LateralController, StaticGain, StaticGainConfig};
 use rover_link::{PeerId, UdpLink};
 use rover_msgs::{
-    ChassisCommand, Command, CommandFrame, EkfDebug, ImuSample, LaneMeasurement, MissionStatus,
-    RoverState, SpeedLoopDebug, WheelSensors,
+    ChassisCommand, ChassisStatus, Command, CommandFrame, EkfDebug, ImuSample, LaneMeasurement,
+    MissionStatus, RoverState, SpeedLoopDebug, WheelSensors,
 };
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -54,6 +59,9 @@ use std::time::{Duration, Instant};
 /// working directory — matching every other binary in this workspace
 /// (`rover-tap`'s `--config` default, `rover-bus`'s own tests).
 const DEFAULT_CONFIG_PATH: &str = "config/rover.toml";
+
+/// How often `CommandAck` is re-published (2 Hz) — see `network_thread`.
+const ACK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Initial covariance for the EKF's five states at startup: the rover is
 /// placed on the line at rest, so these are the "trust the zero-error
@@ -125,6 +133,7 @@ enum Inbound {
     Lane(LaneMeasurement),
     Wheel(WheelSensors),
     Mission(MissionStatus),
+    Chassis(ChassisStatus),
     Cmd(Command),
 }
 
@@ -140,8 +149,9 @@ enum Outbound {
 /// Owns the `Bus` exclusively. Subscribes to every message type the control
 /// loop needs (forwarding each to `tx`), applies the base-station command
 /// handshake (`rover_bus::command::CommandReceiver`) to `CommandFrame`
-/// before forwarding only the newly-applied `Command`, and publishes
-/// whatever arrives on `rx`.
+/// before forwarding only the newly-applied `Command`, publishes whatever
+/// arrives on `rx`, and publishes a `CommandAck` of what it applied (right
+/// after applying, and at 2 Hz) for `rover-telemetry` to fold into `Telemetry`.
 fn network_thread(
     link: UdpLink,
     bus_config: BusConfig,
@@ -149,7 +159,13 @@ fn network_thread(
     rx: mpsc::Receiver<Outbound>,
 ) {
     let mut bus = Bus::new(link, bus_config);
-    let mut cmd_rx = CommandReceiver::new();
+    // Shared with the `CommandFrame` callback below: the callback applies,
+    // the loop reads `ack()` to publish. `dirty` asks the loop for an
+    // immediate ack (a publish cannot happen inside a callback — the bus is
+    // mid-`poll`).
+    let cmd_rx = Rc::new(RefCell::new(CommandReceiver::new()));
+    let ack_dirty = Rc::new(Cell::new(false));
+    let mut next_ack = Instant::now();
 
     {
         let tx = tx.clone();
@@ -171,18 +187,27 @@ fn network_thread(
     }
     {
         let tx = tx.clone();
+        bus.subscribe::<ChassisStatus>(move |m| {
+            let _ = tx.send(Inbound::Chassis(m));
+        });
+    }
+    {
+        let tx = tx.clone();
         bus.subscribe::<MissionStatus>(move |m| {
             let _ = tx.send(Inbound::Mission(m));
         });
     }
     {
         let tx = tx.clone();
+        let cmd_rx = cmd_rx.clone();
+        let ack_dirty = ack_dirty.clone();
         bus.subscribe::<CommandFrame>(move |frame: CommandFrame| {
             // Dedup/ordering lives here, on the network thread, so the
             // control thread only ever sees a command exactly once, the
             // moment it newly takes effect — never a stale retransmit.
-            if let Some(body) = cmd_rx.apply(frame) {
+            if let Some(body) = cmd_rx.borrow_mut().apply(frame) {
                 let _ = tx.send(Inbound::Cmd(body));
+                ack_dirty.set(true);
             }
         });
     }
@@ -190,6 +215,20 @@ fn network_thread(
 
     loop {
         bus.poll();
+
+        // The base-visible acknowledgement of what THIS process applied
+        // (rover-telemetry merges it with navigation's): immediately after a
+        // command is applied, and every `ACK_INTERVAL` regardless, so a lost
+        // ack datagram costs at most half a second and the base can tell this
+        // process is alive.
+        let now = Instant::now();
+        if ack_dirty.replace(false) || now >= next_ack {
+            next_ack = now + ACK_INTERVAL;
+            let ack = cmd_rx.borrow().ack();
+            if let Err(e) = bus.publish(&ack) {
+                log::warn!("rover-control: CommandAck publish failed: {e}");
+            }
+        }
 
         while let Ok(msg) = rx.try_recv() {
             let result = match msg {
@@ -252,6 +291,8 @@ fn control_loop(
     log::info!("rover-control: guidance law = `{}`", controller.name());
 
     let mut gate = SafetyGate::new();
+    let mut chassis_arm = ChassisArm::new();
+    let mut last_chassis_state = ChassisState::Unknown;
 
     let start = Instant::now();
     let tick_period = Duration::from_secs_f32(1.0 / cfg.predict_hz);
@@ -296,7 +337,7 @@ fn control_loop(
                     estimator.correct_wheel(&wheel, last_throttle);
                     last_state = estimator.state();
 
-                    let drive_allowed = gate.drive_allowed(now_s);
+                    let drive_allowed = gate.drive_allowed(now_s) && chassis_arm.drive_ok(now_s);
                     if let Some(dbg) =
                         actuator.handle_wheel_sensors(wheel, now_s, &last_state, drive_allowed)
                     {
@@ -304,6 +345,7 @@ fn control_loop(
                     }
                 }
                 Inbound::Mission(status) => gate.on_mission_status(status.active, now_s),
+                Inbound::Chassis(status) => chassis_arm.on_status(status.watchdog_tripped, now_s),
                 Inbound::Cmd(Command::SetSpeedLimit(pct)) => actuator.set_speed_limit_pct(pct),
                 Inbound::Cmd(cmd) => gate.on_command(cmd),
             }
@@ -324,7 +366,30 @@ fn control_loop(
         }
         was_imu_fresh = imu_fresh;
 
-        let drive_allowed = gate.drive_allowed(now_s);
+        // The chassis board boots tripped and re-arms only on a zero-throttle
+        // command, and reports `watchdog_tripped` in `ChassisStatus`. While
+        // that says tripped — or nothing has been heard for
+        // `CHASSIS_STATUS_STALE_S` — the gate is closed, so the commands sent
+        // are throttle 0: the re-arm for a tripped board, and the safe
+        // default for an unknown one. Logged on each transition only.
+        let chassis_state = chassis_arm.state(now_s);
+        if chassis_state != last_chassis_state {
+            match chassis_state {
+                ChassisState::Armed => {
+                    log::info!("rover-control: chassis armed — drive gate may open")
+                }
+                ChassisState::Tripped => log::warn!(
+                    "rover-control: chassis watchdog tripped — sending throttle 0 until it re-arms"
+                ),
+                ChassisState::Unknown => log::error!(
+                    "rover-control: no ChassisStatus for > {:.0} ms — chassis state unknown, closing the drive gate",
+                    CHASSIS_STATUS_STALE_S * 1000.0
+                ),
+            }
+            last_chassis_state = chassis_state;
+        }
+
+        let drive_allowed = gate.drive_allowed(now_s) && chassis_arm.drive_ok(now_s);
         if drive_allowed && !was_drive_allowed {
             // Resuming after a stop: reset any controller memory rather than
             // letting it pick back up from whatever it held while the

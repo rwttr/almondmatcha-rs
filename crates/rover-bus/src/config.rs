@@ -58,21 +58,57 @@ impl BusConfig {
         let raw: RawConfig = toml::from_str(toml_text).map_err(ConfigError::Toml)?;
 
         let mut peers = HashMap::new();
-        for (name, addr_str) in &raw.services {
+        // Which service first claimed each address, so a duplicate can name
+        // both. Checked here at parse time — not only by a test of the
+        // shipped file — because two services on one `host:port` is the D1
+        // `EADDRINUSE`, and a bench config that repeats the mistake should
+        // fail on load rather than on the second process's bind. Sorted so
+        // the error is deterministic across runs (`HashMap` order is not).
+        let mut claimed: HashMap<SocketAddr, PeerId> = HashMap::new();
+        let mut service_names: Vec<&String> = raw.services.keys().collect();
+        service_names.sort();
+        for name in service_names {
+            let addr_str = &raw.services[name];
             let peer = PeerId::parse(name).ok_or_else(|| ConfigError::UnknownHost(name.clone()))?;
             let addr: SocketAddr = addr_str
                 .parse()
                 .map_err(|e| ConfigError::BadAddress(name.clone(), e))?;
+            if let Some(&other) = claimed.get(&addr) {
+                return Err(ConfigError::DuplicateAddress {
+                    addr,
+                    first: other,
+                    second: peer,
+                });
+            }
+            claimed.insert(addr, peer);
             peers.insert(peer, addr);
         }
 
         let mut routes = HashMap::new();
         for (msg_name, hosts) in raw.routes {
+            // A route key that names no message routes nothing, forever and
+            // silently — a typo like `Telemtry` would otherwise look exactly
+            // like "nobody subscribes to this".
+            if !rover_msgs::ALL_MESSAGES
+                .iter()
+                .any(|&(_, name)| name == msg_name)
+            {
+                return Err(ConfigError::UnknownMessage(msg_name));
+            }
             let mut dests = Vec::with_capacity(hosts.len());
             for host in hosts {
-                dests.push(
-                    PeerId::parse(&host).ok_or_else(|| ConfigError::UnknownHost(host.clone()))?,
-                );
+                let peer =
+                    PeerId::parse(&host).ok_or_else(|| ConfigError::UnknownHost(host.clone()))?;
+                // A destination with no `[services]` address passes every
+                // other check and then fails on every single publish
+                // (`LinkError::UnknownPeer`). Reject it where the typo is.
+                if !peers.contains_key(&peer) {
+                    return Err(ConfigError::UnconfiguredRoute {
+                        message: msg_name,
+                        service: host,
+                    });
+                }
+                dests.push(peer);
             }
             routes.insert(msg_name, dests);
         }
@@ -98,7 +134,7 @@ impl BusConfig {
         })
     }
 
-    /// The resolved address of a peer, if `[hosts]`/`[ports]` named it.
+    /// The resolved address of a peer, if `[services]` named it.
     pub fn addr_of(&self, peer: PeerId) -> Option<SocketAddr> {
         self.peers.get(&peer).copied()
     }
@@ -171,6 +207,16 @@ pub enum ConfigError {
     BadAddress(String, AddrParseError),
     /// `[debug] mirror` was non-empty but did not parse as `ip:port`.
     BadMirrorAddress(String, AddrParseError),
+    /// A `[routes]` key is not the `NAME` of any message type in `rover-msgs`.
+    UnknownMessage(String),
+    /// A `[routes]` entry targets a service that has no `[services]` address.
+    UnconfiguredRoute { message: String, service: String },
+    /// Two `[services]` entries share one `host:port`.
+    DuplicateAddress {
+        addr: SocketAddr,
+        first: PeerId,
+        second: PeerId,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -187,6 +233,18 @@ impl fmt::Display for ConfigError {
             ConfigError::BadMirrorAddress(addr, e) => {
                 write!(f, "[debug] mirror = \"{addr}\" is not a valid address: {e}")
             }
+            ConfigError::UnknownMessage(name) => {
+                write!(f, "[routes] key `{name}` is not a known message type")
+            }
+            ConfigError::UnconfiguredRoute { message, service } => write!(
+                f,
+                "[routes] `{message}` targets `{service}`, which has no [services] address"
+            ),
+            ConfigError::DuplicateAddress {
+                addr,
+                first,
+                second,
+            } => write!(f, "services `{first}` and `{second}` share address {addr}"),
         }
     }
 }
@@ -280,6 +338,43 @@ mod tests {
         assert!(matches!(err, ConfigError::UnknownHost(h) if h == "groundstation"));
     }
 
+    /// Regression for bug F: a destination missing from `[services]` used to
+    /// parse fine and then fail on every publish.
+    #[test]
+    fn route_to_a_service_without_an_address_is_rejected() {
+        let bad = SAMPLE.replace(
+            "ImuSample      = [\"control\"]",
+            "ImuSample      = [\"perception\"]",
+        );
+        let err = BusConfig::parse(&bad).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::UnconfiguredRoute { message, service }
+                if message == "ImuSample" && service == "perception"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn route_key_that_is_not_a_message_name_is_rejected() {
+        let bad = SAMPLE.replace("Telemetry      = [\"base\"]", "Telemtry       = [\"base\"]");
+        let err = BusConfig::parse(&bad).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::UnknownMessage(n) if n == "Telemtry"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_service_address_is_rejected_at_parse_time() {
+        let bad = SAMPLE.replace("192.168.1.2:7010", "192.168.1.1:7001");
+        let err = BusConfig::parse(&bad).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::DuplicateAddress { addr, .. }
+                if addr.to_string() == "192.168.1.1:7001"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn bad_socket_address_is_rejected() {
         // Quoted, so this matches only control's address and not the
@@ -334,10 +429,46 @@ mod tests {
         // liveness heartbeat (plan §5.2 mirror watchdog).
         assert_eq!(
             cfg.route_for::<Telemetry>(),
-            &[PeerId::Base, PeerId::Sensors]
+            &[PeerId::Base, PeerId::Sensors, PeerId::Doctor]
         );
         // Shipped default is `mirror = ""` — disabled.
         assert_eq!(cfg.mirror(), None);
+    }
+
+    /// Regression for bug D: rover-doctor and ground-station both bound
+    /// `base`. Each needs its own service, and the boards' diagnostics and
+    /// the telemetry feed must be routed to the doctor.
+    #[test]
+    fn shipped_config_gives_doctor_its_own_service_and_routes() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/rover.toml");
+        let cfg = BusConfig::load(path).unwrap();
+        let doctor = cfg.addr_of(PeerId::Doctor).expect("[services] doctor");
+        assert_eq!(doctor, "192.168.1.10:7031".parse().unwrap());
+        assert_ne!(Some(doctor), cfg.addr_of(PeerId::Base));
+        assert!(cfg
+            .route_for::<rover_msgs::BoardDiagnostics>()
+            .contains(&PeerId::Doctor));
+        assert!(cfg.route_for::<Telemetry>().contains(&PeerId::Doctor));
+    }
+
+    /// The command-ack and chassis-rearm routes the protocol depends on.
+    #[test]
+    fn shipped_config_routes_acks_and_chassis_status() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/rover.toml");
+        let cfg = BusConfig::load(path).unwrap();
+        assert_eq!(
+            cfg.route_for::<rover_msgs::CommandAck>(),
+            &[PeerId::Telemetry]
+        );
+        // Telemetry no longer receives CommandFrame (it would ack its own
+        // copy); only the two consumers do.
+        assert_eq!(
+            cfg.route_for::<rover_msgs::CommandFrame>(),
+            &[PeerId::Control, PeerId::Navigation]
+        );
+        assert!(cfg
+            .route_for::<rover_msgs::ChassisStatus>()
+            .contains(&PeerId::Control));
     }
 
     /// Design defect D1 was exactly this: two processes silently sharing one
@@ -359,7 +490,7 @@ mod tests {
             );
         }
         // The real config configures every service — this test is only
-        // meaningful if it actually compared seven distinct addresses.
+        // meaningful if it actually compared every service's address.
         assert_eq!(seen.len(), PeerId::ALL.len());
     }
 }

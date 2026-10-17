@@ -38,7 +38,7 @@ pub const FILENAME: &str = "ground_station_telemetry.csv";
 
 pub const HEADER: &str = "Timestamp_us,Seq,Rtk_Lat,Rtk_Lon,Rtk_Fix,Rtk_Sats,\
      Backup_Lat,Backup_Lon,Backup_Fix,Speed_mps,Mission_State,Mission_Active,\
-     Distance_Remaining_m,Bus_Volts,Current_A,Last_Cmd_Seq,Health_Bits\n";
+     Distance_Remaining_m,Bus_Volts,Current_A,Last_Cmd_Session,Last_Cmd_Seq,Health_Bits\n";
 
 /// Format one received `Telemetry` frame as a CSV row. `timestamp_us` is the
 /// base station's own receive-time clock, not `Telemetry::t_us` (the
@@ -48,7 +48,7 @@ pub const HEADER: &str = "Timestamp_us,Seq,Rtk_Lat,Rtk_Lon,Rtk_Fix,Rtk_Sats,\
 /// system.
 pub fn format_row(timestamp_us: u64, t: &Telemetry) -> String {
     format!(
-        "{timestamp_us},{},{:.7},{:.7},{:?},{},{:.7},{:.7},{:?},{},{:?},{},{},{},{},{},{}\n",
+        "{timestamp_us},{},{:.7},{:.7},{:?},{},{:.7},{:.7},{:?},{},{:?},{},{},{},{},{},{},{}\n",
         t.seq,
         t.rtk.lat_deg,
         t.rtk.lon_deg,
@@ -63,6 +63,7 @@ pub fn format_row(timestamp_us: u64, t: &Telemetry) -> String {
         t.mission.distance_remaining_m,
         t.power.bus_volts,
         t.power.current_amps,
+        t.last_cmd_session,
         t.last_cmd_seq,
         t.health.0,
     )
@@ -140,6 +141,7 @@ mod tests {
                 ..Default::default()
             },
             backup: GnssFix::default(),
+            last_cmd_session: 3,
             last_cmd_seq: 5,
             health: rover_msgs::HealthBits::NONE,
         };
@@ -168,6 +170,7 @@ mod tests {
                 sats: 6,
                 ..Default::default()
             },
+            last_cmd_session: 777,
             last_cmd_seq: 42,
             ..Default::default()
         };
@@ -175,7 +178,7 @@ mod tests {
         let row = format_row(2_000, &t);
         assert!(row.starts_with("2000,0,13.7000000,100.5000000,RtkFixed,14,"));
         assert!(row.contains("13.7100000,100.5100000,Autonomous"));
-        assert!(row.contains(",42,"));
+        assert!(row.contains(",777,42,"), "session then seq: {row}");
         assert!(row.contains("Arrived"));
     }
 

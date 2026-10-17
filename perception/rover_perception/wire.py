@@ -521,35 +521,41 @@ class Command:
 
 @dataclass(frozen=True)
 class CommandFrame:
+    """Wire layout: session u16, cmd_seq u16, tag u8, payload area 16 bytes
+    (21 total). `session` is random per ground-station process and never 0
+    (0 means "none"); `cmd_seq` orders frames within one session. See the
+    doc comment on `rover_msgs::CommandFrame`."""
+
     TYPE_ID: ClassVar[int] = 0x0802
     PAYLOAD_LEN: ClassVar[int] = MissionGoal.WIRE_LEN
-    WIRE_LEN: ClassVar[int] = 3 + MissionGoal.WIRE_LEN
+    WIRE_LEN: ClassVar[int] = 5 + MissionGoal.WIRE_LEN
     NAME: ClassVar[str] = "CommandFrame"
 
+    session: int
     cmd_seq: int
     body: Command
 
     def encode(self) -> bytes:
         buf = bytearray(self.WIRE_LEN)
-        struct.pack_into("<H", buf, 0, self.cmd_seq)
-        buf[2] = self.body.tag
+        struct.pack_into("<HH", buf, 0, self.session, self.cmd_seq)
+        buf[4] = self.body.tag
         if self.body.tag == Command.SET_SPEED_LIMIT:
-            buf[3] = self.body.speed_limit_pct
+            buf[5] = self.body.speed_limit_pct
         elif self.body.tag == Command.SET_MISSION_GOAL:
-            struct.pack_into("<dd", buf, 3, self.body.mission_goal.lat_deg, self.body.mission_goal.lon_deg)
-        # Nop / CancelMission / EStop: payload area stays zeroed.
+            struct.pack_into("<dd", buf, 5, self.body.mission_goal.lat_deg, self.body.mission_goal.lon_deg)
+        # Nop / CancelMission / EStop / ClearEStop: payload area stays zeroed.
         return bytes(buf)
 
     @classmethod
     def decode(cls, buf: bytes) -> "CommandFrame":
         _check_len(buf, cls.WIRE_LEN, cls.NAME)
-        cmd_seq, tag = struct.unpack_from("<HB", buf, 0)
+        session, cmd_seq, tag = struct.unpack_from("<HHB", buf, 0)
         if tag == Command.NOP:
             body = Command.nop()
         elif tag == Command.SET_SPEED_LIMIT:
-            body = Command.set_speed_limit(buf[3])
+            body = Command.set_speed_limit(buf[5])
         elif tag == Command.SET_MISSION_GOAL:
-            lat, lon = struct.unpack_from("<dd", buf, 3)
+            lat, lon = struct.unpack_from("<dd", buf, 5)
             body = Command.set_mission_goal(MissionGoal(lat, lon))
         elif tag == Command.CANCEL_MISSION:
             body = Command.cancel_mission()
@@ -559,7 +565,29 @@ class CommandFrame:
             body = Command.clear_estop()
         else:
             raise DecodeError(f"CommandFrame: invalid discriminant {tag} for field `Command`")
-        return cls(cmd_seq, body)
+        return cls(session, cmd_seq, body)
+
+
+@dataclass(frozen=True)
+class CommandAck:
+    """Mirrors `rover_msgs::CommandAck`: what a command consumer (control or
+    navigation) last applied. `session == 0` means nothing applied yet."""
+
+    TYPE_ID: ClassVar[int] = 0x0803
+    WIRE_LEN: ClassVar[int] = 4
+    NAME: ClassVar[str] = "CommandAck"
+
+    session: int
+    cmd_seq: int
+
+    def encode(self) -> bytes:
+        return struct.pack("<HH", self.session, self.cmd_seq)
+
+    @classmethod
+    def decode(cls, buf: bytes) -> "CommandAck":
+        _check_len(buf, cls.WIRE_LEN, cls.NAME)
+        session, cmd_seq = struct.unpack_from("<HH", buf, 0)
+        return cls(session, cmd_seq)
 
 
 @dataclass(frozen=True)
@@ -572,7 +600,7 @@ class Telemetry:
     TYPE_ID: ClassVar[int] = 0x0801
     WIRE_LEN: ClassVar[int] = (
         4 + 8 + RoverState.WIRE_LEN + MissionStatus.WIRE_LEN + PowerSample.WIRE_LEN
-        + GnssFix.WIRE_LEN * 2 + 2 + 2
+        + GnssFix.WIRE_LEN * 2 + 2 + 2 + 2
     )
     NAME: ClassVar[str] = "Telemetry"
 
@@ -583,12 +611,13 @@ class Telemetry:
     power: PowerSample
     rtk: GnssFix
     backup: GnssFix
+    last_cmd_session: int
     last_cmd_seq: int
     health: int  # HealthBits, carried as a plain u16 bitmask
 
     def encode(self) -> bytes:
         head = struct.pack("<IQ", self.seq, self.t_us)
-        tail = struct.pack("<HH", self.last_cmd_seq, self.health)
+        tail = struct.pack("<HHH", self.last_cmd_session, self.last_cmd_seq, self.health)
         return b"".join([
             head, self.state.encode(), self.mission.encode(), self.power.encode(),
             self.rtk.encode(), self.backup.encode(), tail,
@@ -609,8 +638,8 @@ class Telemetry:
         n += GnssFix.WIRE_LEN
         backup = GnssFix.decode(buf[n:])
         n += GnssFix.WIRE_LEN
-        last_cmd_seq, health = struct.unpack_from("<HH", buf, n)
-        return cls(seq, t_us, state, mission, power, rtk, backup, last_cmd_seq, health)
+        last_cmd_session, last_cmd_seq, health = struct.unpack_from("<HHH", buf, n)
+        return cls(seq, t_us, state, mission, power, rtk, backup, last_cmd_session, last_cmd_seq, health)
 
 
 # ===========================================================================
@@ -765,3 +794,20 @@ class BoardDiagnostics:
             board, post_run, post_pass, reset_cause, phy_id, link_speed_mbps,
             link_full_duplex, phy_symbol_errors, uptime_s, tx_drops,
         )
+
+
+# ===========================================================================
+# Registry
+# ===========================================================================
+
+ALL_MESSAGES = (
+    ImuSample, MagSample, ChassisStatus, ChassisCommand, WheelSensors,
+    PowerSample, GnssFix, LaneMeasurement, RoverState, MotionSetpoint,
+    MissionGoal, MissionStatus, CommandFrame, CommandAck, Telemetry,
+    SpeedLoopDebug, EkfDebug, BoardDiagnostics,
+)
+"""Every message type, mirroring `rover_msgs::ALL_MESSAGES`. `bus.py` rejects a
+`[routes]` key that is not one of these names (a typo otherwise routes nothing,
+silently); `test_wire_golden.py` checks the list against the fixtures."""
+
+MESSAGE_NAMES = frozenset(m.NAME for m in ALL_MESSAGES)

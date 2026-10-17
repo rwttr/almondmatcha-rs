@@ -17,10 +17,12 @@
 pub mod command;
 mod config;
 
-pub use command::{CommandReceiver, CommandSender, DEFAULT_RETRANSMIT_INTERVAL};
+pub use command::{
+    random_session, CommandReceiver, CommandSender, Discarded, DEFAULT_RETRANSMIT_INTERVAL,
+};
 pub use config::{BusConfig, ConfigError};
 
-use rover_link::{Link, LinkError};
+use rover_link::{Link, LinkError, PeerId};
 use rover_msgs::frame::{encode_frame, MAX_FRAME_LEN};
 use rover_msgs::Wire;
 use std::collections::HashMap;
@@ -38,7 +40,7 @@ struct Slot {
 /// One subscriber's decode-and-call step, boxed so `Bus` can hold callbacks
 /// for arbitrarily many message types without becoming generic over all of
 /// them at once.
-type Callback = Box<dyn FnMut(&[u8])>;
+type Callback = Box<dyn FnMut(PeerId, &[u8])>;
 
 /// Publish/subscribe over one [`Link`].
 ///
@@ -133,12 +135,21 @@ impl<L: Link> Bus<L> {
     /// newest-wins slot for its type and running any callback registered for
     /// it. Call once per control-loop tick; never blocks, because
     /// [`Link::recv`] never blocks.
+    ///
+    /// Malformed datagrams never stop the drain: a datagram too short to hold
+    /// a frame header is skipped inside [`Link::recv`] (see its contract),
+    /// and a body that does not decode as its type is dropped here — it
+    /// neither reaches subscribers nor overwrites the newest-wins slot, so
+    /// one corrupt packet cannot turn "the latest good `T`" into `None`.
     pub fn poll(&mut self) {
-        while let Some((_peer, frame)) = self.link.recv() {
+        while let Some((peer, frame)) = self.link.recv() {
             let type_id = frame.header.type_id;
+            if let Some(Err(_)) = rover_msgs::validate_body(type_id, frame.body) {
+                continue;
+            }
             if let Some(cbs) = self.callbacks.get_mut(&type_id) {
                 for cb in cbs.iter_mut() {
-                    cb(frame.body);
+                    cb(peer, frame.body);
                 }
             }
             self.latest.insert(
@@ -152,7 +163,8 @@ impl<L: Link> Bus<L> {
     }
 
     /// The most recently received `T`, decoded, or `None` if nothing of that
-    /// type has arrived yet (or the last one failed to decode).
+    /// type has arrived yet. (A malformed datagram never becomes "the latest":
+    /// [`Bus::poll`] drops it.)
     ///
     /// This is the "give me the latest `ImuSample`" side of the API: fine for
     /// a control loop that wants this tick's best estimate and does not care
@@ -181,14 +193,21 @@ impl<L: Link> Bus<L> {
     /// frame that arrives before the next `poll` call, so a slow callback
     /// slows the loop that calls `poll` rather than piling up work.
     pub fn subscribe<T: Wire>(&mut self, mut f: impl FnMut(T) + 'static) {
-        self.callbacks
-            .entry(T::TYPE_ID)
-            .or_default()
-            .push(Box::new(move |body: &[u8]| {
+        self.subscribe_from::<T>(move |_peer, msg| f(msg));
+    }
+
+    /// Like [`Bus::subscribe`], but also passes the service the datagram came
+    /// from (resolved from its source address by the link). For messages whose
+    /// meaning depends on the sender — `rover-telemetry` keeps one
+    /// `CommandAck` per consumer and must tell control's from navigation's.
+    pub fn subscribe_from<T: Wire>(&mut self, mut f: impl FnMut(PeerId, T) + 'static) {
+        self.callbacks.entry(T::TYPE_ID).or_default().push(Box::new(
+            move |peer: PeerId, body: &[u8]| {
                 if let Ok(msg) = T::decode(body) {
-                    f(msg);
+                    f(peer, msg);
                 }
-            }));
+            },
+        ));
     }
 
     /// The config this bus was built with, for callers that need routing or
@@ -359,6 +378,86 @@ mod tests {
         assert!(bus.publish(&imu()).is_ok());
         assert_eq!(bus.mirror_failures(), 1);
         assert!(!bus.link().sent.is_empty(), "the real route still ran");
+    }
+
+    /// Regression for bug G: a <4-byte datagram from a known peer made
+    /// `recv` return `None`, so `poll` stopped draining and everything behind
+    /// it waited a tick. A body that failed to decode also replaced the
+    /// newest-wins slot, turning the last good value into `None`.
+    #[test]
+    fn poll_skips_malformed_datagrams_and_keeps_draining() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(PeerId::Base, sender.local_addr().unwrap());
+        let link = UdpLink::bind(PeerId::Control, "127.0.0.1:0", peers).unwrap();
+        let to = link.local_addr().unwrap();
+        let mut bus = Bus::new(link, config_with_mirror(None));
+
+        let good = |t_us: u32| {
+            let mut msg = imu();
+            msg.t_us = t_us;
+            let mut buf = [0u8; MAX_FRAME_LEN];
+            let n = encode_frame(&msg, 0, &mut buf);
+            buf[..n].to_vec()
+        };
+        // Header-only datagram: right type, body too short to decode.
+        let bad_body = {
+            let mut d = good(0);
+            d.truncate(4 + 3);
+            d
+        };
+        sender.send_to(&good(1), to).unwrap();
+        sender.send_to(&[0xAA, 0xBB], to).unwrap(); // shorter than a header
+        sender.send_to(&bad_body, to).unwrap(); // must not clobber t_us = 1
+        sender.send_to(&good(2), to).unwrap(); // behind both bad ones
+        sender.send_to(&bad_body, to).unwrap(); // and a bad one last
+
+        let mut seen = Vec::new();
+        let seen_cb = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let seen_cb = seen_cb.clone();
+            bus.subscribe::<ImuSample>(move |m| seen_cb.borrow_mut().push(m.t_us));
+        }
+        for _ in 0..200 {
+            bus.poll();
+            seen.clone_from(&seen_cb.borrow());
+            if seen.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // One poll must have drained past the short datagram.
+        assert_eq!(seen, vec![1, 2], "datagram behind a malformed one was lost");
+        // Let the trailing bad body arrive too, then check it did not win.
+        std::thread::sleep(Duration::from_millis(50));
+        bus.poll();
+        assert_eq!(bus.latest::<ImuSample>().map(|m| m.t_us), Some(2));
+    }
+
+    #[test]
+    fn subscribe_from_reports_the_sending_service() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(PeerId::Navigation, sender.local_addr().unwrap());
+        let link = UdpLink::bind(PeerId::Telemetry, "127.0.0.1:0", peers).unwrap();
+        let to = link.local_addr().unwrap();
+        let mut bus = Bus::new(link, config_with_mirror(None));
+        let got = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let got = got.clone();
+            bus.subscribe_from::<ImuSample>(move |p, m| got.borrow_mut().push((p, m.t_us)));
+        }
+        let mut buf = [0u8; MAX_FRAME_LEN];
+        let n = encode_frame(&imu(), 0, &mut buf);
+        sender.send_to(&buf[..n], to).unwrap();
+        for _ in 0..200 {
+            bus.poll();
+            if !got.borrow().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*got.borrow(), vec![(PeerId::Navigation, 1)]);
     }
 
     #[test]

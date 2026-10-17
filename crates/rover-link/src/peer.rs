@@ -38,12 +38,16 @@ pub enum PeerId {
     Perception,
     /// `ground-station`, on the base PC.
     Base,
+    /// `rover-doctor`, on the base PC. A separate service from [`PeerId::Base`]
+    /// (same IP, different port): both processes run on the base PC at once
+    /// and two binds of one address is `EADDRINUSE` — the D1 mistake again.
+    Doctor,
 }
 
 impl PeerId {
-    /// All seven, in the order `config/rover.toml`'s `[services]` table
+    /// All eight, in the order `config/rover.toml`'s `[services]` table
     /// lists them.
-    pub const ALL: [PeerId; 7] = [
+    pub const ALL: [PeerId; 8] = [
         PeerId::Control,
         PeerId::Navigation,
         PeerId::Telemetry,
@@ -51,6 +55,7 @@ impl PeerId {
         PeerId::Sensors,
         PeerId::Perception,
         PeerId::Base,
+        PeerId::Doctor,
     ];
 
     /// The spelling used as a key in `config/rover.toml`'s `[services]` /
@@ -64,6 +69,7 @@ impl PeerId {
             PeerId::Sensors => "sensors",
             PeerId::Perception => "perception",
             PeerId::Base => "base",
+            PeerId::Doctor => "doctor",
         }
     }
 

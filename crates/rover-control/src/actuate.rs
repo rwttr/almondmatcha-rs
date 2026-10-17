@@ -564,6 +564,75 @@ impl SafetyGate {
 }
 
 // ===========================================================================
+// Chassis re-arm
+// ===========================================================================
+
+/// No `ChassisStatus` for this long and the chassis is "unknown": the gate
+/// closes (throttle 0) rather than drive a board that may be tripped,
+/// rebooted or unreachable. The board publishes status continuously, so one
+/// second is many missed frames; short enough that a dead link is noticed
+/// well inside a mission, long enough not to flap on a single dropped packet.
+pub const CHASSIS_STATUS_STALE_S: f64 = 1.0;
+
+/// What `rover-control` currently believes about the chassis board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChassisState {
+    /// Armed and reporting: throttle may flow.
+    Armed,
+    /// The board's command watchdog is tripped. It stays tripped until it
+    /// receives a `ChassisCommand` with `|throttle| < 1e-3`, so control must
+    /// send throttle 0 until the status says otherwise — without this, after
+    /// a link blip mid-mission the chassis stays tripped while control
+    /// believes it is driving.
+    Tripped,
+    /// No `ChassisStatus` yet, or none for [`CHASSIS_STATUS_STALE_S`].
+    Unknown,
+}
+
+/// Tracks the latest `ChassisStatus` (clock-free, caller-supplied `now_s`,
+/// like [`SafetyGate`]). The chassis firmware boots tripped and only re-arms
+/// on a zero-throttle command, so this is a gate on the *host* side too:
+/// [`ChassisArm::drive_ok`] is ANDed into the drive gate by `main.rs`.
+/// Starts [`ChassisState::Unknown`] (closed).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChassisArm {
+    latest: Option<(bool, f64)>,
+}
+
+impl ChassisArm {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a `ChassisStatus` (`watchdog_tripped`) received at `now_s`.
+    pub fn on_status(&mut self, watchdog_tripped: bool, now_s: f64) {
+        self.latest = Some((watchdog_tripped, now_s));
+    }
+
+    pub fn state(&self, now_s: f64) -> ChassisState {
+        match self.latest {
+            Some((tripped, t)) if now_s - t <= CHASSIS_STATUS_STALE_S => {
+                if tripped {
+                    ChassisState::Tripped
+                } else {
+                    ChassisState::Armed
+                }
+            }
+            _ => ChassisState::Unknown,
+        }
+    }
+
+    /// Whether throttle may flow. Tripped and unknown both close it: the
+    /// zero-throttle commands the closed gate produces are exactly what
+    /// re-arms a tripped board, and what keeps an unknown one safe. (Steer is
+    /// centred while closed — the gate's usual behaviour — which is a
+    /// harmless simplification of "steer may still be sent".)
+    pub fn drive_ok(&self, now_s: f64) -> bool {
+        self.state(now_s) == ChassisState::Armed
+    }
+}
+
+// ===========================================================================
 // Confidence-based speed derating
 // ===========================================================================
 
@@ -1581,6 +1650,111 @@ mod tests {
         let cmd = act.tick_chassis_command(0.1, &s, true, 1.0, 0.02);
         assert_eq!(cmd.throttle, 0.0);
         assert!(cmd.steer.is_finite());
+    }
+
+    // -- chassis re-arm ----------------------------------------------------
+
+    #[test]
+    fn chassis_arm_starts_unknown_and_closed() {
+        let arm = ChassisArm::new();
+        assert_eq!(arm.state(0.0), ChassisState::Unknown);
+        assert!(!arm.drive_ok(0.0));
+    }
+
+    #[test]
+    fn chassis_arm_tracks_tripped_and_armed() {
+        let mut arm = ChassisArm::new();
+        arm.on_status(true, 1.0);
+        assert_eq!(arm.state(1.1), ChassisState::Tripped);
+        assert!(!arm.drive_ok(1.1));
+        arm.on_status(false, 1.2);
+        assert_eq!(arm.state(1.3), ChassisState::Armed);
+        assert!(arm.drive_ok(1.3));
+    }
+
+    #[test]
+    fn chassis_arm_goes_unknown_after_a_second_of_silence() {
+        let mut arm = ChassisArm::new();
+        arm.on_status(false, 10.0);
+        assert!(arm.drive_ok(10.0 + CHASSIS_STATUS_STALE_S));
+        assert_eq!(
+            arm.state(10.0 + CHASSIS_STATUS_STALE_S + 0.001),
+            ChassisState::Unknown
+        );
+    }
+
+    /// Regression for bug J: with the chassis tripped, every command that
+    /// leaves the actuator must be a (near-)zero throttle — that is the only
+    /// thing that re-arms the board — even though mission/IMU/E-stop all say
+    /// drive; and driving resumes once the status says armed.
+    #[test]
+    fn tripped_chassis_gets_zero_throttle_then_driving_resumes() {
+        let mut act = Actuator::new(actuator_cfg());
+        let mut gate = SafetyGate::new();
+        let mut arm = ChassisArm::new();
+        gate.on_mission_status(true, 0.0);
+        gate.on_imu(0.0);
+        arm.on_status(false, 0.0);
+        let st = state(0.0, 0);
+
+        let driving = act.tick_chassis_command(
+            0.0,
+            &st,
+            gate.drive_allowed(0.0) && arm.drive_ok(0.0),
+            0.0,
+            0.02,
+        );
+        assert!(driving.throttle > 0.0, "baseline: gate open drives");
+
+        // Link blip: the board trips and says so.
+        arm.on_status(true, 0.1);
+        gate.on_mission_status(true, 0.1);
+        gate.on_imu(0.1);
+        for i in 0..5 {
+            let now = 0.1 + 0.02 * i as f64;
+            let cmd = act.tick_chassis_command(
+                0.0,
+                &st,
+                gate.drive_allowed(now) && arm.drive_ok(now),
+                now,
+                0.02,
+            );
+            assert!(cmd.throttle.abs() < 1e-3, "tripped: got {}", cmd.throttle);
+        }
+
+        // Board re-armed (it saw the zero throttle) and reports it.
+        arm.on_status(false, 0.3);
+        gate.on_mission_status(true, 0.3);
+        gate.on_imu(0.3);
+        let resumed = act.tick_chassis_command(
+            0.0,
+            &st,
+            gate.drive_allowed(0.3) && arm.drive_ok(0.3),
+            0.3,
+            0.02,
+        );
+        assert!(resumed.throttle > 0.0, "resumes after re-arm");
+    }
+
+    /// The chassis drops a command whose `seq` is not wrap-aware newer than
+    /// the last accepted, so control's seq must advance by exactly one per
+    /// command on every path (gate open, closed, bad input) and never repeat.
+    #[test]
+    fn chassis_command_seq_increments_by_one_on_every_path() {
+        let mut act = Actuator::new(actuator_cfg());
+        let st = state(0.0, 0);
+        let mut last = None;
+        for i in 0..200u32 {
+            let open = i % 3 != 0;
+            let steer = if i % 7 == 0 { f32::NAN } else { 0.1 };
+            let cmd = act.tick_chassis_command(steer, &st, open, i as f64 * 0.02, 0.02);
+            if let Some(prev) = last {
+                assert_eq!(cmd.seq, u16::wrapping_add(prev, 1));
+            } else {
+                assert_eq!(cmd.seq, 1);
+            }
+            last = Some(cmd.seq);
+        }
     }
 
     // -- wheel speed from MCU timestamps (audit item 11) -------------------

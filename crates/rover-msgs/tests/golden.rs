@@ -130,11 +130,16 @@ macro_rules! all_types {
             state: MissionState::Running,
         });
         $mac!(CommandFrame {
+            session: 0xA5C3,
             cmd_seq: 9001,
             body: Command::SetMissionGoal(MissionGoal {
                 lat_deg: 7.006_9,
                 lon_deg: 100.498_8,
             }),
+        });
+        $mac!(CommandAck {
+            session: 0xA5C3,
+            cmd_seq: 9001,
         });
         $mac!(Telemetry {
             seq: 1_000_001,
@@ -185,6 +190,7 @@ macro_rules! all_types {
                 utc_ms: 1_700_000_000_000,
                 source: GnssSource::Backup,
             },
+            last_cmd_session: 0xA5C3,
             last_cmd_seq: 9001,
             health: HealthBits(0b0000_0100),
         });
@@ -236,54 +242,107 @@ fn should_update() -> bool {
         .unwrap_or(false)
 }
 
+/// Compare (or, under `UPDATE_GOLDEN`, write) `testdata/<fixture>.bin` for one
+/// value. `fixture` is the type's `NAME` for the canonical instance and
+/// `<NAME>_<Variant>` for the extra variants in [`variant_fixtures`].
+fn check_named<T: Wire + PartialEq + core::fmt::Debug>(fixture: &str, original: T) {
+    let mut buf = [0u8; 512];
+    let written = original.encode(&mut buf);
+    assert_eq!(
+        written,
+        T::WIRE_LEN,
+        "{fixture}: encode() length disagrees with WIRE_LEN"
+    );
+    let encoded = &buf[..written];
+
+    let path = testdata_dir().join(format!("{fixture}.bin"));
+
+    if should_update() {
+        std::fs::create_dir_all(path.parent().unwrap())
+            .unwrap_or_else(|e| panic!("creating {}: {e}", path.parent().unwrap().display()));
+        std::fs::write(&path, encoded)
+            .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+        eprintln!("wrote {}", path.display());
+    } else {
+        let fixture_bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{fixture}: could not read fixture {} ({e}). \
+                 If this is a new type, generate it with `UPDATE_GOLDEN=1 cargo test -p rover-msgs --test golden`, \
+                 commit the .bin file, and update perception/rover_perception/wire.py to match.",
+                path.display(),
+            )
+        });
+        assert_eq!(
+            encoded,
+            fixture_bytes.as_slice(),
+            "{fixture}: encoded bytes no longer match testdata/{fixture}.bin — \
+             this is either a wire-format regression, or an intentional protocol \
+             change that needs `UPDATE_GOLDEN=1` PLUS a coordinated update to \
+             perception/rover_perception/wire.py and a redeploy of every node.",
+        );
+
+        // The fixture must also decode back to the same value: a byte match
+        // alone doesn't prove decode() agrees about field order.
+        let decoded = T::decode(&fixture_bytes)
+            .unwrap_or_else(|e| panic!("{fixture}: fixture failed to decode: {e}"));
+        assert_eq!(
+            decoded, original,
+            "{fixture}: fixture decodes to a different value than the instance that produced it"
+        );
+    }
+}
+
 macro_rules! check_golden {
     ($ty:ident { $($field:tt)* }) => {{
-        let original = $ty { $($field)* };
-
-        let mut buf = [0u8; 512];
-        let written = original.encode(&mut buf);
-        assert_eq!(written, $ty::WIRE_LEN, "{}: encode() length disagrees with WIRE_LEN", $ty::NAME);
-        let encoded = &buf[..written];
-
-        let path = testdata_dir().join(format!("{}.bin", $ty::NAME));
-
-        if should_update() {
-            std::fs::create_dir_all(path.parent().unwrap())
-                .unwrap_or_else(|e| panic!("creating {}: {e}", path.parent().unwrap().display()));
-            std::fs::write(&path, encoded)
-                .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-            eprintln!("wrote {}", path.display());
-        } else {
-            let fixture = std::fs::read(&path).unwrap_or_else(|e| {
-                panic!(
-                    "{}: could not read fixture {} ({e}). \
-                     If this is a new type, generate it with `UPDATE_GOLDEN=1 cargo test -p rover-msgs --test golden`, \
-                     commit the .bin file, and update perception/rover_perception/wire.py to match.",
-                    $ty::NAME, path.display(),
-                )
-            });
-            assert_eq!(
-                encoded, fixture.as_slice(),
-                "{}: encoded bytes no longer match testdata/{}.bin — \
-                 this is either a wire-format regression, or an intentional protocol \
-                 change that needs `UPDATE_GOLDEN=1` PLUS a coordinated update to \
-                 perception/rover_perception/wire.py and a redeploy of every node.",
-                $ty::NAME, $ty::NAME,
-            );
-
-            // The fixture must also decode back to the same value: a byte match
-            // alone doesn't prove decode() agrees about field order.
-            let decoded = $ty::decode(&fixture).unwrap_or_else(|e| {
-                panic!("{}: fixture failed to decode: {e}", $ty::NAME)
-            });
-            assert_eq!(decoded, original, "{}: fixture decodes to a different value than the instance that produced it", $ty::NAME);
-        }
+        check_named($ty::NAME, $ty { $($field)* });
     }};
 }
 
 #[test]
 fn wire_bytes_match_committed_fixtures() {
     all_types!(check_golden);
+}
+
+/// Fixtures for the values `all_types!` does not cover: every other
+/// [`Command`] variant (the tag byte and the zero-padded payload area are
+/// exactly where a Python/Rust disagreement would hide), the absent-target
+/// branch of `MissionStatus` (presence flag false, goal zeroed) and the
+/// `valid = false` lane measurement. File names are `<Type>_<Variant>.bin`;
+/// `perception/tests/test_wire_golden.py` mirrors this list one for one.
+#[test]
+fn variant_bytes_match_committed_fixtures() {
+    let frame = |body| CommandFrame {
+        session: 0xA5C3,
+        cmd_seq: 9002,
+        body,
+    };
+    check_named("CommandFrame_Nop", frame(Command::Nop));
+    check_named(
+        "CommandFrame_SetSpeedLimit",
+        frame(Command::SetSpeedLimit(55)),
+    );
+    check_named("CommandFrame_CancelMission", frame(Command::CancelMission));
+    check_named("CommandFrame_EStop", frame(Command::EStop));
+    check_named("CommandFrame_ClearEStop", frame(Command::ClearEStop));
+    check_named(
+        "MissionStatus_NoTarget",
+        MissionStatus {
+            active: false,
+            distance_remaining_m: 0.0,
+            target: None,
+            state: MissionState::Idle,
+        },
+    );
+    check_named(
+        "LaneMeasurement_Invalid",
+        LaneMeasurement {
+            curvature_inv_m: 0.0,
+            heading_err_rad: 0.0,
+            cross_track_m: 0.0,
+            valid: false,
+            t_us: 271_828,
+        },
+    );
 }
 
 /// The 4-byte frame header is part of the contract too — a Python decoder

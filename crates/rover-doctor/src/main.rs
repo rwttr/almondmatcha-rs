@@ -1,9 +1,10 @@
 //! `rover-doctor` — base PC binary: preflight GO/NO-GO check.
 //!
-//! Run once on the base PC before driving, in place of `ground-station`
-//! (both bind the `base` service, so they cannot run at the same time —
-//! that is fine, this tool is meant to run *before* the operator starts
-//! `ground-station` for the session, not alongside it). It listens for
+//! Run once on the base PC before driving. It binds its own `doctor` service
+//! (192.168.1.10:7031), not `base` — it used to share `base` with
+//! `ground-station`, so the two died with `EADDRINUSE` whenever both ran;
+//! now it can run alongside it (it is still meant to run *before* the
+//! operator drives, but nothing forces the order). It listens for
 //! about ten seconds, then prints one line per check and exits `0` for GO
 //! or non-zero for NO-GO, so a launch script can gate on it directly:
 //!
@@ -72,15 +73,15 @@ fn main() {
         std::process::exit(2);
     });
 
-    let bind_addr = bus_config.addr_of(PeerId::Base).unwrap_or_else(|| {
+    let bind_addr = bus_config.addr_of(PeerId::Doctor).unwrap_or_else(|| {
         log::error!(
-            "no [services] entry for `base` in {}",
+            "no [services] entry for `doctor` in {}",
             args.config.display()
         );
         std::process::exit(2);
     });
     let link =
-        UdpLink::bind(PeerId::Base, bind_addr, bus_config.peers().clone()).unwrap_or_else(|e| {
+        UdpLink::bind(PeerId::Doctor, bind_addr, bus_config.peers().clone()).unwrap_or_else(|e| {
             log::error!("binding {bind_addr}: {e}");
             std::process::exit(2);
         });

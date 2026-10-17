@@ -12,9 +12,12 @@
 //! # E-stop: read this before wiring this up to anything real
 //!
 //! `Command::EStop` crosses a UDP link with no delivery guarantee. This
-//! binary retransmits it once a second until `Telemetry::last_cmd_seq`
-//! echoes back (`rover_bus::CommandSender`, already written and tested —
-//! see its doc comment), which is the best a network command can do. It is
+//! binary retransmits it once a second until `Telemetry::{last_cmd_session,
+//! last_cmd_seq}` acknowledges it (`rover_bus::CommandSender`, already
+//! written and tested — see its doc comment), which is the best a network
+//! command can do. An EStop pre-empts: it discards every queued command and
+//! replaces the one in flight (each is logged at warn level), and nothing
+//! issued afterwards can displace it. It is
 //! **not** the rover's safety mechanism. The guaranteed stop is the
 //! firmware command watchdog (plan §5.2): 200 ms with no `ChassisCommand`
 //! trips it, steering centres, throttle ramps to zero over 300 ms, and it
@@ -81,7 +84,7 @@ fn main() {
     });
     let bind_addr = bus_config.addr_of(PeerId::Base).unwrap_or_else(|| {
         log::error!(
-            "no [hosts]/[ports] entry for `base` in {}",
+            "no [services] entry for `base` in {}",
             args.config.display()
         );
         std::process::exit(1);
@@ -102,6 +105,7 @@ fn main() {
     let run_dir_path = run_dir.path().display().to_string();
     let csv_logger = csv_log::CsvLogger::spawn(run_dir);
     let mut sender = CommandSender::default();
+    log::info!("command session {:#06x}", sender.session());
 
     let latest_telemetry: Rc<RefCell<Telemetry>> = Rc::new(RefCell::new(Telemetry::default()));
     let last_telemetry_at: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
@@ -148,14 +152,37 @@ fn main() {
             match command_parse::parse_command(&line) {
                 Ok(cmd) => {
                     let is_estop = matches!(cmd, rover_msgs::Command::EStop);
-                    sender.set(cmd);
+                    // An EStop drops whatever was queued or in flight; say so
+                    // loudly, once per command, so the operator knows what
+                    // will NOT be sent (and, for the in-flight one, may
+                    // already have been applied).
+                    for d in sender.set(cmd) {
+                        let msg = match d.cmd_seq {
+                            Some(seq) => format!(
+                                "E-STOP discarded in-flight command {:?} (cmd_seq={seq}, \
+                                 unacknowledged -- the rover may already have applied it)",
+                                d.body
+                            ),
+                            None => format!("E-STOP discarded queued command {:?}", d.body),
+                        };
+                        log::warn!("{msg}");
+                        println!("\n{msg}");
+                    }
                     if is_estop {
                         // Printed immediately, not just on the next redraw --
                         // an operator who just pressed Enter on "estop"
                         // should see the disclaimer without waiting for the
                         // next 200 ms tick.
-                        println!("\nSending E-STOP (cmd_seq={}).", sender.cmd_seq());
+                        match sender.in_flight() {
+                            Some((seq, _)) => println!("\nSending E-STOP (cmd_seq={seq})."),
+                            None => println!("\nSending E-STOP."),
+                        }
                         println!("{}", display::ESTOP_DISCLAIMER);
+                    } else if sender.queue_len() > 0 {
+                        println!(
+                            "\nQueued behind the unacknowledged command ({} waiting).",
+                            sender.queue_len()
+                        );
                     }
                 }
                 Err(e) => println!("\ncommand error: {e}"),
@@ -165,7 +192,10 @@ fn main() {
         if let Some(frame) = sender.poll(Instant::now()) {
             let _ = bus.publish(&frame);
         }
-        sender.on_telemetry(latest_telemetry.borrow().last_cmd_seq);
+        {
+            let t = latest_telemetry.borrow();
+            sender.on_telemetry(t.last_cmd_session, t.last_cmd_seq);
+        }
 
         let now = Instant::now();
         if now >= next_redraw {
@@ -175,7 +205,7 @@ fn main() {
                 .map(|t| now.duration_since(t).as_millis() as u64);
             let status = link::classify(age_ms);
             let t = latest_telemetry.borrow();
-            let pending_seq = (!sender.is_acked()).then(|| sender.cmd_seq());
+            let pending_seq = sender.in_flight().map(|(seq, _)| seq);
             print!(
                 "{}",
                 display::render_dashboard(

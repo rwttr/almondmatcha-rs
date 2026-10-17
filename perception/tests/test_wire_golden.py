@@ -25,6 +25,7 @@ from rover_perception.wire import (
     ChassisCommand,
     ChassisStatus,
     Command,
+    CommandAck,
     CommandFrame,
     EkfDebug,
     FixQuality,
@@ -168,10 +169,15 @@ INSTANCES = [
     ),
     (
         CommandFrame(
+            session=0xA5C3,
             cmd_seq=9001,
             body=Command.set_mission_goal(MissionGoal(lat_deg=7.0069, lon_deg=100.4988)),
         ),
         "CommandFrame",
+    ),
+    (
+        CommandAck(session=0xA5C3, cmd_seq=9001),
+        "CommandAck",
     ),
     (
         Telemetry(
@@ -217,10 +223,33 @@ INSTANCES = [
                 utc_ms=1_700_000_000_000,
                 source=GnssSource.BACKUP,
             ),
+            last_cmd_session=0xA5C3,
             last_cmd_seq=9001,
             health=0b0000_0100,
         ),
         "Telemetry",
+    ),
+    # Variant fixtures, mirroring `variant_bytes_match_committed_fixtures` in
+    # golden.rs: every other Command variant, no-target MissionStatus, and an
+    # invalid lane measurement.
+    (CommandFrame(0xA5C3, 9002, Command.nop()), "CommandFrame_Nop"),
+    (CommandFrame(0xA5C3, 9002, Command.set_speed_limit(55)), "CommandFrame_SetSpeedLimit"),
+    (CommandFrame(0xA5C3, 9002, Command.cancel_mission()), "CommandFrame_CancelMission"),
+    (CommandFrame(0xA5C3, 9002, Command.estop()), "CommandFrame_EStop"),
+    (CommandFrame(0xA5C3, 9002, Command.clear_estop()), "CommandFrame_ClearEStop"),
+    (
+        MissionStatus(active=False, distance_remaining_m=0.0, target=None, state=MissionState.IDLE),
+        "MissionStatus_NoTarget",
+    ),
+    (
+        LaneMeasurement(
+            curvature_inv_m=0.0,
+            heading_err_rad=0.0,
+            cross_track_m=0.0,
+            valid=False,
+            t_us=271_828,
+        ),
+        "LaneMeasurement_Invalid",
     ),
     (
         SpeedLoopDebug(
@@ -305,3 +334,15 @@ def test_wire_len_constants_are_self_consistent():
     produce it."""
     for instance, fixture_name in INSTANCES:
         assert instance.WIRE_LEN == len(_fixture(fixture_name)), fixture_name
+
+
+def test_message_registry_matches_the_fixtures():
+    """`ALL_MESSAGES` (used to validate `[routes]` keys) must list every type
+    that has a canonical fixture, with unique names and ids."""
+    from rover_perception.wire import ALL_MESSAGES
+
+    names = [m.NAME for m in ALL_MESSAGES]
+    assert len(set(names)) == len(names)
+    assert len({m.TYPE_ID for m in ALL_MESSAGES}) == len(names)
+    canonical = {name for _, name in INSTANCES if "_" not in name}
+    assert canonical == set(names)

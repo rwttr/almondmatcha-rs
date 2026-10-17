@@ -74,7 +74,7 @@ try:
 except ImportError:  # Python < 3.11 -- the Jetson runs 3.10.
     import tomli as tomllib
 
-from .wire import encode_frame
+from .wire import MESSAGE_NAMES, encode_frame
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,11 @@ class BusConfig:
         routes_raw: Dict[str, List[str]] = raw.get("routes", {})
         routes: Dict[str, List[str]] = {}
         for msg_name, hosts in routes_raw.items():
+            # Mirrors rover_bus::ConfigError::UnknownMessage: a key that names
+            # no message type routes nothing, silently -- a typo looks exactly
+            # like "nobody subscribes".
+            if msg_name not in MESSAGE_NAMES:
+                raise ConfigError(f"[routes] key `{msg_name}` is not a known message type")
             for host in hosts:
                 if host not in services:
                     raise ConfigError(

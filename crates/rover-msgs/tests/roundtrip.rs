@@ -92,11 +92,16 @@ macro_rules! all_types {
             state: MissionState::Running,
         });
         $mac!(CommandFrame {
+            session: 0xA5C3,
             cmd_seq: 9001,
             body: Command::SetMissionGoal(MissionGoal {
                 lat_deg: 7.006_9,
                 lon_deg: 100.498_8,
             }),
+        });
+        $mac!(CommandAck {
+            session: 0xA5C3,
+            cmd_seq: 9001,
         });
         $mac!(Telemetry {
             seq: 1_000_001,
@@ -147,6 +152,7 @@ macro_rules! all_types {
                 utc_ms: 1_700_000_000_000,
                 source: GnssSource::Backup,
             },
+            last_cmd_session: 0xA5C3,
             last_cmd_seq: 9001,
             health: HealthBits(0b0000_0100),
         });
@@ -295,4 +301,24 @@ fn type_ids_are_unique() {
             pair[0].0, pair[0].1, pair[1].1,
         );
     }
+}
+
+/// `ALL_MESSAGES` (used by config validation and `rover-tap`) must list
+/// exactly the types this suite exercises — a new type missing from it would
+/// make a `[routes]` entry for it a config error and leave it undecodable in
+/// `rover-tap`.
+#[test]
+fn all_messages_lists_every_type() {
+    let mut exercised: Vec<(u16, &'static str)> = Vec::new();
+    macro_rules! collect_id {
+        ($ty:ident { $($field:tt)* }) => {{
+            let _ = $ty { $($field)* };
+            exercised.push(($ty::TYPE_ID, $ty::NAME));
+        }};
+    }
+    all_types!(collect_id);
+    exercised.sort();
+    let mut listed: Vec<(u16, &str)> = ALL_MESSAGES.to_vec();
+    listed.sort();
+    assert_eq!(listed, exercised);
 }

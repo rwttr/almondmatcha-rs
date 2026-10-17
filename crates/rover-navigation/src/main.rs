@@ -4,7 +4,9 @@
 //! `gnss_mission_monitor_node.cpp` with one process: two serial readers on
 //! their own threads feeding [`gnss::UbloxAssembler`] /
 //! [`gnss::SpresenseAssembler`], and a main loop that runs [`mission::Mission`]
-//! and answers [`rover_msgs::CommandFrame`]s from the base station.
+//! and answers [`rover_msgs::CommandFrame`]s from the base station,
+//! acknowledging each applied one with a [`rover_msgs::CommandAck`] (see
+//! `rover_bus::command`).
 //!
 //! # Two cross-cutting gaps that used to live here, now fixed
 //!
@@ -78,6 +80,8 @@ struct Args {
 /// that mission state and command handling feel immediate; slow enough not
 /// to spin the CPU on an RPi core with headroom needed elsewhere.
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
+/// How often `CommandAck` is re-published (2 Hz).
+const ACK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Cap on an incomplete serial line before it is dropped — see
 /// `gnss.rs::LineReader`.
@@ -130,6 +134,10 @@ fn main() {
 
     let mut mission = Mission::new(&mission_config);
     let mut cmd_receiver = CommandReceiver::new();
+    // Acknowledge what THIS process applied to rover-telemetry, which merges
+    // it with rover-control's before telling the base (see `CommandAck`).
+    // Sent right after a command is applied and then every `ACK_INTERVAL`.
+    let mut next_ack = Instant::now();
     let mut rtk_fix = GnssFix::default();
     let mut backup_fix = GnssFix::default();
     // Receive time of each stored fix. A fix is only as good as it is recent:
@@ -169,8 +177,10 @@ fn main() {
             let _ = bus.publish(&backup_fix);
         }
 
+        let mut ack_now = false;
         for frame in cmd_rx.try_iter() {
             if let Some(cmd) = cmd_receiver.apply(frame) {
+                ack_now = true;
                 log::info!(
                     "applying command: {cmd:?} (mission state was {:?}, goal was {:?})",
                     mission.state(),
@@ -181,6 +191,10 @@ fn main() {
         }
 
         let now = Instant::now();
+        if ack_now || now >= next_ack {
+            next_ack = now + ACK_INTERVAL;
+            let _ = bus.publish(&cmd_receiver.ack());
+        }
         let age_s = |t: Option<Instant>| t.map(|t| now.duration_since(t).as_secs_f64());
         let position = select_fresh_navigation_fix(
             &rtk_fix,
