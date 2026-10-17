@@ -147,8 +147,12 @@ pub struct CommandStatus {
     /// Commands queued behind the in-flight one.
     pub queue_len: usize,
     pub session: u16,
-    /// `Telemetry::last_cmd_seq` — what the rover last echoed.
-    pub last_acked_seq: u16,
+    /// `Telemetry::last_cmd_seq` — what the rover last echoed, but only when
+    /// the echo belongs to OUR session. `None` = no ack for this session seen
+    /// yet: a seq echoed under another session (the previous run of this
+    /// program, or another sender) or 0 ("no consensus") would sit next to
+    /// our own cmd_seqs and read as if it were ours.
+    pub last_acked_seq: Option<u16>,
 }
 
 pub fn format_command_line(c: &CommandStatus) -> String {
@@ -157,14 +161,18 @@ pub fn format_command_line(c: &CommandStatus) -> String {
     } else {
         String::new()
     };
+    let echoed = match c.last_acked_seq {
+        Some(seq) => format!("rover last echoed {seq}"),
+        None => "no ack yet this session".to_string(),
+    };
     match &c.in_flight {
         Some((seq, cmd)) => format!(
-            "Command:  {cmd:?} cmd_seq={seq} pending ack{queue} (rover last echoed {}; session {:#06x})",
-            c.last_acked_seq, c.session
+            "Command:  {cmd:?} cmd_seq={seq} pending ack{queue} ({echoed}; session {:#06x})",
+            c.session
         ),
         None => format!(
-            "Command:  none pending (rover last echoed {}; session {:#06x})",
-            c.last_acked_seq, c.session
+            "Command:  none pending ({echoed}; session {:#06x})",
+            c.session
         ),
     }
 }
@@ -289,7 +297,7 @@ mod tests {
             in_flight: None,
             queue_len: 0,
             session: 0xabcd,
-            last_acked_seq: 6,
+            last_acked_seq: Some(6),
         }
     }
 
@@ -304,6 +312,17 @@ mod tests {
         assert!(idle.contains("none pending"));
         assert!(idle.contains("echoed 6"));
         assert!(idle.contains("0xabcd"));
+    }
+
+    #[test]
+    fn command_line_says_no_ack_yet_for_a_foreign_session_echo() {
+        let mut c = idle_status();
+        c.last_acked_seq = None;
+        let idle = format_command_line(&c);
+        assert!(idle.contains("no ack yet this session"));
+        assert!(!idle.contains("echoed"));
+        c.in_flight = Some((1, Command::Nop));
+        assert!(format_command_line(&c).contains("no ack yet this session"));
     }
 
     #[test]

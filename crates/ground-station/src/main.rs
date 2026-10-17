@@ -148,6 +148,8 @@ fn main() {
     // the 200 ms full-screen redraw would erase a printed line almost at once.
     let mut notice = display::Notice::default();
 
+    let mut publish_limit = csv_log::RateLimit::with_interval(Duration::from_secs(5));
+
     loop {
         bus.poll();
 
@@ -193,7 +195,17 @@ fn main() {
         }
 
         if let Some(frame) = sender.poll(Instant::now()) {
-            let _ = bus.publish(&frame);
+            // A send error (no route, socket down) used to vanish, leaving
+            // the operator staring at "pending ack" for a command that never
+            // left the PC. Log it (rate-limited: poll() retries, so this can
+            // repeat every cycle) and put it on the dashboard too.
+            if let Err(e) = bus.publish(&frame) {
+                let now = Instant::now();
+                if let Some(n) = publish_limit.check(now) {
+                    log::warn!("command send failed: {e} (+{n} similar failures suppressed)");
+                }
+                notice.set(format!("command send FAILED: {e}"), now);
+            }
         }
         {
             let t = latest_telemetry.borrow();
@@ -212,7 +224,10 @@ fn main() {
                 in_flight: sender.in_flight(),
                 queue_len: sender.queue_len(),
                 session: sender.session(),
-                last_acked_seq: t.last_cmd_seq,
+                // Only an echo under OUR session is an ack of ours; right
+                // after a restart the rover still echoes the old session's
+                // seq (or 0 = no consensus).
+                last_acked_seq: (t.last_cmd_session == sender.session()).then_some(t.last_cmd_seq),
             };
             print!(
                 "{}",

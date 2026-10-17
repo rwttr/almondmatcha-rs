@@ -86,24 +86,32 @@ const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// Decides whether a repeating error may be logged now. Pure (time is passed
 /// in) so the rate limit is testable without sleeping.
 #[derive(Debug)]
-struct RateLimit {
+pub struct RateLimit {
     last: Option<Instant>,
     suppressed: u64,
+    interval: Duration,
 }
 
 impl RateLimit {
-    fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_interval(ERROR_LOG_INTERVAL)
+    }
+
+    /// Same limiter with its own window — the command-send path wants a
+    /// shorter one than a full disk does (an operator is waiting on it).
+    pub fn with_interval(interval: Duration) -> Self {
         Self {
             last: None,
             suppressed: 0,
+            interval,
         }
     }
 
     /// `Some(n)` = log now, `n` earlier occurrences were suppressed;
     /// `None` = stay quiet (and count it).
-    fn check(&mut self, now: Instant) -> Option<u64> {
+    pub fn check(&mut self, now: Instant) -> Option<u64> {
         match self.last {
-            Some(t) if now.saturating_duration_since(t) < ERROR_LOG_INTERVAL => {
+            Some(t) if now.saturating_duration_since(t) < self.interval => {
                 self.suppressed += 1;
                 None
             }
