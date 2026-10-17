@@ -433,3 +433,56 @@ def test_route_recovery_is_reported():
     finally:
         bus.close()
         route_sock.close()
+
+
+# ===========================================================================
+# Source address: rover-link only accepts a datagram whose source ip:port
+# equals a configured [services] address (`rover_link::udp::peer_of`).
+# ===========================================================================
+
+
+def _free_port() -> int:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_bus_for_a_service_sends_from_that_services_configured_addr():
+    own, ctl = _free_port(), _free_port()
+    cfg = BusConfig.parse(
+        f'[services]\nperception = "127.0.0.1:{own}"\ncontrol = "127.0.0.1:{ctl}"\n'
+        '[routes]\nLaneMeasurement = ["control"]\n'
+    )
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.bind(("127.0.0.1", ctl))
+    rx.settimeout(1.0)
+    with contextlib.closing(rx), Bus(cfg, self_service="perception") as bus:
+        bus.publish(_lane_measurement())
+        _, src = rx.recvfrom(2048)
+    # The cross-language contract: exactly the configured ip:port.
+    assert src == cfg.addr_of("perception")
+
+
+def test_bus_bind_failure_names_the_address_and_the_bind_any_escape():
+    from rover_perception.bus import BusBindError
+
+    # TEST-NET-1: not an address this host owns.
+    cfg = BusConfig.parse('[services]\nperception = "192.0.2.1:17999"\n')
+    with pytest.raises(BusBindError, match="--bind-any"):
+        Bus(cfg, self_service="perception")
+
+
+def test_bus_bind_any_uses_the_configured_port():
+    port = _free_port()
+    cfg = BusConfig.parse(
+        f'[services]\nperception = "192.0.2.1:{port}"\ncontrol = "127.0.0.1:{port + 0}"\n'
+    )
+    bus = Bus(cfg, self_service="perception", bind_any=True)
+    with contextlib.closing(bus._sock):
+        assert bus._sock.getsockname() == ("0.0.0.0", port)
+
+
+def test_bus_unknown_self_service_is_a_config_error():
+    cfg = BusConfig.parse(SAMPLE)
+    with pytest.raises(ConfigError):
+        Bus(cfg, self_service="perception")

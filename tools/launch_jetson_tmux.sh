@@ -82,10 +82,12 @@ export PYTHONUNBUFFERED=1
 # ~30 FPS, which is noise).
 #
 # Note `--csv` takes a PATH, not a boolean -- checked against
-# `perception/rover_perception/main.py`'s argparse. There is no established
-# filename for it in `docs/CSV_LOGGING.md` (the Jetson's Tier 2 log never
-# existed in this repo), so the launcher picks one and puts it in the shared
-# run directory with everything else.
+# `perception/rover_perception/main.py`'s argparse. The output
+# filename contract in `docs/VISION_PIPELINE.md` is `lane_detection.csv`,
+# which is what this launcher uses; the ROS 2 era wrote
+# `ws_jetson_lane_detection_TIMESTAMP.csv` (see `docs/CSV_LOGGING.md`), which
+# is not reproduced -- the run directory already carries the timestamp. It
+# goes in the shared run directory with everything else.
 # ---------------------------------------------------------------------------
 PERCEPTION_CSV="${PERCEPTION_CSV:-}"     # set below, once ROVER_RUN_DIR exists
 PERCEPTION_PREVIEW="${PERCEPTION_PREVIEW:-0}"
@@ -107,8 +109,8 @@ tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 # lay a run out the same way, which is what makes the two halves of a run
 # recognisable as one after they are rsync'd together.
 #
-# `next_run_number` strips the "run_" prefix, takes exactly the next three
-# characters and parses them; `format_run_timestamp` builds "YYYYMMDD_HHMMSS"
+# `next_run_number` strips the "run_" prefix, takes the leading run of
+# digits (at least three, any more -- run 1000 follows 999) and parses it; `format_run_timestamp` builds "YYYYMMDD_HHMMSS"
 # from a UTC unix timestamp -- hence `date -u`, not plain `date`.
 # ---------------------------------------------------------------------------
 mkdir -p "$RUNS_ROOT"
@@ -117,9 +119,8 @@ for _entry in "$RUNS_ROOT"/run_*; do
     [[ -d "$_entry" ]] || continue
     _name="$(basename "$_entry")"
     _rest="${_name#run_}"
-    _digits="${_rest:0:3}"
-    if [[ "$_digits" =~ ^[0-9]{3}$ ]]; then
-        _n=$((10#$_digits))
+    if [[ "$_rest" =~ ^([0-9]{3,}) ]]; then
+        _n=$((10#${BASH_REMATCH[1]}))
         (( _n > _max_run )) && _max_run=$_n
     fi
 done
@@ -190,7 +191,25 @@ tmux select-pane -t "$SESSION_NAME:0.0" -T "Perception"
 tmux send-keys   -t "$SESSION_NAME:0.0" "cd '$ROOT'" C-m
 tmux send-keys   -t "$SESSION_NAME:0.0" "$PANE_ENV" C-m
 tmux send-keys   -t "$SESSION_NAME:0.0" "clear && echo -e '\\e[1;36m>>> [1/1] PERCEPTION (D415 + lane detection) <<<\\e[0m' && sleep 1" C-m
-run_logged 0.0 perception "$PERCEPTION_CMD"
+# Unlike the RPi rover processes (see launch_rover_tmux.sh), perception is
+# restarted on exit: it is stateless (a restart just re-seeds the lane
+# search), and a dead perception leaves the rover on gyro + odometry only.
+# A clean exit 0 (operator quit, non-looping video ended) stops the loop.
+# The CSV logger appends, so a restart does not wipe the run's data. The
+# loop lives in a small generated script (not inline in send-keys) because
+# it needs bash's PIPESTATUS, and the pane's shell may be zsh.
+PERCEPTION_LOOP_SH="$ROVER_RUN_DIR/perception_loop.sh"
+cat > "$PERCEPTION_LOOP_SH" <<LOOP_EOF
+#!/usr/bin/env bash
+while true; do
+    stdbuf -oL -eL $PERCEPTION_CMD 2>&1 | tee -a '$ROVER_RUN_DIR/perception.log'
+    rc=\${PIPESTATUS[0]}
+    [[ \$rc -eq 0 ]] && break
+    echo "[restart] \$(date -u +%H:%M:%S) perception exited rc=\$rc; restarting in 2s" | tee -a '$ROVER_RUN_DIR/perception.log'
+    sleep 2
+done
+LOOP_EOF
+tmux send-keys -t "$SESSION_NAME:0.0" "bash '$PERCEPTION_LOOP_SH'" C-m
 
 # Pane 1: spare shell
 tmux set-option -p -t "$SESSION_NAME:0.1" @name "Spare_Shell"

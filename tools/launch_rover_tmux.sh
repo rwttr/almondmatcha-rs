@@ -137,8 +137,9 @@ tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 # The number and name are computed here with the *same* scheme as
 # `rover-runs::next_run_number` / `run_dir_name` -- not a reimplementation
 # that happens to look similar. `next_run_number` strips the "run_" prefix,
-# takes exactly the next 3 characters (not "up to the next underscore"),
-# and parses them as the run number, ignoring anything that doesn't parse;
+# takes the leading run of digits (at least 3, any more: run 1000 follows
+# 999; not "up to the next underscore") and parses it as the run number,
+# ignoring anything that doesn't parse;
 # `format_run_timestamp` builds "YYYYMMDD_HHMMSS" from a UTC unix timestamp
 # (its own test cross-checks this against `date -u`), not local time -- so
 # this allocator uses `date -u`, not plain `date`, deliberately.
@@ -148,9 +149,8 @@ for _entry in "$RUNS_ROOT"/run_*; do
     [[ -d "$_entry" ]] || continue
     _name="$(basename "$_entry")"
     _rest="${_name#run_}"
-    _digits="${_rest:0:3}"
-    if [[ "$_digits" =~ ^[0-9]{3}$ ]]; then
-        _n=$((10#$_digits))
+    if [[ "$_rest" =~ ^([0-9]{3,}) ]]; then
+        _n=$((10#${BASH_REMATCH[1]}))
         (( _n > _max_run )) && _max_run=$_n
     fi
 done
@@ -207,6 +207,14 @@ mkdir -p "$ROVER_RUN_DIR"
 # So: export it inside every pane explicitly, rather than trusting inheritance.
 PANE_ENV="export ROVER_RUN_DIR='$ROVER_RUN_DIR' RUST_LOG='$RUST_LOG'"
 
+# NO restart loop around the rover processes, deliberately (unlike the Jetson
+# launcher's perception pane). A rover-control that silently restarts
+# mid-mission would come back with its state machine reset and could
+# re-arm/drive without the operator knowing it had crashed; a crash must
+# stay visible in the pane, and restarting is a deliberate operator action.
+# (Re-running a command in the pane keeps ROVER_RUN_DIR, and the CSV logger
+# appends to the run's existing files.)
+#
 # run_logged <pane> <logname> <command>
 # The command is passed single-quoted by every caller so that any $(...) or
 # quoting inside it reaches the pane's shell intact and is evaluated there,

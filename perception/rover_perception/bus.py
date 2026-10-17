@@ -92,6 +92,12 @@ ROVER_CONFIG_ENV = "ROVER_CONFIG"
 Address = Tuple[str, int]
 
 
+class BusBindError(OSError):
+    """The socket could not be bound to this process's configured service
+    address (typically: this host does not own that IP). Distinct from
+    `ConfigError` so main.py can print the bind-any hint and exit non-zero."""
+
+
 class ConfigError(ValueError):
     """Mirrors `rover_bus::config::ConfigError`: something is wrong with
     `rover.toml`'s bus-relevant sections (unparseable TOML, a malformed
@@ -245,13 +251,43 @@ class Bus:
     publish a different type.
     """
 
-    def __init__(self, config: BusConfig, sock: Optional[socket.socket] = None) -> None:
+    def __init__(
+        self,
+        config: BusConfig,
+        sock: Optional[socket.socket] = None,
+        *,
+        self_service: Optional[str] = None,
+        bind_any: bool = False,
+    ) -> None:
         self._config = config
         # `sock` is injectable for tests that want to control the local
-        # bind address; production code (main.py) always takes the default,
-        # an ordinary unbound UDP socket -- fine for sending, since `sendto`
-        # picks an ephemeral local port on first use.
-        self._sock = sock if sock is not None else socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # bind address. Otherwise the socket is bound to THIS process's own
+        # `[services]` entry (`self_service`, e.g. "perception"), because
+        # `rover_link::udp::peer_of` accepts a datagram only if its source
+        # ip:port exactly equals a configured service address: an unbound
+        # socket sends from an ephemeral port, and the receiver drops every
+        # frame as coming from an unknown peer (the symptom is a perfectly
+        # healthy-looking publisher whose LaneMeasurements never arrive).
+        #
+        # `bind_any=True` binds 0.0.0.0:<configured port> instead, for a
+        # machine that does not own the configured IP (a dev laptop). The
+        # source PORT is then right, but the source IP is whatever the
+        # kernel routes from -- it matches the configured address only
+        # when this host really owns that IP, so on a machine that does
+        # not, the receiver will still drop frames. It is for dev use only.
+        #
+        # `self_service=None` keeps the old unbound behaviour (a bench or
+        # replay tool that never talks to a rover-link receiver).
+        if sock is not None:
+            self._sock = sock
+        else:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self_service is not None:
+                try:
+                    self._bind_own_address(self._sock, config, self_service, bind_any)
+                except BaseException:
+                    self._sock.close()
+                    raise
         # Per-TYPE_ID sequence counter -- see this module's docstring on why
         # per-type, not one counter for the whole bus.
         self._send_seq: Dict[int, int] = {}
@@ -261,6 +297,26 @@ class Bus:
         self._failing_routes: Dict[Address, Tuple[float, int]] = {}
         # addr -> monotonic time of the last WARNING emitted for it.
         self._route_warned_at: Dict[Address, float] = {}
+
+    @staticmethod
+    def _bind_own_address(
+        sock: socket.socket, config: BusConfig, service: str, bind_any: bool
+    ) -> None:
+        addr = config.addr_of(service)
+        if addr is None:
+            raise ConfigError(f"[services] has no entry for this process ({service!r})")
+        host, port = addr
+        bind_host = "0.0.0.0" if bind_any else host
+        try:
+            sock.bind((bind_host, port))
+        except OSError as exc:
+            raise BusBindError(
+                f"cannot bind {bind_host}:{port} (service {service!r}): {exc}. "
+                f"This host must own {host} for the receiver to accept our "
+                f"datagrams; on a dev machine without that address, bind "
+                f"0.0.0.0:{port} instead (--bind-any), knowing the receiver "
+                f"will still drop frames unless the source IP matches."
+            ) from exc
 
     def publish(self, msg) -> None:
         """Encode `msg` and send it to every service `[routes]` names for

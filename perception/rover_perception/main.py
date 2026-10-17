@@ -51,11 +51,19 @@ plumbing around it.
   module docstring) -- there is no queue, and therefore nothing for a frame
   to go stale *in*. A `None` from `camera.read()` here means either "no
   frame is available yet" (a D415 grab timeout -- try again) or "this
-  source is exhausted" (a non-looping video's end) -- see `_MAX_CONSECUTIVE_NONE`
-  below for how this loop tells those apart, which is a different problem
-  from staleness and not a relaxation of it.
+  source is exhausted or gone" (a non-looping video's end, or a D415 that
+  dropped off USB) -- see `_MAX_CONSECUTIVE_NONE` below for how this loop
+  tells those apart, which is a different problem from staleness and not a
+  relaxation of it.
 - `cv_bridge`, `sensor_msgs/Image`, QoS profiles, `rclpy` -- there is no ROS
   here at all; see `rover_perception/__init__.py`.
+
+# Recovery
+
+A bad frame (an exception from detect/publish) is logged rate-limited and
+skipped. A lost camera is reopened with backoff (`_REOPEN_BACKOFF_S`); only
+when that budget is spent does the process exit non-zero. A non-looping
+video's end is a clean exit 0, as before.
 """
 
 from __future__ import annotations
@@ -75,7 +83,7 @@ from typing import Deque, Optional, Sequence
 
 import cv2
 
-from .bus import Bus, BusConfig, ConfigError
+from .bus import Bus, BusBindError, BusConfig, ConfigError
 from .camera import Camera, CameraConfig, CameraError
 from .lane import LaneDetector, LaneResult
 from .wire import LaneMeasurement
@@ -85,15 +93,31 @@ logger = logging.getLogger("rover_perception.main")
 _FPS_WINDOW = 30
 
 # How many consecutive `camera.read() -> None` reads this loop tolerates
-# before treating the source as exhausted rather than momentarily busy.
+# before treating the source as exhausted or gone rather than momentarily
+# busy. (Then: a non-looping video ends the run; anything else triggers a
+# camera reopen with backoff, see `_REOPEN_BACKOFF_S`.)
 # `Camera.read()` returns `None` for two very different reasons that look
 # identical from here -- a routine D415 grab timeout (single frame, retry
 # is correct) and a non-looping video file's end-of-stream (permanent,
 # retrying forever would spin this loop at 100% CPU doing nothing). ~150
 # reads is a few seconds' worth of retries at typical camera rates -- long
 # enough that no plausible transient hiccup trips it, short enough that a
-# genuinely dead source is noticed quickly rather than hanging the process.
+# genuinely dead source is noticed quickly rather than hanging the process
+# (and, without the 10 ms sleep in the loop, spinning at 100% CPU).
 _MAX_CONSECUTIVE_NONE = 150
+
+# Delays (seconds) between attempts to reopen the camera after it has gone
+# away; one entry per attempt, so this is also the attempt budget. A
+# D415 that dropped off the USB bus (cable jolt, brown-out) usually comes
+# back within seconds, and a dead perception process means the rover runs
+# on gyro + odometry alone for the rest of the mission -- so try to recover
+# before giving up. Total wait ~31 s; after that the process exits NON-zero
+# so a supervisor (the Jetson launcher's restart loop) can see it failed.
+_REOPEN_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0)
+
+# Minimum seconds between logged per-frame errors: a detector that raises
+# on every frame would otherwise write ~30 tracebacks a second.
+_FRAME_ERROR_LOG_INTERVAL_S = 5.0
 
 _CSV_COLUMNS = ("timestamp", "curvature", "theta", "b", "detected", "fps")
 
@@ -242,11 +266,50 @@ def _camera_config_from_args(args: argparse.Namespace) -> CameraConfig:
     )
 
 
+class _RateLimitedErrorLog:
+    """Logs at most one exception per `interval_s`, counting the ones it
+    swallowed in between so the line that does appear says how bad it is."""
+
+    def __init__(self, interval_s: float = _FRAME_ERROR_LOG_INTERVAL_S) -> None:
+        self._interval_s = interval_s
+        self._last = -float("inf")
+        self._suppressed = 0
+
+    def log(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._last >= self._interval_s:
+            logger.exception("%s (%d similar suppressed)", message, self._suppressed)
+            self._last = now
+            self._suppressed = 0
+        else:
+            self._suppressed += 1
+
+
+def _reopen_camera(args: argparse.Namespace, shutdown: "_ShutdownFlag") -> Optional[Camera]:
+    """Try to reopen the camera, backing off between attempts. `None` once
+    the budget is spent (or shutdown was requested meanwhile)."""
+    for attempt, delay in enumerate(_REOPEN_BACKOFF_S, start=1):
+        if shutdown:
+            return None
+        logger.warning(
+            "reopening camera (attempt %d/%d) after %.1f s",
+            attempt, len(_REOPEN_BACKOFF_S), delay,
+        )
+        time.sleep(delay)
+        try:
+            return Camera(_camera_config_from_args(args))
+        except CameraError as exc:
+            logger.error("camera reopen failed: %s", exc)
+    return None
+
+
 def run(args: argparse.Namespace) -> int:
     """Initialise everything, run the capture/detect/publish loop until
     shutdown is requested (or the source is exhausted), and clean up.
-    Returns a process exit code: 0 on a clean shutdown, non-zero on a fatal
-    initialisation failure (bad config, camera that never opens).
+    Returns a process exit code: 0 on a clean shutdown (or a non-looping
+    video's end), non-zero on a fatal initialisation failure (bad config,
+    camera that never opens) or when the camera is lost and cannot be
+    reopened.
     """
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -266,7 +329,14 @@ def run(args: argparse.Namespace) -> int:
         logger.error("failed to open camera: %s", exc)
         return 1
 
-    bus = Bus(bus_config)
+    # Bound to our own [services] address, or rover-link drops every
+    # datagram (see Bus.__init__).
+    try:
+        bus = Bus(bus_config, self_service="perception", bind_any=args.bind_any)
+    except (BusBindError, ConfigError) as exc:
+        logger.error("failed to set up the bus socket: %s", exc)
+        camera.close()
+        return 1
     detector = LaneDetector()
     fps_counter = _RollingFps()
     csv_logger = _CsvLogger(Path(args.csv)) if args.csv else None
@@ -280,20 +350,41 @@ def run(args: argparse.Namespace) -> int:
     frame_count = 0
     consecutive_none = 0
     last_heartbeat = 0.0
+    frame_errors = _RateLimitedErrorLog()
+    exit_code = 0
 
     try:
         while not shutdown:
-            frame = camera.read()
+            try:
+                frame = camera.read()
+            except Exception:
+                # A backend raising mid-stream (pyrealsense2 on a USB drop)
+                # is the same event as a dead source: count it as a miss.
+                frame_errors.log("camera.read() raised")
+                frame = None
             if frame is None:
                 consecutive_none += 1
                 if consecutive_none >= _MAX_CONSECUTIVE_NONE:
+                    if args.video and args.no_loop:
+                        logger.info("end of non-looping video; stopping")
+                        break
                     logger.error(
                         "no frame from camera for %d consecutive reads; "
-                        "stopping (end of a non-looping video, or the camera "
-                        "went away)",
+                        "camera presumed lost, trying to reopen",
                         consecutive_none,
                     )
-                    break
+                    camera.close()
+                    new_camera = _reopen_camera(args, shutdown)
+                    if new_camera is None:
+                        if not shutdown:
+                            logger.error("camera could not be reopened; giving up")
+                            exit_code = 1
+                        break
+                    camera = new_camera
+                    consecutive_none = 0
+                    # Stale tracking seed from before the gap.
+                    detector.reset()
+                    continue
                 # A short sleep, not a busy spin, while waiting on a source
                 # that has nothing for us right now (a D415 grab timeout, or
                 # one bad video frame) -- see _MAX_CONSECUTIVE_NONE's
@@ -303,37 +394,44 @@ def run(args: argparse.Namespace) -> int:
                 continue
             consecutive_none = 0
 
-            result = detector.detect(frame)
+            # One bad frame (a detector exception, a publish/pack error)
+            # must not kill the process: log (rate-limited) and carry on with
+            # the next frame.
+            try:
+                result = detector.detect(frame)
 
-            # Free-running, wrapping u32 microsecond counter local to this
-            # publisher -- see wire.py's LaneMeasurement and the porting
-            # brief: consumers only ever take deltas within one publisher's
-            # own stream, so the epoch is arbitrary, but it must monotonic
-            # and must WRAP (not reset to 0) when it overflows, which is
-            # exactly what `& 0xFFFFFFFF` on an ever-increasing counter
-            # does.
-            t_us = time.monotonic_ns() // 1000 & 0xFFFFFFFF
-            msg = LaneMeasurement(
-                curvature_inv_m=result.curvature_inv_m,
-                heading_err_rad=result.heading_err_rad,
-                cross_track_m=result.cross_track_m,
-                valid=result.valid,
-                t_us=t_us,
-            )
-            bus.publish(msg)
-
-            achieved_fps = fps_counter.tick()
-            frame_count += 1
-
-            if csv_logger is not None:
-                csv_logger.log(
-                    time.time(),
-                    result.curvature_inv_m,
-                    math.degrees(result.heading_err_rad),
-                    result.cross_track_m,
-                    result.valid,
-                    achieved_fps,
+                # Free-running, wrapping u32 microsecond counter local to this
+                # publisher -- see wire.py's LaneMeasurement and the porting
+                # brief: consumers only ever take deltas within one publisher's
+                # own stream, so the epoch is arbitrary, but it must monotonic
+                # and must WRAP (not reset to 0) when it overflows, which is
+                # exactly what `& 0xFFFFFFFF` on an ever-increasing counter
+                # does.
+                t_us = time.monotonic_ns() // 1000 & 0xFFFFFFFF
+                msg = LaneMeasurement(
+                    curvature_inv_m=result.curvature_inv_m,
+                    heading_err_rad=result.heading_err_rad,
+                    cross_track_m=result.cross_track_m,
+                    valid=result.valid,
+                    t_us=t_us,
                 )
+                bus.publish(msg)
+
+                achieved_fps = fps_counter.tick()
+                frame_count += 1
+
+                if csv_logger is not None:
+                    csv_logger.log(
+                        time.time(),
+                        result.curvature_inv_m,
+                        math.degrees(result.heading_err_rad),
+                        result.cross_track_m,
+                        result.valid,
+                        achieved_fps,
+                    )
+            except Exception:
+                frame_errors.log("per-frame detect/publish failed; skipping frame")
+                continue
 
             now = time.monotonic()
             if args.verbose:
@@ -367,7 +465,7 @@ def run(args: argparse.Namespace) -> int:
         camera.close()
         bus.close()
 
-    return 0
+    return exit_code
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -411,6 +509,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not loop a video file at end-of-stream (default: loop).",
     )
 
+    parser.add_argument(
+        "--bind-any",
+        action="store_true",
+        help=(
+            "Bind the bus socket to 0.0.0.0:<perception port> instead of the "
+            "configured IP, for a dev machine that does not own it. The "
+            "receiver still drops frames unless the source IP matches."
+        ),
+    )
     parser.add_argument(
         "--config",
         metavar="PATH",

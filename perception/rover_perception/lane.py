@@ -130,6 +130,9 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+# Largest finite float32; the wire's '<f' fields cannot carry more.
+_F32_MAX = 3.4028234663852886e38
+
 
 class LaneConfig:
     """Mirrors `vision_navigation.config.LaneDetectionConfig` field-for-field.
@@ -612,6 +615,21 @@ class LaneDetector:
             detected = False
             curvature_px = theta_deg = b_m = float("nan")
 
+        # Non-finite (or beyond-float32) geometry is not a lane. The wire
+        # packs these as '<f', and struct.pack raises OverflowError on a
+        # finite double above float32's range (and NaN/inf would reach the
+        # EKF as garbage), which would kill the publish loop -- degrade to
+        # valid=false instead, same as any other lost frame. Checked on the
+        # converted wire values, since the 2*px_per_m curvature scale can
+        # itself push a large-but-finite fit past the f32 limit.
+        curvature_inv_m = 2.0 * curvature_px * cfg.BEV_PX_PER_M if detected else 0.0
+        heading_err_rad = -math.radians(theta_deg) if detected else 0.0
+        if detected and not all(
+            math.isfinite(v) and abs(v) <= _F32_MAX
+            for v in (curvature_inv_m, heading_err_rad, b_m)
+        ):
+            detected = False
+
         # Track the lane across frames: `b` is the fitted offset at the
         # canvas bottom row, exactly where the next frame's first search
         # window starts, so it is the correct seed with no re-derivation.
@@ -632,7 +650,7 @@ class LaneDetector:
         # compute_lane_params; curvature needs a scale conversion (1/px to
         # 1/m), theta only a unit conversion (degrees to radians) -- and,
         # as of D5, a sign correction.
-        curvature_inv_m = 2.0 * curvature_px * cfg.BEV_PX_PER_M
+        # (curvature_inv_m is computed above, in the finiteness guard.)
 
         # Sign convention: heading_err_rad positive means "the lane heads
         # right, steer right" -- the same convention cross_track_m and
@@ -650,7 +668,7 @@ class LaneDetector:
         # deliberately keeps the original's (wrong) convention unchanged --
         # see module docstring section 2 -- so the frozen parity oracle in
         # tests/test_lane_parity.py still applies at that boundary.
-        heading_err_rad = -math.radians(theta_deg)
+        # (heading_err_rad = -radians(theta_deg), also computed above.)
 
         return LaneResult(
             curvature_inv_m=curvature_inv_m,

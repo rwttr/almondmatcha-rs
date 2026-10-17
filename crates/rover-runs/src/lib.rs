@@ -2,14 +2,12 @@
 //!
 //! Split out into its own crate (rather than living in `rover-telemetry`,
 //! where it started) because `ground-station` needs the identical
-//! `run_NNN_<stamp>/` numbering for its own CSV capture — see
-//! `docs/RUST_REWRITE_PLAN.md`'s task brief on why a second, hand-copied
-//! implementation of run numbering is exactly the bug class this project
-//! keeps finding: two run-number scanners that drift apart (off-by-one in
-//! the zero-padding, a different tie-break on a malformed directory name,
-//! ...) would let a base-station capture and a rover capture from the same
-//! session disagree about which run they belong to. One crate, one
-//! implementation, used by both binaries.
+//! `run_NNN_<stamp>/` naming for its own CSV capture, and one shared
+//! implementation keeps the zero-padding and the parse rules from drifting
+//! between binaries. Note that each machine (RPi, Jetson, base station)
+//! scans its own `runs/` directory and numbers its runs independently, so
+//! run numbers do NOT line up across machines; the timestamp is what ties
+//! the halves of one session together.
 //!
 //! Two behaviours are carried over deliberately:
 //!
@@ -20,9 +18,11 @@
 //!   file with headers regardless. A missing CSV is positive evidence that
 //!   topic never delivered data.
 //! - **Run numbering scans the directory for the current maximum**, same as
-//!   `get_next_run_number` (`glob("run_*")`, parse the three digits after
+//!   `get_next_run_number` (`glob("run_*")`, parse the leading digits after
 //!   `run_`, take the max, add one) rather than persisting a counter
-//!   anywhere.
+//!   anywhere. Names are zero-padded to at least three digits, and parsing
+//!   accepts any digit count, so run 1000 follows run 999 instead of the
+//!   scanner reading `100` forever.
 
 #![forbid(unsafe_code)]
 
@@ -41,8 +41,17 @@ pub fn next_run_number(existing_dir_names: &[String]) -> u32 {
     existing_dir_names
         .iter()
         .filter_map(|name| name.strip_prefix("run_"))
-        .filter_map(|rest| rest.get(0..3))
-        .filter_map(|digits| digits.parse::<u32>().ok())
+        // Leading ASCII digits, any count (3 is only the zero-pad minimum):
+        // a fixed 3-char slice would read run_1000 as 100 and re-issue
+        // run 101 forever.
+        .filter_map(|rest| {
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            (end >= 3)
+                .then(|| rest[..end].parse::<u32>().ok())
+                .flatten()
+        })
         .max()
         .map_or(1, |n| n + 1)
 }
@@ -152,19 +161,48 @@ impl RunDir {
         Ok(())
     }
 
-    /// Open `filename` inside this run directory for the first time,
-    /// writing `header` immediately, creating the run directory itself if
-    /// this is the first file created for this run. Returns an already-open
-    /// handle ready for `writeln!` of subsequent rows.
+    /// Open `filename` inside this run directory for appending, writing
+    /// `header` only if the file is new or empty. Returns an already-open
+    /// handle ready for `writeln!` of subsequent rows, creating the run
+    /// directory itself if this is the first file created for this run.
+    ///
+    /// Append, not truncate: a process restarted in its tmux pane keeps the
+    /// same `ROVER_RUN_DIR`, and truncating would wipe the run's data so
+    /// far. If the existing file's first line differs from `header` (a
+    /// different schema), rows are NOT mixed into it: the file is rotated
+    /// to `name.1.csv`, `name.2.csv`, ... (first one that is new, empty, or
+    /// has a matching header).
     pub fn create_csv(&self, filename: &str, header: &str) -> std::io::Result<File> {
         self.ensure_dir()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(self.path.join(filename))?;
-        file.write_all(header.as_bytes())?;
-        Ok(file)
+        let (stem, ext) = match filename.rsplit_once('.') {
+            Some((s, e)) => (s, format!(".{e}")),
+            None => (filename, String::new()),
+        };
+        let expected_first_line = header.lines().next().unwrap_or("");
+        let mut candidate = filename.to_string();
+        let mut n = 0u32;
+        loop {
+            let path = self.path.join(&candidate);
+            let existing_header = match File::open(&path) {
+                Ok(f) => {
+                    let mut first = String::new();
+                    std::io::BufRead::read_line(&mut std::io::BufReader::new(f), &mut first)?;
+                    first
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e),
+            };
+            let is_new = existing_header.is_empty();
+            if is_new || existing_header.trim_end() == expected_first_line {
+                let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+                if is_new {
+                    file.write_all(header.as_bytes())?;
+                }
+                return Ok(file);
+            }
+            n += 1;
+            candidate = format!("{stem}.{n}{ext}");
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -236,6 +274,89 @@ mod tests {
         assert!(run_dir.path().exists());
         assert!(run_dir.path().join("a.csv").exists());
 
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn run_numbers_past_999_keep_counting() {
+        assert_eq!(next_run_number(&["run_999_x".to_string()]), 1000);
+        assert_eq!(next_run_number(&["run_1000_x".to_string()]), 1001);
+        assert_eq!(
+            next_run_number(&["run_999_x".to_string(), "run_12345_x".to_string()]),
+            12346
+        );
+        assert_eq!(run_dir_name(1000, 0), "run_1000_19700101_000000");
+        // Still at least three digits, so shorter names are not accepted.
+        assert_eq!(next_run_number(&["run_12_x".to_string()]), 1);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let tmp =
+            std::env::temp_dir().join(format!("rover-runs-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn new_csv_gets_its_header() {
+        let tmp = scratch("csv_new");
+        let rd = RunDir {
+            path: tmp.join("run"),
+            created: Default::default(),
+        };
+        rd.create_csv("a.csv", "H1,H2\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(rd.path().join("a.csv")).unwrap(),
+            "H1,H2\n"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn reopening_appends_without_a_second_header() {
+        let tmp = scratch("csv_reopen");
+        let rd = RunDir {
+            path: tmp.join("run"),
+            created: Default::default(),
+        };
+        let mut f = rd.create_csv("a.csv", "H1,H2\n").unwrap();
+        writeln!(f, "1,2").unwrap();
+        drop(f);
+        let mut f = rd.create_csv("a.csv", "H1,H2\n").unwrap();
+        writeln!(f, "3,4").unwrap();
+        drop(f);
+        assert_eq!(
+            fs::read_to_string(rd.path().join("a.csv")).unwrap(),
+            "H1,H2\n1,2\n3,4\n"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn header_mismatch_rotates_to_a_new_file() {
+        let tmp = scratch("csv_rotate");
+        let rd = RunDir {
+            path: tmp.join("run"),
+            created: Default::default(),
+        };
+        let mut f = rd.create_csv("a.csv", "H1,H2\n").unwrap();
+        writeln!(f, "1,2").unwrap();
+        drop(f);
+        let mut f = rd.create_csv("a.csv", "X,Y,Z\n").unwrap();
+        writeln!(f, "7,8,9").unwrap();
+        drop(f);
+        assert_eq!(
+            fs::read_to_string(rd.path().join("a.csv")).unwrap(),
+            "H1,H2\n1,2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(rd.path().join("a.1.csv")).unwrap(),
+            "X,Y,Z\n7,8,9\n"
+        );
+        // Same new schema again appends to the rotated file.
+        drop(rd.create_csv("a.csv", "X,Y,Z\n").unwrap());
+        assert!(!rd.path().join("a.2.csv").exists());
         fs::remove_dir_all(&tmp).ok();
     }
 
