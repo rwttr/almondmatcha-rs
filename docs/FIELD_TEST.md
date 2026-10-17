@@ -34,9 +34,11 @@ cannot hold two different default targets and these build for
 build --release` at the repo root does not build them, and never will** — you
 must `cd` into each crate. This catches people every time.
 
-`rust-toolchain.toml` already pins the toolchain and lists
-`thumbv7em-none-eabihf` under `targets`, so rustup installs the cross target
-on its own the first time you build inside the repo.
+`rust-toolchain.toml` pins the toolchain to an exact release (`1.99.1`, with
+`rustfmt`, `clippy` and `llvm-tools`) and lists `thumbv7em-none-eabihf` under
+`targets`, so rustup installs both the compiler and the cross target on its
+own the first time you build inside the repo. (It used to say `stable`, which
+let the firmware size figures drift; bump it deliberately.)
 
 ### Which binaries each machine actually needs
 
@@ -46,7 +48,8 @@ on its own the first time you build inside the repo.
 | Base `192.168.1.10` | `ground-station`, `rover-doctor`, `rover-tap` |
 | Jetson `192.168.1.5` | the `rover-perception` console script (product 4) |
 
-`cargo build --release` builds all twelve crates; if you would rather not,
+`cargo build --release` builds all 13 workspace packages (the twelve crates plus
+`tools/replay`); if you would rather not,
 `cargo build --release -p rover-control -p rover-navigation -p rover-telemetry`
 is what the RPi launch script tells you to run when it finds a binary missing.
 
@@ -146,7 +149,7 @@ against gains that have never run with a correctly-signed heading term.
 
 ### 0.3 Flashing
 
-Nothing in `firmware/` has ever met silicon. First flash is a bench activity,
+As of 2026-10-17 nothing in `firmware/` has ever met silicon. First flash is a bench activity,
 not a field one — do it before you pack. `docs/RUST_REWRITE_PLAN.md` §13.4 has
 the full hardware-verification debt list in risk order; the Ethernet PHY is
 the hard gate, and §13.4a explains what the firmware can and cannot tell you
@@ -193,7 +196,9 @@ reflash it with the plain `cargo build --release` above. `docs/CALIBRATION.md`
 sequence tells you three things worth reading:
 
 - **The POST result** — a board that fails its power-on self-test still boots
-  and still publishes, degraded and saying so.
+  and still publishes, degraded and saying so. (The chassis also boots
+  **tripped** — see §1 — so a freshly flashed chassis logging `tripped` is
+  correct, not a fault.)
 - **The reset cause** — an unexpected watchdog or brown-out reset here is a
   finding, not noise.
 - ⚠️ **The PHY strap warning.** Both boards log `ANAR` and the decoded
@@ -230,10 +235,26 @@ Power in this order:
 3. **Both NUCLEOs** (chassis 192.168.1.2, sensors 192.168.1.6).
 4. **Base station** (192.168.1.10) — last, and optional.
 
-**Keep the drive wheels off the ground until §4.** The chassis firmware starts
-with the command watchdog already tripped, so an unattended board sits at zero
-throttle rather than whatever the pins powered up as — but that is a safety
-net, not a substitute for blocks.
+**Keep the drive wheels off the ground until §4.** The chassis firmware boots
+with its command watchdog already **tripped**, so an unattended board sits at
+zero throttle rather than driving on the first command it hears — but that is a
+safety net, not a substitute for blocks. (The motor enable pins float for the
+instant between reset and the firmware taking them over — `STATUS_OPEN.md` §3
+item 9 — which is one more reason for blocks.)
+
+**How the chassis gets armed.** It stays tripped until it receives a
+`ChassisCommand` with zero throttle from `rover-control` (`192.168.1.1:7001` —
+it ignores any other source). `rover-control` does this by itself: it reads
+`ChassisStatus`, and while the board reports `watchdog_tripped` it sends zero
+throttle, which is exactly the re-arming command; once the status says armed,
+throttle may flow, subject to the rest of the drive gate (a live IMU, a
+`MissionStatus`, an accepted camera frame). If `rover-control` hears no
+`ChassisStatus` for 1 s it closes its drive gate rather than drive a board that
+may be tripped, rebooted or unreachable. The same path re-arms the board after
+any later trip (cable blip, `rover-control` restart): expect `WATCHDOG_TRIPPED`
+to show in the base's health line for a moment, then clear — it does not need a
+human. A tripped board that never re-arms means `rover-control` is not running
+or is not getting `ChassisStatus`.
 
 Check the LAN before anything else:
 
@@ -334,6 +355,16 @@ directory convention, same tee'd logs, same `SKIP_ATTACH=1`. It allocates its
 own `run_NNN_<stamp>/` on the Jetson's own filesystem — the two machines have
 separate disks, and §5 is where the halves get reassembled.
 
+**Perception is restarted if it dies** (unlike the RPi processes): the pane runs
+a small generated `perception_loop.sh` that restarts it two seconds after any
+non-zero exit and stops on a clean exit 0. Perception itself survives
+per-frame exceptions and reopens a lost camera with backoff (1, 2, 4, 8, 16 s)
+before giving up and exiting non-zero, so a restart means the camera did not
+come back. The CSV logger appends, so a restart does not wipe the run's data.
+Perception sends from its own `[services] perception` address — the RPi's
+processes drop datagrams from any other source — so on a dev machine that does
+not own `192.168.1.5` it needs `--bind-any`.
+
 Field defaults are CSV logging **on** (a run you cannot analyse afterwards was
 a wasted drive), no preview window, and the throttled heartbeat rather than
 per-frame logging. Overrides, all environment variables:
@@ -363,7 +394,15 @@ rover_perception.main` takes the same flags.
 cargo run --release -p ground-station
 ```
 
-Operator commands are whole words followed by Enter, not single keystrokes:
+`ground-station` and `rover-doctor` (§3) bind different `[services]` addresses
+(`base` `192.168.1.10:7030` and `doctor` `192.168.1.10:7031`), so both can run
+on the base PC at the same time; they used to fight over one port.
+
+Operator commands are whole words followed by Enter, not single keystrokes.
+They go out one at a time, in order; the dashboard's `Command:` line shows the
+one in flight, how many are queued behind it, the session id, and the last
+`cmd_seq` the rover echoed. An `estop` is different: it discards the queue and
+replaces whatever is in flight, and nothing replaces an in-flight `estop`.
 
 | Command | Alias | Effect |
 |---|---|---|
@@ -394,20 +433,34 @@ that.
 ## 3. Preflight — `rover-doctor`
 
 Run this on the base PC after everything is up and before the wheels touch the
-ground.
+ground. It must be the base PC: it binds the `doctor` service,
+`192.168.1.10:7031`, and on a machine without that address it exits with status
+2 and a bind error before printing a single check. It does not conflict with
+`ground-station` — they bind different ports — so leave the dashboard up.
 
 ```sh
 cargo run --release -p rover-doctor
 ```
 
-Binds as `base`, listens ten seconds (`--listen-secs` — long enough for more
-than one period of every feed, including the boards' 1 Hz heartbeat), prints
-one line per check, exits non-zero on NO-GO so it can gate a launch script.
+Listens ten seconds (`--listen-secs` — long enough for more than one period of
+every feed, including the boards' 1 Hz heartbeat), prints one line per check,
+exits non-zero on NO-GO so it can gate a launch script. What it hears comes
+from the two boards' `BoardDiagnostics` and the rover's `Telemetry`; it does
+not probe individual services.
 
-Checks: every service reachable; both boards passed POST; no abnormal reset
-causes; both links at 100 Mbit/s full duplex with no symbol errors; no health
-bits; **drivetrain calibrated**; RTK fix quality; lane detection live;
-estimator converged.
+The nine checks, in print order: **feeds reachable** (both boards'
+diagnostics and `Telemetry` were all seen — absence is `NOT SEEN`); **board
+POST** (both passed; a board that ran no checks at all is NO-GO); **reset
+causes** (no abnormal cause on either board); **board link quality** (both at
+100 Mbit/s full duplex with no symbol errors; a speed of 0 means "could not
+read the PHY" and is `NOT SEEN`); **telemetry health bits** (none set);
+**drivetrain calibrated** (`metres_per_tick > 0` in the *base PC's*
+`config/rover.toml` — the output names the file, and the RPi's copy must
+match); **RTK fix quality** (`RtkFloat` or `RtkFixed` — expect NO-GO on a bench
+with no sky view); **lane detection live** (`lane_age_ms` within the
+estimator's stale threshold, read from `Telemetry`); **estimator converged**
+(`ESTIMATOR_DIVERGED` clear). An estimator the telemetry process has never
+heard from reads as diverged, not healthy.
 
 Reading the output:
 
@@ -428,18 +481,28 @@ breakdown, and the point is to be able to bisect a regression, which you
 cannot do if everything changes at once.
 
 1. **On blocks, wheels clear.** Confirm the servo turns the right way (§0.2)
-   and follows the lane. Confirm the command watchdog trips when you kill
-   `ground-station`, and that the motors ramp to zero rather than stepping.
-2. **Straight line, walking pace.** `speed 20`. Watch `cross_track_m` in the
-   base display, not the rover.
+   and follows the lane. Confirm the command watchdog trips — and the motors
+   ramp to zero rather than stepping — when you **kill `rover-control` (or pull
+   the chassis's Ethernet cable)**. Do *not* use `ground-station` for this: the
+   watchdog is fed by `rover-control`'s `ChassisCommand` stream, and losing the
+   base must never stop the rover (killing the base should change nothing but
+   the dashboard's link line). Then restart `rover-control` and confirm the
+   board re-arms by itself (§1).
+2. **Straight line, walking pace.** `speed 20`. Watch the rover, and the
+   dashboard's speed, mission and health lines; the base dashboard does **not**
+   show `cross_track_m`. That lives in `rover_state.csv` on the RPi (and in
+   `Telemetry` on the wire), so to watch it live run `rover-tap --as ...` with
+   the `[debug] mirror` set (§5), or read the CSV afterwards.
 3. **Gentle curve.** The first place the heading term does real work.
 4. **Full circuit.**
 
 Abort at the first surprise and look at the logs before repeating. A run you
 do not understand is worth less than no run.
 
-Stop the run cleanly — `cancel`, then stop `rover-telemetry` — rather than
-cutting power. Files are flushed on close.
+Stop the run cleanly — `cancel`, wait a couple of seconds, then stop
+`rover-telemetry` — rather than cutting power. CSV writers flush about once a
+second and no process installs a signal handler, so Ctrl-C, `tmux kill-session`
+or a power cut can lose the last ~1 s of rows.
 
 ---
 
@@ -456,10 +519,16 @@ runs/run_001_20260920_143052/
     rover_state.csv     chassis_status.csv    board_diagnostics.csv
     mission_status.csv  power.csv             speed_loop_debug.csv
     rtk_gnss.csv        backup_gnss.csv
+    rover_control.log   rover_navigation.log rover_telemetry.log   (launcher tee)
 ```
 
+**On the Jetson** (its own disk, same naming): `lane_detection.csv`,
+`perception.log` and the generated `perception_loop.sh`.
+
 **On the base** (`ground-station`, same `--runs-dir` flag — the old
-`--log-file` is gone): `ground_station_telemetry.csv`.
+`--log-file` is gone): `ground_station_telemetry.csv` (its columns include
+`Last_Cmd_Session` and `Last_Cmd_Seq`, which is how you tell afterwards what the
+rover had acknowledged).
 
 The base capture is **not** redundant. It records what the operator actually
 saw, including link gaps the rover's own log cannot show because the rover was
@@ -472,11 +541,17 @@ between the two logs *is* the finding.
 > above. There is no `chassis_imu.csv`: `ImuSample` routes only to `control`,
 > so raw IMU is not captured on this branch.
 
-**Files are created on first write, not at startup.** A missing CSV is
-positive evidence that the feed never delivered a sample; a run that received
-nothing leaves nothing and consumes no run number. Do not "fix" this by
+**CSV files are created on first write, not at startup.** A missing CSV is
+positive evidence that the feed never delivered a sample. Do not "fix" this by
 pre-creating headers — an earlier version did, and it made a dead feed
-indistinguishable from a quiet one.
+indistinguishable from a quiet one. Two caveats: the **launch scripts** create
+the run directory eagerly and tee every pane's console output into it, so a
+launch always leaves a directory and consumes a run number even if nothing
+arrives — "a run that received nothing leaves nothing" holds only for a binary
+run by hand. And files **append**: restarting a process in its pane keeps the
+same `ROVER_RUN_DIR` and adds to its CSVs rather than overwriting them; if a
+file's header no longer matches (a schema change between builds) the old file
+is kept and new rows go to `name.1.csv`, `name.2.csv`, ….
 
 **Read `board_diagnostics.csv` first when something felt wrong.** POST results,
 reset cause and link state for both boards, decoded to names — a row saying
@@ -508,12 +583,19 @@ back, ~83 MB/s at 1280×720/30 fills the Jetson's 128 GB in ~26 minutes
 ### Watching live instead
 
 ```sh
-cargo run --release -p rover-tap -- --as telemetry --hz
+cargo run --release -p rover-tap -- --mirror --hz
 ```
 
 Routing is unicast fan-out, so a tap sees only what is addressed to the service
-it binds as. `[debug] mirror` + `--mirror` shows the whole bus — **leave the
-mirror empty for real field runs** so nothing depends on a laptop being there.
+it binds as — and `--as telemetry` on the RPi would collide with the running
+`rover-telemetry` for that port, so use the mirror there. `[debug] mirror` +
+`--mirror` shows every frame a *host* process publishes (`RoverState`,
+`Telemetry`, `MissionStatus`, `CommandFrame`, …). It does **not** show what the
+boards send — `ImuSample`, `WheelSensors`, `ChassisStatus`, `PowerSample`,
+`BoardDiagnostics` — because the firmware has no mirror; for those, tap as the
+service they are routed to (`--as control`, with `rover-control` stopped and the
+RPi's address — `docs/CALIBRATION.md` §4). **Leave the mirror empty for real
+field runs** so nothing depends on a laptop being there.
 
 ---
 
@@ -542,7 +624,8 @@ Kept short on purpose; `docs/STATUS_OPEN.md` is authoritative and this list
 will rot before that one does.
 
 1. Drivetrain calibration is `0.0` (§0.1).
-2. Nothing has been flashed (§0.3); the LAN8742A PHY is the hard gate.
+2. Nothing has been flashed, as of 2026-10-17 (§0.3); the LAN8742A PHY is the
+   hard gate.
 3. Servo direction unverified, and the D5 re-tune (§0.2). The sign itself is
    fixed.
 4. Replay parity is against a synthetic trace only. No recorded ROS 2 run

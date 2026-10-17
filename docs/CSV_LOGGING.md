@@ -22,6 +22,33 @@ data as a ROS 2 one, they're paired here; where it doesn't, that's noted too:
 | `chassis_imu.csv` | *(none — `ImuSample` routes only to `control`; raw IMU isn't captured)* |
 | `chassis_cmd.csv` | *(none — motor commands aren't logged on this branch)* |
 | — | `rover_state.csv`, `chassis_status.csv`, `board_diagnostics.csv` — new on `rs`, no ROS 2 equivalent |
+| *(Jetson)* `ws_jetson_lane_detection_TIMESTAMP.csv` | `lane_detection.csv` in the Jetson's own `run_NNN_<stamp>/` — written by `perception` when `--csv` is given (the launch script passes it) |
+| *(base)* none — the base was display-only | `ground_station_telemetry.csv` — new on `rs`; header `Timestamp_us,Seq,Rtk_Lat,Rtk_Lon,Rtk_Fix,Rtk_Sats,Backup_Lat,Backup_Lon,Backup_Fix,Speed_mps,Mission_State,Mission_Active,Distance_Remaining_m,Bus_Volts,Current_A,Last_Cmd_Session,Last_Cmd_Seq,Health_Bits` |
+
+**`speed_loop_debug.csv` header on `rs`:**
+`Timestamp_us,Measured_Left_TPS,Measured_Right_TPS,Measured_Avg_TPS,Target_TPS,Error_Pct,PID_Output_Pct`
+— the same seven columns as the `chassis_speed_pid.csv` schema below, in the
+same order.
+
+**How the `rs` writers behave** (the schemas below say nothing about this):
+
+- **Append, not truncate.** A process restarted in its pane keeps the same
+  `ROVER_RUN_DIR`; its CSVs are opened for appending and the header is written
+  only for a new or empty file. If an existing file's first line differs from
+  the header (a schema change between builds), the old file is kept untouched
+  and rows go to `name.1.csv`, `name.2.csv`, … — the first that is new, empty
+  or matching.
+- **Buffered, flushed about once a second with `sync_data`.** Up to ~1 s of rows
+  can be lost if a process is killed (there is no signal handler) or power is
+  cut.
+- **Bounded queues.** The writer sits behind a bounded channel (8,192 rows in
+  `rover-telemetry`, 1,024 in `ground-station`); when a stalled disk fills it,
+  new rows are dropped and counted, and the count is logged once a second. A
+  gap in a CSV is therefore either "no data arrived" or "the disk stalled" —
+  the process log says which.
+- **Files are still created on first write**, as the Tier 1 section below
+  describes — but the launch scripts create the run directory itself eagerly
+  (they tee console logs into it), so a launch always leaves a directory.
 
 ---
 
@@ -368,6 +395,11 @@ Both RPi and Jetson used synchronized run numbering:
 **Example**:
 - Run 1: `run_001_20250104_143052/`
 - Run 2: `run_002_20250104_151823/`
+
+On branch `rs` the numbering lives in the `rover-runs` crate (and is mirrored
+by the two launch scripts' bash allocators, which must agree with it): `NNN` is
+at least three digits, and run numbers above 999 (`run_1000_…`) parse and
+increment correctly in all three.
 
 ---
 

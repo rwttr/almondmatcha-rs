@@ -63,10 +63,14 @@ doctor     = "192.168.1.10:7031"
 # port — see `rover-tap`'s own doc comment. That is inherent to unicast, not
 # a bug.
 #
-# When `mirror` is set, every published frame is additionally sent there, so
-# one rover-tap sees the whole bus from anywhere on the LAN. Costs one extra
-# datagram per message — negligible at these rates, but leave it empty for
-# field runs so nothing depends on a laptop being present.
+# When `mirror` is set, every frame published by a HOST process (rover-bus's
+# Bus::publish) is additionally sent there, so one rover-tap sees all of the
+# host-side traffic from anywhere on the LAN. The firmware has no mirror
+# concept: ImuSample, WheelSensors, ChassisStatus, PowerSample and
+# BoardDiagnostics are sent by the boards straight to their routed
+# destinations and never reach it. Costs one extra datagram per message —
+# negligible at these rates, but leave it empty for field runs so nothing
+# depends on a laptop being present.
 [debug]
 mirror = ""                   # e.g. "192.168.1.100:7099"
 
@@ -243,7 +247,7 @@ timeout_s          = 2.0
 # line and take the variance of the lane parameters over a few hundred frames.
 # No such recording exists yet -- no ROS 2 runs/ CSVs exist in this repository
 # and none ever did. A run must be produced first before R can be seeded this
-# way. See docs/STATUS_OPEN.md §1.1.
+# way. See docs/STATUS_OPEN.md §2 ("EKF tuning eats time" row) and §1.4.
 # ---------------------------------------------------------------------------
 [estimator]
 predict_hz            = 100.0

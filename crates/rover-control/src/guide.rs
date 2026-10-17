@@ -1,7 +1,8 @@
 //! Stage 2: guide. The pluggable [`LateralController`] trait (plan §8) and
 //! its only implementation, [`StaticGain`] — the bit-exact port of
 //! `rover_kinematic_control_node.py`'s steering law and the parity baseline
-//! every future controller is measured against (plan §10; docs/STATUS_OPEN.md §1). `Lqr` and
+//! every future controller is measured against (plan §10; the replay gate that checks it, and
+//! why that gate is still synthetic-only, is `docs/STATUS_OPEN.md` §1.4). `Lqr` and
 //! `Mpc` are named in the plan as later work and are deliberately **absent**
 //! here, not stubbed — see `docs/RUST_REWRITE_PLAN.md` §8 and this crate's
 //! `config` module, which rejects `control.law = "lqr"`/`"mpc"` at startup

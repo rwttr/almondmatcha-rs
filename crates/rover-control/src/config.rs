@@ -53,9 +53,9 @@ pub struct AppConfig {
 /// Which [`crate::guide::LateralController`] to build. A closed enum rather
 /// than a free-form string: `Lqr`/`Mpc` are named in the plan (§8) as future
 /// work and deliberately not implemented here (see this crate's top-level
-/// docs and `docs/STATUS_OPEN.md` §1) — naming them as *rejected* variants means a config
-/// asking for one fails loudly at startup instead of silently falling back
-/// to `StaticGain`.
+/// docs, `docs/REWRITE_SUMMARY.md` §8 and plan §9 step 15) — naming them as
+/// *rejected* variants means a config asking for one fails loudly at startup
+/// instead of silently falling back to `StaticGain`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ControllerLaw {
     StaticGain(StaticGainConfig),

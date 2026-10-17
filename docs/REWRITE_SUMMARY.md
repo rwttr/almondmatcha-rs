@@ -7,11 +7,15 @@ evidence, see [STATUS_DONE.md](STATUS_DONE.md) and
 [STATUS_OPEN.md](STATUS_OPEN.md) — this document covers architecture and
 rationale, not day-to-day state.
 
-**Status:** complete as software, unproven as a rover. **Nothing has been
-flashed to a board, and the drivetrain is uncalibrated.** Those two facts
-govern everything below; `STATUS_OPEN.md` has the full accounting.
+**Status:** complete as software, unproven as a rover. **As of 2026-10-17
+nothing has been flashed to a board, and the drivetrain is uncalibrated.**
+Those two facts govern everything below; `STATUS_OPEN.md` has the full
+accounting. A 2026-10-17 audit fixed a long list of software faults
+(`STATUS_DONE.md` §8) — including a sign error in the estimator that its own
+tests shared — which is a reason to trust the code more and the absence of
+bench time no less.
 
-Designed and built 19–20 September 2026. The ROS 2 rover still runs on `main`
+Designed and built 19–20 September 2026; audited 17 October 2026. The ROS 2 rover still runs on `main`
 in `RoboticsGG/almondmatcha`, the fallback — this repository's `origin` has
 no `main` branch of its own.
 
@@ -22,8 +26,9 @@ no `main` branch of its own.
 The rover ran on ROS 2 across five machines, including two NUCLEO-F767ZI
 boards running mROS 2 — a C/C++ port of ROS 2 — over mbed OS, lwIP and
 embeddedRTPS. Branch `rs` deletes all of it and replaces it with plain UDP
-datagrams on a static LAN, a single Cargo workspace covering both the Linux
-binaries and the microcontroller firmware, and one Python process on the
+datagrams on a static LAN, one repository holding both the Linux binaries (a
+Cargo workspace) and the microcontroller firmware (two separate Cargo
+projects) against one shared message crate, and one Python process on the
 Jetson for perception. There is no middleware, no discovery, no broker, no
 code generation, and no TCP. Along the way the estimator was upgraded from an
 exponential moving average to a 5-state EKF, and the firmware gained a
@@ -69,7 +74,7 @@ framework is a liability rather than leverage.
 |---|---|
 | ROS 2 Humble + Fast-DDS on Linux | Plain UDP datagrams, static routing table in `config/rover.toml` |
 | mROS 2 + embeddedRTPS + lwIP + mbed OS on two MCUs | [Embassy](https://embassy.dev) async Rust, `no_std` |
-| `.msg`/`.srv`/`.action` files + `rosidl` codegen | `crates/rover-msgs` — 17 hand-written types, one shared crate |
+| `.msg`/`.srv`/`.action` files + `rosidl` codegen | `crates/rover-msgs` — 18 hand-written types, one shared crate |
 | Three DDS domains (D4/D5/D6) for isolation | Unicast fan-out from a table. Isolation is not needed when nothing discovers anything. |
 | Multicast discovery, `initialPeersList` | Static addresses. Nothing discovers anything, ever. |
 | `camera_stream_node` → DDS → `lane_detection_node` | One Python process. The hop was 1:1 on the same machine. |
@@ -80,10 +85,12 @@ framework is a liability rather than leverage.
 
 ### The structural win
 
-**One Cargo workspace builds the host binaries and the MCU firmware against
-one shared message crate.** A wire-layout disagreement between the Raspberry
-Pi and an STM32 is now a compile error on a laptop instead of a HardFault in
-a field. This is the single change that most reduces the cost of being wrong.
+**One repository builds the host binaries and the MCU firmware against one
+shared message crate.** (The firmware crates are separate Cargo projects — a
+workspace cannot hold two default targets — that take `rover-msgs` by path.)
+A wire-layout disagreement between the Raspberry Pi and an STM32 is now a
+compile error on a laptop instead of a HardFault in a field. This is the
+single change that most reduces the cost of being wrong.
 
 ---
 
@@ -105,8 +112,11 @@ form. Previously, if the Raspberry Pi died mid-drive, the STM32 held its last
 PWM value indefinitely and the rover kept going. Now: a 200 ms command
 timeout, a 300 ms throttle ramp to zero rather than a step into a loaded
 drivetrain, steering centred immediately, and an independent 500 ms hardware
-watchdog for hung firmware. Recovery requires an explicit zero-throttle
-command — it never resumes by itself just because packets came back.
+watchdog for hung firmware. The chassis boots tripped, accepts commands only
+from `rover-control`, and drops stale ones. Recovery requires an explicit
+zero-throttle command — it never resumes by itself just because packets came
+back — and `rover-control` supplies it automatically by watching
+`ChassisStatus`.
 
 **A test suite**, where the first-party ROS 2 code had none. (One file was
 named `test_lane_pipeline_video.py`, but it contains zero assertions — it is
@@ -159,7 +169,7 @@ not a parity failure, but it must not be mistaken for one.
 | ├─ vendored MCU stack | 766 files |
 | └─ docs, launch tooling, `command/`, `.vscode/` | 109 files |
 | Tracked source, before → after | ~12.5 MB → 2.3 MB |
-| Message types | 17, plus the frame header — 18 golden byte fixtures |
+| Message types | 18, plus the frame header — 26 golden byte fixtures (with seven variant fixtures) |
 
 Current test counts and firmware flash/RAM figures move as work lands, so
 they live in one place rather than two: `STATUS_DONE.md` §1. (The
@@ -169,7 +179,7 @@ footprint, not today's total.)
 
 ---
 
-## 7. Four things that will bite you
+## 7. Five things that will bite you
 
 **The sign convention is inverted from ISO 8855, deliberately.**
 `heading_err_rad`, `cross_track_m` and `steer` are all positive when the
@@ -187,6 +197,14 @@ only — 2× decoding. The Rust firmware decodes both channels on every edge —
 4× decoding. Any calibration taken against the old firmware reads exactly
 double. `config/rover.toml` records `decoding = "quadrature_4x"` for this
 reason.
+
+**The sign convention bit twice, not once.** Besides the detector's `theta`
+(D5), the 2026-10-17 audit found the EKF's process model had the curvature
+term backwards (`e_psi_dot = (gyro - b_g) - v*kappa`; the right-hand-positive
+convention makes it `+ v*kappa`). The model's tests had been written from the
+same wrong equation, so they passed. Plan §2.2 has the dated note and the
+derivation; the gyro's own z-up, counter-clockwise-positive assumption is the
+remaining unchecked link (`STATUS_OPEN.md` §3 item 8).
 
 **Hardware quadrature is impossible on this harness.** STM32 timer encoder
 mode needs both channels of one encoder on the same timer. Verified
@@ -209,8 +227,8 @@ the document now carries a banner saying so.
 `STATUS_DONE.md` is authoritative on what is built and its evidence;
 `STATUS_OPEN.md` on what remains and what to worry about. In short: all
 twelve crates, both firmware images, the perception process and the replay
-gate are done and tested — 331 Rust tests, 88 Python tests, clippy/rustfmt
-clean. Board self-diagnostics landed most recently: both boards run a
+gate are done and tested — 434 Rust tests, 122 Python tests, clippy/rustfmt
+clean, toolchain pinned to rustc 1.99.1. Board self-diagnostics landed most recently: both boards run a
 power-on self-test and report it, along with reset cause and Ethernet link
 state, and `rover-doctor` turns that into a preflight GO/NO-GO. None of it
 has met silicon.
@@ -218,9 +236,10 @@ has met silicon.
 **Blocking field use — neither is a coding task:** calibrating the
 drivetrain (`ticks_per_rev`, `metres_per_tick`, `track_width_m` are all `0.0`
 in `config/rover.toml`) and flashing the boards for the first time, past the
-LAN8742A PHY gate. `STATUS_OPEN.md` §1.1–§1.2 has the procedures and the
-reasoning; `docs/FIELD_TEST.md` is the end-to-end procedure once they're
-done.
+LAN8742A PHY gate. `docs/CALIBRATION.md` is the calibration procedure
+(plan §2.6 is the reasoning), `STATUS_OPEN.md` §1.1–§1.2 the order of
+operations for the first bench session; `docs/FIELD_TEST.md` is the end-to-end
+procedure once they're done.
 
 **Deferred by choice:** the two ESP32 LoRa links (out of scope by
 instruction, but the reason there is no TCP anywhere), and the LQR and MPC
@@ -236,8 +255,8 @@ control laws (phase 2 and 3 — the trait exists so they are additions).
 | [STATUS_DONE.md](STATUS_DONE.md) | What is built, and the evidence for it. Authoritative over any status claim elsewhere. |
 | [STATUS_OPEN.md](STATUS_OPEN.md) | What remains and what to worry about. Authoritative over any status claim elsewhere. |
 | [HARDWARE.md](HARDWARE.md) | Machines, sensors, both pin maps, calibration status. |
-| [CALIBRATION.md](CALIBRATION.md) | The drivetrain calibration procedure — probe-rs setup, which ST-Link is which board, Procedures A and B. |
-| [FIELD_TEST.md](FIELD_TEST.md) | Bench to logged field run, and getting the data back. |
+| [CALIBRATION.md](CALIBRATION.md) | Step-by-step drivetrain encoder calibration: which ST-Link is which board, build/flash, Procedures A and B. |
+| [FIELD_TEST.md](FIELD_TEST.md) | Cold bench to logged run: build, flash, launch order, preflight, the drive, where the data lands. |
 | [VISION_PIPELINE.md](VISION_PIPELINE.md) | How a camera frame becomes lane geometry. ROS 2 era, still the reference. |
 | [CONTROL_LAW.md](CONTROL_LAW.md) | Steering and speed derivation. ROS 2 era — see the warning above. |
 | [CSV_LOGGING.md](CSV_LOGGING.md) | Log schemas. ROS 2 era. |

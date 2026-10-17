@@ -8,9 +8,11 @@ This file is deliberately the pessimistic half. It exists so that nobody has
 to infer what is missing by reading a list of accomplishments and noticing an
 absence.
 
-**The one-line version: the software is written and tested, and none of it has
-ever run on the rover.** Every item in §1 must be cleared before a field run
-means anything.
+**The one-line version: the software is written and tested, and as of
+2026-10-17 none of it has ever run on the rover.** Every item in §1 must be
+cleared before a field run means anything. (The 2026-10-17 audit fixed a
+long list of faults in the software — `STATUS_DONE.md` §8 — and found a few
+more things only a bench can settle: §3 items 8-10, and §8 here.)
 
 ---
 
@@ -45,13 +47,42 @@ is no flag to skip it.
 
 ### 1.2 Nothing has ever been flashed
 
-Every firmware claim is a claim about a binary that compiles, not one that has
-run. The LAN8742A PHY against Embassy's `GenericPhy` is the gate that decides
-whether any of it is real — see §3 below and `RUST_REWRITE_PLAN.md` §13.4a.
+As of 2026-10-17. A bench session had been pencilled in for 2026-09-21; it did
+not happen, and no board has been flashed since. Every firmware claim is a
+claim about a binary that compiles, not one that has run. The LAN8742A PHY
+against Embassy's `GenericPhy` is the gate that decides whether any of it is
+real — see §3 below and `RUST_REWRITE_PLAN.md` §13.4a.
 
 This applies to the board self-diagnostics too, and the irony is worth stating
 plainly: **the power-on self-test has itself never executed.** It is
 scaffolding for the first bring-up, not evidence about it.
+
+**First bench session, in order** (the Linux base PC, `192.168.1.10`, both
+NUCLEOs on USB; `docs/CALIBRATION.md` §§1-3 has the commands):
+
+1. **Install the toolchain on that PC** (`docs/CALIBRATION.md` §2): the apt
+   prerequisites, `probe-rs-tools`, the udev rule — then **replug both
+   boards** so the kernel re-evaluates permissions. It is a fresh machine for
+   this stack and this is the step that bites.
+2. **Identify the two probes before flashing anything.** `probe-rs list` with
+   both cables in shows two ST-Links. Sensors (`192.168.1.6`) is
+   `066DFF3932504E3043014542`, corroborated by git history; chassis
+   (`192.168.1.2`) is `066AFF3932504E3043101915`, recovered from the old
+   `flash_chassis` OpenOCD alias with no second source. Confirm both against
+   `probe-rs list` as the first act of the session, and correct the table in
+   `docs/CALIBRATION.md` §1 if the chassis value disagrees.
+3. **Always pass `--probe`.** With both ST-Links attached `probe-rs run`
+   picks whichever enumerates first, and that order is not stable across
+   replugs — so the `cargo run --release` shortcut is not safe on this bench;
+   use `probe-rs run --probe 0483:374b:<serial> …`.
+4. **Flash the sensors board with the `calibration` image** and run Procedure
+   A (`docs/CALIBRATION.md` §3.1, §5): the first time any of this firmware
+   meets silicon. Then flash the chassis board and **read its `defmt` output
+   for the PHY strap warning** (§3.1) before unplugging the cable. If the
+   boards are also on the LAN, `rover-tap --as control --type WheelSensors`
+   reads the same counts without reflashing — but it needs the RPi's
+   `192.168.1.1` address, so it is the fallback, not the plan
+   (`docs/CALIBRATION.md` §4).
 
 ### 1.3 D5 — the heading sign: **fixed in software, re-tune outstanding**
 
@@ -103,11 +134,11 @@ they actually stand:
 |---|---|
 | **PHY bring-up on F767ZI** | **Open — still the hard gate.** Exposure is unchanged; diagnosis is much better. The boards report PHY identity, negotiated speed, duplex and symbol errors, and now also `ANAR` and the `MODE[2:0]` straps — see §3.1, which is a concrete, likely failure mode that was invisible before. See plan §13.4a. |
 | **Control regression from the port** | **Partly closed.** Replay gate passes against a frozen oracle; the lane port is exact against the vendored original. Field parity unproven — see §1.4. |
-| **Sign-convention inversion** | **Sign closed; gain re-tune open.** Worth remembering how it went wrong: the mitigation was "documented §10, unit-tested", and that documentation is exactly what let D5 hide — the prose asserted a convention nothing checked against the consuming model. See §1.3. |
+| **Sign-convention inversion** | **Sign closed; gain re-tune open.** Worth remembering how it went wrong: the mitigation was "documented §10, unit-tested", and that documentation is exactly what let D5 hide — the prose asserted a convention nothing checked against the consuming model. See §1.3. The 2026-10-17 audit found a second one of the same kind inside the EKF (the curvature term of the process model had the wrong sign, and its tests had shared the error — plan §2.2), so the entry stays "closed" only for the two signs anyone has checked; the gyro's own sign is §3 item 8. |
 | **Encoder constant wrong after 2×→4×** | **Open**, but now checkable: `HARDWARE.md` §3 records an expected value, so the calibration run either confirms it or disagrees loudly. |
 | **RTK bandwidth over 433 MHz** | Deferred to phase 2. Untouched. |
 | **No command uplink when disconnected** | **Architecturally answered** — goals preload from `[mission]` and the base station is non-essential by design — but the LoRa link itself is phase 2. |
-| **EKF tuning eats time** | **Open.** "Seed `R` from measured variance" still requires a recording that does not exist. The other half — "log innovations from day one" — *is* done, via `EkfDebug`. |
+| **EKF tuning eats time** | **Open.** "Seed `R` from measured variance" still requires a recording that does not exist (see §1.4 for why none does). The other half — "log innovations from day one" — *is* done, via `EkfDebug`. |
 | **Magnetometer disappoints** | Deferred by design, behind an off-by-default flag. Not a concern. |
 | **Jetson Python bus drifts from Rust** | **Closed.** Golden-byte fixtures checked from both languages, both directions. |
 | **No ROS 2 escape hatch** | Accepted. `main` is intact in `RoboticsGG/almondmatcha` (not this repository). Criterion 10 ("`main` still builds") has not been re-verified recently. |
@@ -141,6 +172,37 @@ none of it is closable from a desk:
 6. **Watchdog end to end** — cannot be faked in a test.
 7. **Every timing constant** — 200 ms / 300 ms / 500 ms are reasoned, not
    measured.
+8. **Gyro z sign.** Since the 2026-10-17 audit the EKF depends explicitly on
+   the gyro's z axis being **z-up, counter-clockwise positive**
+   (`e_psi_dot = (gyro - b_g) + v*kappa`, plan §2.2; `rover-model`'s comments
+   spell out the derivation). How the LSM6DSV16X sits on the IKS4A1 relative
+   to the chassis has never been checked against that. Check on the bench:
+   with the IMU feed visible, turn the rover counter-clockwise (seen from
+   above) by hand and confirm z reads **positive**. A negative reading means
+   every yaw-rate term is backwards; fix it at the source (the chassis
+   firmware's IMU read), not in the estimator, because the model and the
+   zero-rate update both assume z-up. The feed is published by the board
+   straight to `control`, so reading it needs `rover-tap --as control
+   --type ImuSample` on the RPi's address (`docs/CALIBRATION.md` §4) — the
+   `[debug] mirror` cannot see it.
+9. **Motor enable pins float from reset until `Motors::new`.** The four
+   H-bridge enables (`PF12 PD15 PF13 PE9`) are floating inputs after reset;
+   the firmware now constructs `Motors` (all enables low, 0 % duty) as the
+   first thing in `main`, before Ethernet bring-up, but software cannot close
+   the window between reset and that call. Hardware pull-downs on the four
+   enable lines would. Worth looking at with a meter or scope at power-on
+   before the motors are connected to anything that matters.
+10. **Encoder decode runs in the executor, not an ISR.** The decode arms EXTI
+    before sampling the pins, which closed the lost-edge window the audit
+    found, but a *second* edge arriving before the task samples decodes as a
+    diagonal jump and counts as zero. Under executor load (UDP, I2C) at high
+    wheel speed, ticks could fall short. Check it in Procedure A: spin a
+    wheel slowly and then fast, and compare the counts for the same ten
+    turns — they should match. If they fall short, move the decode into the
+    EXTI interrupt handler or onto a hardware timer. (At the recalled ~1500
+    ticks/rev and 0.20 m/s the tick rate is only ~760/s, so this may never
+    bite at cruise; it is the fast hand-spin and any burst of load that would
+    show it.)
 
 ### 3.1 The `ANAR` / strap gap — the most likely way the PHY bites
 
@@ -180,7 +242,7 @@ Narratives live in `RUST_REWRITE_PLAN.md` §13.3b. Status only:
 | D1 | `PeerId` addressed machines, not processes | **Done** — `[services]` in `config/rover.toml` |
 | D2 | `GnssFix` could not say which receiver it came from | **Done** — `GnssSource` / `GnssFix.source` |
 | D3 | Mission monitor navigated on the uncorrected receiver | **Done** — `select_navigation_fix`, tested |
-| D4 | Base-station CSV contradicts `CSV_LOGGING.md` | **Half done.** Perception's `--csv` is opt-in as decided. `ground-station` creates its run directory lazily, so a base that receives nothing leaves nothing — but any run that receives anything logs, with no flag to decline. |
+| D4 | Base-station CSV contradicts `CSV_LOGGING.md` | **Half implemented.** Perception's `--csv` is opt-in as decided. `ground-station` creates its run directory lazily, so a base that receives nothing leaves nothing — but any run that receives anything logs, with no flag to decline. (Plan §13.3b's intro lists D1-D3 as implemented and D4 as the half-implemented one; this table agrees.) |
 | D5 | `heading_err_rad`'s sign disagreed with its consumer | **Sign fixed; re-tune outstanding.** §1.3 |
 | D6 | Camera measurement timestamped after detection | **Open.** §5.1 |
 
@@ -251,11 +313,15 @@ are met.
 
 1. **Calibrate the drivetrain** (§1.1). Twenty minutes, no hardware risk,
    unblocks criterion 6 and turns every logged speed into a real number.
-2. **Flash both boards on the bench** (§1.2) and get past the PHY gate. This is
-   the decision point for the whole branch. `rover-doctor` and
-   `board_diagnostics.csv` are there to tell you what happened.
-3. **Confirm the servo direction on blocks** (§1.3). Sixty seconds. The sign
-   fix is settled in software; this checks the firmware mapping below it.
+   Run Procedure A first and let it double as the encoder checks (§3 items 3
+   and 10).
+2. **Flash both boards on the bench** (§1.2, which has the order of
+   operations) and get past the PHY gate. This is the decision point for the
+   whole branch. `rover-doctor` and `board_diagnostics.csv` are there to tell
+   you what happened.
+3. **Confirm the servo direction on blocks** (§1.3), and the gyro z sign
+   (§3 item 8). Sixty seconds each. The camera sign fix is settled in
+   software; these check the hardware mappings below it.
 4. **Re-tune for D5 and D6 together**, on hardware, once the boards run. D5's
    fix alone is a 3.21× authority increase — this is the step that matters
    most now, not a formality.
@@ -264,3 +330,41 @@ are met.
    repository's `origin` has no `main`.
 
 `docs/FIELD_TEST.md` is the end-to-end procedure once steps 1–3 are done.
+
+---
+
+## 8. Smaller open items, none needing a bench to start
+
+Left over from the 2026-10-17 audit (`STATUS_DONE.md` §8). None blocks a first
+bench session; all are worth knowing before trusting a result.
+
+- **Synthetic replay traces are not kinematically consistent.** `e_y` and
+  `e_psi` in the synthetic truth are independent curves, and the synthetic
+  gyro lacks the `e_psi_dot` term. That is why the dropout scenario's RMSE
+  rose from 0.76 to 1.68 degrees when the EKF's curvature sign was corrected
+  (it still passes the 3.0 degree gate): the coasting accuracy of that
+  scenario is not a meaningful number. Fixing the generator would make the
+  gate's coasting half worth reading; it does not touch §1.4's real gap, which
+  is the missing recording.
+- **I2C bus recovery is not implemented.** The firmware bounds the IMU reset
+  loop and runs I2C with a 5 ms timeout, but cannot clock out a stuck slave
+  (the 9-clock SCL recovery): the HAL does not hand the pins back. A slave
+  holding SDA low survives an MCU reset, so the likely symptom is a POST or
+  IMU failure that only a power cycle clears. Unobserved, since nothing has
+  run.
+- **CSV rows can be lost on kill.** Writers flush about once a second with
+  `sync_data` and no binary installs a signal handler, so Ctrl-C, `tmux
+  kill-session` or a power cut can lose up to about 1 s of rows (the final
+  flush only runs when a logger is dropped normally). Waiting a couple of
+  seconds before stopping a process, as `docs/FIELD_TEST.md` §4 now says,
+  keeps the loss to nothing in practice.
+- **`TelemetryLite` and the LoRa links are unimplemented**, by design (phase 2,
+  plan §6, §13.3 item 7): there is no `LoraSerialLink` and no packed 18-byte
+  frame, so nothing yet exercises the one-way-link assumptions the command
+  protocol was built around.
+- **`tools/requirements.txt` is unpinned** (`pyrealsense2`, `opencv-python`,
+  `numpy`, no versions), so a rebuilt Jetson venv for the D415 capture utility
+  is not reproducible. `perception/pyproject.toml` has lower bounds only.
+
+The toolchain, which this list used to include, is pinned: `rust-toolchain.toml`
+says `1.99.1`, and the size figures in `STATUS_DONE.md` are measured under it.

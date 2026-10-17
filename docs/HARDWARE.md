@@ -11,8 +11,9 @@ authoritative and this file is a description of it**, not a second source.
 Exception: the pin tables, which live only in the two firmware crates'
 `config.rs` / module docs, cited per row below.
 
-> Anything marked ⚠️ has **never been checked against real silicon**. The Rust
-> firmware has never been flashed. See `RUST_REWRITE_PLAN.md` §13.4.
+> Anything marked ⚠️ has **never been checked against real silicon**. As of
+> 2026-10-17 the Rust firmware has never been flashed. See
+> `RUST_REWRITE_PLAN.md` §13.4 and `STATUS_OPEN.md` §3.
 
 ---
 
@@ -56,9 +57,11 @@ Notes that cost a field session to rediscover:
 
 - **The D415's depth stream is unused** — the lane detector takes BGR only.
   Depth was "reserved for obstacle avoidance" and never wired to anything.
-- **The IKS4A1 carries no magnetometer** — no compass is available on this
-  rover, so `[estimator] use_magnetometer = false` is not a tuning choice.
-  Even with one, the drive motors would distort it under load (plan §2.5).
+- **The IKS4A1's magnetometer (a LIS2MDL) is not used.** The shield carries
+  one (plan §2.5, Appendix B) but the firmware never wires it up, so there is
+  no compass on this rover today. `[estimator] use_magnetometer = false` is
+  the right setting regardless: the drive motors would distort it under load,
+  and a stationary calibration would not hold (plan §2.5).
 - **Both GNSS receivers moved to the RPi.** The ROS 2 sensors firmware read NMEA
   over UART; the Rust firmware deliberately does not — serial parsing on an MCU
   bought nothing `rover-navigation` can't do with a real allocator and parser.
@@ -155,6 +158,12 @@ motor stays dead**, TIM1's MOE/break configuration is the first place to look.
 
 Servo: centre `100.0°`, duty band `0.05`–`0.10`, steering limit `±45°`.
 
+⚠️ **The four enable pins are floating inputs from reset until
+`Motors::new` runs** — the first thing `main` does, before Ethernet bring-up,
+and it drives all four low with every PWM at 0 %. Software cannot close the
+window before that call; hardware pull-downs on the four enable lines would
+(`STATUS_OPEN.md` §3 item 9).
+
 ---
 
 ## 5. Sensors NUCLEO pin map
@@ -201,18 +210,30 @@ hardware guarantee that a count can never be missed under load.
 ## 6. Safety
 
 The ROS 2 firmware had **no watchdog**: if the RPi died mid-drive, the STM32
-held its last PWM value indefinitely and kept going. Both Rust firmware
-images now carry two independent layers:
+held its last PWM value indefinitely and kept going. The Rust firmware has two
+independent layers, but they are not the same on both boards:
 
-| Layer | Timeout | Catches |
-|---|---|---|
-| Command watchdog | 200 ms (10 missed frames @ 50 Hz) | dead peer — RPi or link |
-| IWDG | 500 ms | dead firmware — hung task, deadlocked I²C |
+| Layer | Where | Timeout | Catches |
+|---|---|---|---|
+| Command watchdog | **chassis only** — it is the board that owns the motors | 200 ms (10 missed frames @ 50 Hz) | dead peer — RPi or link |
+| Link watchdog | sensors — publishes only, nothing to cut | 2,000 ms without a `Telemetry` heartbeat; logs and flashes the status LED | a one-way link failure, made visible at the board |
+| IWDG | both boards | 500 ms | dead firmware — hung task, deadlocked I²C |
 
-On a command timeout the throttle **ramps** to zero over 300 ms rather than
+The chassis **boots tripped**: after a mid-drive reset the `rover-control`
+stream is still running, and applying its first non-zero command would resume
+driving with nobody having re-armed. It accepts `ChassisCommand` only from
+`192.168.1.1:7001`, drops stale or duplicate sequence numbers while armed, and
+moves its timeout deadline only when a command is *accepted*, so a flood of
+stale datagrams cannot keep a dead controller's last throttle alive. On a
+command timeout the throttle **ramps** to zero over 300 ms rather than
 stepping (a step into a loaded drivetrain is a mechanical shock), steering
-centres immediately, and recovery requires an explicit zero-throttle command —
-the rover never resumes on its own just because packets came back.
+centres immediately, and `watchdog_tripped` is published before the ramp
+starts. Recovery requires an explicit zero-throttle command, and the rover
+never resumes on its own just because packets came back: `rover-control` reads
+`ChassisStatus`, sends zero throttle while the board reports tripped (which is
+what re-arms it), and closes its own drive gate if `ChassisStatus` goes
+missing for 1 s. The firmware also clamps drive duty to 40 %, mirroring
+`[speed] limit_cap_pct`. Details: `RUST_REWRITE_PLAN.md` §5.2.
 
 ---
 

@@ -2,11 +2,22 @@
 
 > **This documents the ROS 2 system that branch `rs` replaced.** The pipeline
 > itself is ported behaviour-preservingly into
-> `perception/rover_perception/lane.py`, which cites this document by section;
-> the ROS wrapper described here (`lane_detection_node.py`) is gone, its
-> frame-to-frame state folded into `LaneDetector`. Camera capture and
-> detection now run in one process, so the `tpc_rover_d415_rgb` hop this
-> document ends at no longer exists.
+> `perception/rover_perception/lane.py`; the frozen parity oracle's
+> `perception/tests/oracle/config.py` cites this document by section and
+> heading (`## 2. Adaptive color segmentation …`, `### Regenerating the ROI`),
+> which is why those must not move. The ROS wrapper described here
+> (`lane_detection_node.py`) is gone, its frame-to-frame state folded into
+> `LaneDetector`. Camera capture and detection now run in one process, so the
+> `tpc_rover_d415_rgb` hop this document ends at no longer exists.
+>
+> **One deliberate difference from what ships (D5).** The `theta` described in
+> §5 and the Output contract below is the detector's *raw* fit, and its sign is
+> the ROS 2 one. The `rs` detector publishes **`-theta`** as `heading_err_rad`
+> (`LaneDetector.detect` negates it; `RUST_REWRITE_PLAN.md` §13.3b D5), because
+> the raw sign is opposite to `d(cross_track)/d(distance)` and to what the EKF
+> and `RoverState::at_lookahead` assume. `process_frame`, `compute_lane_params`
+> and the oracle keep the original sign on purpose. Everything else here —
+> geometry, masks, the fit — is as shipped.
 
 
 How a camera frame becomes the three numbers the steering loop consumes.

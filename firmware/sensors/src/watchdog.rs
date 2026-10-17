@@ -19,7 +19,7 @@
 //! table does route `Telemetry` here:
 //!
 //! ```text
-//! Telemetry = ["base", "sensors"]
+//! Telemetry = ["base", "sensors", "doctor"]
 //! ```
 //!
 //! (an earlier draft of this comment described a gap where nothing routed to

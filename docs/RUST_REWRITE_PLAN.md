@@ -1,7 +1,8 @@
 # Rust Rewrite Plan — `almondmatcha` v5
 
-**Status:** implemented on branch `rs`. §13 records what actually exists.
-**Written:** 2026-09-19 · **Revised:** 2026-09-20 (rev 4)
+**Status:** implemented on branch `rs`; **nothing flashed as of 2026-10-17**.
+Status lives in `STATUS_DONE.md` and `STATUS_OPEN.md`, not here (§13).
+**Written:** 2026-09-19 · **Revised:** 2026-10-17 (rev 5)
 **Scope:** full replacement of the ROS 2 / DDS / mros2 stack with a Rust workspace,
 adding state estimation (EKF), a pluggable control law, a firmware command
 watchdog, metric speed, and a link layer that survives the base station leaving
@@ -10,10 +11,17 @@ untouched. (This branch has since become its own repository — `main` now
 lives only in `RoboticsGG/almondmatcha`; this repository's `origin` has no
 `main`.)
 
-**Rev 3 added §13, the record of how the implementation actually diverged from
-this plan.** Everything above it is the plan; §13 and the status documents it
-points to are what exists on branch `rs`. Where the two disagree, §13 is right
-and the plan text is aspirational.
+**Rev 3 added §13, an implementation status table; rev 4 moved that status
+out.** Everything above §13 is the plan, and where it and the code disagree the
+code is what ships. What exists, and the evidence for it, is
+[`STATUS_DONE.md`](STATUS_DONE.md); what remains is
+[`STATUS_OPEN.md`](STATUS_OPEN.md); §13 keeps only the part that is not status
+(why the implementation diverged, the defect narratives, the hardware debt).
+
+**Rev 5 (2026-10-17)** folds in the 2026-10-17 audit (`STATUS_DONE.md` §8):
+§2.2's process model had a sign error (dated note there), §4.2's command
+protocol gained sessions and consumer-side acks, and §5.2's watchdog gained the
+boot-tripped, freshness and source-filter rules the audit found it needed.
 
 **Rev 2 changes:** §2.6 metric speed calibration (encoder spec is *not* in the
 repo — measurement procedure supplied), §5.2 full watchdog specification, §6 new
@@ -33,7 +41,7 @@ currently unused), §8 pluggable controller trait for LQR/MPC.
 | Jetson? | **Stays Python** (TensorRT / PyTorch). Perception only. |
 | New: estimation | **EKF** on the RPi — lane + IMU + wheel odometry (+ optional magnetometer). |
 | New: control | **Pluggable** `LateralController`: static-gain (current) → LQR → MPC. |
-| New: safety | **Firmware command watchdog** on both STM32 boards. |
+| New: safety | **Firmware command watchdog** on the chassis board (the one that owns the motors); a link watchdog and the IWDG on the sensors board. |
 | New: comms | **Link abstraction** — Ethernet today, LoRa for the base link tomorrow. |
 | Migration style | **Big bang** on a branch. `main` kept the working ROS 2 rover — now only in `RoboticsGG/almondmatcha`. |
 
@@ -41,9 +49,11 @@ currently unused), §8 pluggable controller trait for LQR/MPC.
 example built against `stm32f777zi` — the same die as the F767ZI with crypto
 fused on. Same MAC, same package, same pinout.
 
-**The biggest structural win:** one Cargo workspace builds the MCU firmware *and*
-the host binaries against one shared message crate. A struct-layout disagreement
-between RPi and STM32 becomes a compile error on a laptop, not a HardFault in a field.
+**The biggest structural win:** one repository holds the MCU firmware *and* the
+host binaries, and both build against one shared message crate (`rover-msgs`;
+the firmware crates are separate Cargo projects that take it by path, not
+workspace members — §7). A struct-layout disagreement between RPi and STM32
+becomes a compile error on a laptop, not a HardFault in a field.
 
 ---
 
@@ -127,7 +137,7 @@ x = [ e_y      cross-track error at front axle     (m)
 
 ```
 e_y_dot    =  v * sin(e_psi)   ~=  v * e_psi
-e_psi_dot  =  (w_gyro - b_g)  -  v * kappa
+e_psi_dot  =  (w_gyro - b_g)  +  v * kappa
 kappa_dot  =  0 + w_kappa        (random walk)
 v_dot      =  0 + w_v            (corrected by odometry)
 b_g_dot    =  0 + w_b            (random walk)
@@ -136,11 +146,30 @@ b_g_dot    =  0 + w_b            (random walk)
 ```
           e_y  e_psi  kappa    v      b_g
  e_y    [  0     v      0     e_psi    0  ]
- e_psi  [  0     0     -v    -kappa   -1  ]
+ e_psi  [  0     0      v     kappa   -1  ]
  kappa  [  0     0      0      0       0  ]     F_d ~= I + F_c*dt
  v      [  0     0      0      0       0  ]
  b_g    [  0     0      0      0       0  ]
 ```
+
+> **Correction, 2026-10-17.** Rev 1-4 of this plan had `e_psi_dot = (w_gyro -
+> b_g) - v*kappa`, with `-v` and `-kappa` in the `e_psi` row of `F_c`. That was
+> wrong under this repository's own sign convention, and the code and its
+> tests inherited it until the 2026-10-17 audit. The derivation: gyro z is
+> z-up, counter-clockwise positive; `e_psi > 0` means the rover points *left*
+> of the lane tangent (§10: positive errors mean "steer right"); `kappa > 0` is
+> a *right*-hand curve. On a right-hand curve the tangent rotates clockwise at
+> `v*kappa`, so a rover that is not yawing ends up pointing further left of it
+> and `e_psi` *rises* — a `+v*kappa` term. A rover that follows the curve has
+> `gyro = -v*kappa` and `e_psi` constant. The original `-v*kappa` is what the
+> equation would be with ISO 8855's left-positive curvature, which this system
+> deliberately does not use; it silently re-imported the convention §10 says
+> never to touch. The control input matrix follows the same convention:
+> `B[e_psi] = -v/L` (steering right yaws clockwise, which lowers `e_psi`;
+> §8.1). `rover-model` carries the derivation in its comments, and its tests
+> and the EKF's no longer assume the old sign. The EKF now also depends
+> explicitly on the gyro being z-up, counter-clockwise positive, which has not
+> been checked on the board — `STATUS_OPEN.md` §3 item 8.
 
 **Camera** (~30 Hz, `valid` only), `L_a = 1.22 m`. Linear under small-angle:
 
@@ -156,7 +185,10 @@ H_cam = [ 1  L_a  L_a^2/2  0  0 ]
 
 **Zero-rate update:** when throttle is zero and both encoders are quiet, apply
 `z = w_gyro` against `h(x) = b_g`. This is how `b_g` actually becomes observable.
-Runs free every time the rover pauses.
+Runs free every time the rover pauses. (Until 2026-10-17 the update was fed a
+hard-coded `0.0` rather than the gyro reading, so the bias never learned.)
+Time gaps in the IMU or wheel feeds longer than 500 ms skip the step and
+re-anchor the clock instead of integrating across the gap.
 
 ### 2.3 Implementation rules
 
@@ -343,15 +375,17 @@ struct Telemetry {                              // LAN, ~5 Hz, ~170 B
     seq: u32, t_us: u64,
     state: RoverState, mission: MissionStatus,
     power: PowerSample, rtk: GnssFix, backup: GnssFix,
-    last_cmd_seq: u16,                          // command ack, §4.2
+    last_cmd_session: u16, last_cmd_seq: u16,   // command ack, §4.2 (177 B total)
     health: HealthBits,
 }
 // TelemetryLite: see §6.3 — 18 bytes, LoRa only.
 
-struct CommandFrame {                           // base -> rover, idempotent
-    cmd_seq: u16,
-    body: Command,   // SetSpeedLimit | SetMissionGoal | CancelMission | EStop
+struct CommandFrame {                           // base -> rover, idempotent, 21 B
+    session: u16,    // random non-zero per ground-station process; 0 reserved
+    cmd_seq: u16,    // monotonic within a session
+    body: Command,   // Nop | SetSpeedLimit | SetMissionGoal | CancelMission | EStop | ClearEStop
 }
+struct CommandAck { session: u16, cmd_seq: u16 } // consumer -> telemetry, 4 B, §4.2
 
 // ---- Debug ---------------------------------------------------------------
 struct SpeedLoopDebug { measured_left_tps: f32, measured_right_tps: f32,
@@ -408,7 +442,7 @@ Stable `u16` per type. Publish = encode, `send_to` each subscriber in a static
 routing table. Subscribe = bind, filter on type ID. Newest-wins; no retransmit,
 no ordering, no session state.
 
-**Unicast fan-out, not multicast.** With seven services on five hosts and
+**Unicast fan-out, not multicast.** With eight services on five hosts and
 sub-200-byte messages this costs nothing, and it removes the IGMP dependency
 that forced the hand-maintained `initialPeersList` workaround in
 `fastdds_rover.xml`.
@@ -418,15 +452,43 @@ that forced the hand-maintained `initialPeersList` workaround in
 Rev 1 used TCP request/response for `SetSpeedLimit` and mission goals. **That is
 now dropped**, because TCP cannot cross a LoRa link (§6). Instead:
 
-- Base sends `CommandFrame { cmd_seq, body }` as a plain datagram, repeatedly,
-  at ~1 Hz, until acknowledged.
-- Rover applies any frame whose `cmd_seq` is newer than the last applied, and
-  echoes `last_cmd_seq` in every `Telemetry` / `TelemetryLite`.
-- Base stops retransmitting once it sees its `cmd_seq` echoed.
+- Base sends `CommandFrame { session, cmd_seq, body }` as a plain datagram,
+  repeatedly, at ~1 Hz, until acknowledged.
+- Each process that *acts on* commands applies a frame that is new by
+  `(session, cmd_seq)` and publishes a `CommandAck { session, cmd_seq }` saying
+  what **it** applied — right after applying, and again at 2 Hz.
+- `rover-telemetry` folds the acks into `Telemetry::{last_cmd_session,
+  last_cmd_seq}` (and, one day, `TelemetryLite` — §6.3, not built) — see below — and the base stops
+  retransmitting once it sees its `(session, cmd_seq)` echoed.
 
-Roughly 30 lines. It is link-agnostic, loss-tolerant, needs no connection state,
-and works identically over Ethernet and LoRa. **This is strictly better than the
-rev-1 TCP design even on the LAN**, and it means `rover-bus` carries no TCP at all.
+Roughly 30 lines of idea; the audit-hardened version is longer. It is
+link-agnostic, loss-tolerant, needs no connection state, and works identically
+over Ethernet and LoRa. **This is strictly better than the rev-1 TCP design even
+on the LAN**, and it means `rover-bus` carries no TCP at all.
+
+**What rev 5 changed, and why (2026-10-17 audit).**
+
+- **Sessions.** `session` is a random non-zero `u16` chosen once per
+  `ground-station` process (0 is reserved for "nothing applied"). A receiver
+  orders by `cmd_seq` only *within* a session; a frame from a different session
+  starts a new ordering. Without it, restarting the base reset `cmd_seq` to 1
+  while the rover still held `L`, so commands `1..L` were ignored as stale — and
+  the echo then falsely acked `L`. It costs two bytes and no handshake.
+- **Acks come from the consumers, not from telemetry.** `CommandFrame` is routed
+  only to `rover-control` (safety gate, speed limit) and `rover-navigation`
+  (mission state machine) — each runs its own `CommandReceiver`.
+  `rover-telemetry` used to receive its own copy and echo it, which acked
+  commands the consumers never got. Now its `AckTracker` echoes `(session, seq)`
+  in `Telemetry` only when **both** consumers' acks are fresh (≤ 2 s) and in the
+  same non-zero session, using the **older** of the two `seq`s; otherwise it
+  sends `(0, 0)`. The base therefore stops retransmitting only once both
+  consumers have the command.
+- **FIFO, one in flight.** `ground-station`'s `CommandSender` sends commands one
+  at a time in order; the in-flight command is acked when `Telemetry`'s session
+  matches and `last_cmd_seq` is newer-or-equal.
+- **E-stop pre-empts.** An `EStop` discards everything queued and replaces the
+  in-flight command (logged); nothing replaces an in-flight `EStop`. A queue
+  of ordinary commands must never delay a stop.
 
 Bulk transfers (log retrieval) are not a bus concern — use `rsync` over SSH when
 on the LAN.
@@ -498,6 +560,7 @@ also in ST's official repo. Optional — see §2.5 for why to be cautious.
 | `CMD_TIMEOUT` | **200 ms** | 10 missed frames at the 50 Hz command rate |
 | `RAMP_TIME` | **300 ms** | throttle → 0 on a ramp, not a step: a step into a loaded drivetrain is a mechanical shock |
 | steering on trip | **centre** | a latched steering angle turns a runaway into a circle |
+| boot state | **tripped** | after a mid-drive reset (IWDG, brown-out) the control stream is still running; applying its first non-zero command would resume driving with nobody having re-armed |
 | recovery | **automatic**, but only after an explicit zero-throttle command | prevents a flapping link from producing lurch-stop-lurch |
 | observability | `ChassisStatus.watchdog_tripped` | today you cannot tell this happened |
 
@@ -526,6 +589,33 @@ loop {
 }
 ```
 
+**What the implementation adds to the sketch (rev 5; `firmware/chassis/src/watchdog.rs`):**
+
+- **Boots tripped**, and `watchdog_tripped` says so. A tripped board ignores any
+  command with non-zero throttle (and forgets the sequence baseline, so a
+  restarted controller whose numbering starts again can resync). The explicit
+  zero-throttle command that re-arms it does **not** itself apply its
+  steer/throttle: the packet that re-arms the board can never be the one that
+  moves it.
+- **Source filter.** `ChassisCommand` is accepted only from `192.168.1.1:7001`
+  (source IP *and* port, `config::CONTROL_ADDR`); anything else is dropped before
+  it reaches the watchdog.
+- **Seq freshness.** While armed, a command whose `seq` is not newer than the
+  last accepted (wrap-aware) is dropped as stale, duplicate or reordered.
+- **The deadline moves only for accepted commands.** The timeout is an absolute
+  deadline, not a `Timer::after` restarted every loop pass; a flood of dropped
+  datagrams therefore cannot keep a dead controller's last throttle alive.
+- **Trip order.** `watchdog_tripped` is published *before* the 300 ms ramp, and
+  steering is centred first (§13.3 item 3). The IWDG is petted during the ramp.
+- **Host re-arm.** `rover-control` consumes `ChassisStatus` (routed to telemetry
+  *and* control): while the board reports tripped it sends zero throttle — which
+  is exactly what re-arms it — and with no `ChassisStatus` for 1 s it closes its
+  own drive gate, since the board may be tripped, rebooted or unreachable. A
+  restarted `rover-control` cannot take over an *armed* board until the
+  200 ms timeout trips (its `seq` looks old); after that it resyncs.
+- Drive duty is also clamped in firmware at 40 %, mirroring `[speed]
+  limit_cap_pct`, so even a bad controller or sender cannot command more.
+
 **Sensors board:** it publishes only, so it has no actuation to cut. It gets the
 mirror-image watchdog instead — if the RPi stops *consuming* (no `Telemetry`
 heartbeat seen for 2 s), it logs and flashes the status LED. Cheap, and it makes a
@@ -535,12 +625,16 @@ one-way link failure visible at the board rather than silent.
 against a dead *peer*. The hardware independent watchdog protects against a dead
 *firmware* — a hung task, a deadlock, a stuck I2C transaction. Enable IWDG at
 ~500 ms and pet it only from the control task, so a hang in that task resets the
-board (which drops PWM to a safe state on reset). The current firmware has neither
-layer. Wire both.
+board (which drops PWM to a safe state on reset). The ROS 2 firmware had neither
+layer; the Rust firmware wires both. (A reset leaves the motor enable pins
+floating until `Motors::new` runs — `STATUS_OPEN.md` §3 item 9.)
 
-**Acceptance test (§11):** rover on blocks, driving; pull the Ethernet cable.
-Motors must ramp to zero within 200 ms + 300 ms, steering must centre,
-`watchdog_tripped` must appear in the next telemetry frame that gets through.
+**Acceptance test (§12 criterion 3):** rover on blocks, driving; pull the
+chassis's Ethernet cable (or kill `rover-control`). Motors must ramp to zero
+within 200 ms + 300 ms, steering must centre, `watchdog_tripped` must appear in
+the next telemetry frame that gets through. Killing `ground-station` is **not**
+this test: the watchdog is fed by `rover-control`'s `ChassisCommand` stream, and
+losing the base must never stop the rover.
 
 ### 5.3 Rate and dead-code changes
 
@@ -710,13 +804,13 @@ no `main` at all.
 
 ```
 almondmatcha-rs/
-├── Cargo.toml                   # workspace: firmware + host, one message crate
-├── rust-toolchain.toml
+├── Cargo.toml                   # workspace: host crates + tools/replay (firmware is excluded)
+├── rust-toolchain.toml          # pinned: 1.99.1 + llvm-tools + thumbv7em target
 ├── config/
-│   └── rover.toml               # hosts, routes, drivetrain calib, gains, link cfg
+│   └── rover.toml               # [services], routes, drivetrain calib, gains, safety
 ├── crates/
 │   ├── rover-msgs/              # no_std. wire types + codec + golden tests
-│   ├── rover-link/              # Link trait: UdpLink, LoraSerialLink
+│   ├── rover-link/              # Link trait: UdpLink (LoraSerialLink: phase 2, not built)
 │   ├── rover-bus/               # pub/sub + command-echo over any Link
 │   ├── rover-model/             # linearised error dynamics — shared, §8
 │   ├── rover-estimator/         # EKF. pure math, no I/O, laptop-testable
@@ -725,15 +819,17 @@ almondmatcha-rs/
 │   ├── rover-telemetry/         # bin  (RPi)  CSV + link encode
 │   ├── rover-runs/              # run_NNN_<stamp>/ convention, shared by telemetry + ground-station
 │   ├── ground-station/          # bin  (Base)
-│   ├── rover-doctor/            # bin  (Base)  preflight GO/NO-GO, 9 checks
+│   ├── rover-doctor/            # bin  (Base)  preflight GO/NO-GO, 9 checks, own `doctor` service
 │   └── rover-tap/               # bin  debug CLI — replaces `ros2 topic echo`
-├── firmware/
+├── firmware/                    # NOT workspace members: own Cargo projects, rover-msgs by path
 │   ├── chassis/                 # no_std, thumbv7em-none-eabihf
 │   └── sensors/                 # no_std
 ├── perception/                  # Jetson Python
 │   ├── pyproject.toml
 │   └── rover_perception/{camera,lane,bus,wire,main}.py
-├── tools/replay/                # CSV replay harness for estimator + control
+├── tools/
+│   ├── replay/                  # CSV replay harness for estimator + control (workspace member)
+│   └── launch_{rover,jetson}_tmux.sh   # central tmux launchers
 ├── testdata/                    # golden wire-format fixtures
 └── docs/
 ```
@@ -777,6 +873,8 @@ rover-model ──> rover-estimator   (F matrix for the EKF predict)
             ──> Mpc               (prediction model over the horizon)
 ```
 
+`B(v)`'s only non-zero entry is `B[e_psi] = -v/L` (steering right yaws the rover
+clockwise, which lowers `e_psi`; the same convention as the corrected §2.2).
 Change the vehicle model once and estimator and controller stay consistent. This
 is worth more than it looks: today the "LQR" gains in
 `rover_kinematic_control_node.py` are hardcoded numbers from an offline derivation
@@ -945,11 +1043,11 @@ none ever did** — §12 criterion 2 has what producing one would take, and
    three. Revisit if `bisync` is ever unyanked.
 
 2. **Firmware constants are a hand-transcribed `config.rs`, not a compile-time
-   parser.** `config/rover.toml`'s own header comment says firmware should
-   `include_str!` it and parse it in a `const fn`. That parser is a project in
+   parser.** The obvious alternative is for the firmware to `include_str!`
+   `config/rover.toml` and parse it in a `const fn`. That parser is a project in
    itself and getting it subtly
    wrong is a worse failure than a small constants file a human can diff by
-   eye. Every constant cites its `rover.toml` key. **The manual sync step is
+   eye; `rover.toml`'s own header comment now says exactly that. Every constant cites its `rover.toml` key. **The manual sync step is
    real and is the documented cost of not having the parser.**
 
 3. **The watchdog centres the steering *before* the ramp, not after.** §5.2's
@@ -982,19 +1080,21 @@ none ever did** — §12 criterion 2 has what producing one would take, and
 ### 13.3b Open design defects found during implementation
 
 Six real flaws, surfaced by building against this plan and then by auditing
-what was built. **D1-D4 are implemented** — D1 as `[services]` in
+what was built. **D1-D3 are implemented** — D1 as `[services]` in
 `config/rover.toml`, D2 as `GnssSource` / `GnssFix.source`, D3 as
 `select_navigation_fix` in `crates/rover-navigation/src/mission.rs` (with
-passing tests), D4 as perception's `--csv` flag, off by default (the base
-station only half-follows that decision — see D4).
+passing tests). **D4 is half-implemented**: perception's `--csv` flag is off by
+default as decided, but the base station only half-follows that decision — see
+D4.
 
-**D5 and D6 are open, and both are deferred for the same reason:** each
-changes closed-loop behaviour against gains tuned around the current
-behaviour, so neither should be taken without a re-tune on hardware. They
-should be taken together.
+**D5's sign is fixed; D5's gain re-tune and D6 are open**, deferred for the same
+reason: each changes closed-loop behaviour against gains tuned around the
+current behaviour, so neither should be taken without a re-tune on hardware.
+They should be taken together.
 
-**D5 is the only one that can make the rover steer the wrong way**, and should
-be settled before anything is flashed. D6 is a systematic lag the system
+**D5 was the only one that could make the rover steer the wrong way**, which is
+why its sign was settled before anything is flashed (the detector now negates
+`theta`; the D5 section has the account). D6 is a systematic lag the system
 cannot currently even measure.
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
@@ -1287,7 +1387,9 @@ Nothing in `firmware/` has met silicon. In rough order of risk:
 3. **Encoder sign convention** — the quadrature table's forward direction was
    defined from first principles and cannot be checked without turning a wheel
    by hand and watching `ticks_left`/`ticks_right`. If it counts backwards,
-   swap that encoder's two pin arguments.
+   flip that wheel's sign inside the decode (`QuadChannel::new` — the pin
+   arguments to `init` are typed per physical pin and cannot be swapped in
+   code), or swap the two channel wires at the connector.
 4. **Software decode under load** — an EXTI decode, unlike a timer peripheral,
    can in principle miss edges while competing with UDP and I2C interrupts.
    Unmeasured.

@@ -12,8 +12,8 @@ the reasoning.
 This is a bench-then-field session, ~20 minutes total, needing a tape
 measure, chalk or marking tape, and a laptop with an ST-Link cable.
 
-> ⚠️ **None of this has been run.** Nothing in `firmware/` has ever been
-> flashed to real silicon (`docs/STATUS_DONE.md`, `docs/FIELD_TEST.md` §0.3).
+> ⚠️ **None of this has been run** (as of 2026-10-17). Nothing in `firmware/`
+> has ever been flashed to real silicon (`docs/STATUS_DONE.md`, `docs/FIELD_TEST.md` §0.3).
 > Every command below has been checked against the source in this repo —
 > the Cargo config, the routing table, the message wire format — but not
 > against a board on a bench. Where a step depends on something only real
@@ -84,7 +84,11 @@ Everything below that flashes "the chassis board" should name the serial
 explicitly with `--probe`, for the same reason the sensors board's serial
 matters: with both boards plugged in, `probe-rs run` with no `--probe` picks
 whichever one it enumerates first, and that is not guaranteed to be stable
-across replugging.
+across replugging — so never run it without `--probe` on this bench, and treat
+the `cargo run --release` shortcut in §3.1 as single-board only. The order of
+operations for a first bench session (toolchain, identify probes, sensors
+image and Procedure A, then chassis and the PHY strap warning) is
+`docs/STATUS_OPEN.md` §1.2.
 
 > Footnote for anyone cross-referencing the old OpenOCD-era notes: OpenOCD
 > renamed this option between versions — `hla_serial` in older notes,
@@ -117,10 +121,11 @@ cargo install probe-rs-tools --locked
 systemd-devel`. On Arch, `pkgconf` and `systemd-libs` are usually already
 there.)
 
-`rust-toolchain.toml` at the repo root already pins `channel = "stable"` with
-`rustfmt`/`clippy`/`thumbv7em-none-eabihf` as components — `rustup` will pick
-that up automatically inside the repo, so the `target add` above is mostly a
-belt-and-braces step for a fresh machine.
+`rust-toolchain.toml` at the repo root pins `channel = "1.99.1"` with
+`rustfmt`, `clippy` and `llvm-tools` as components (`llvm-tools` is what makes
+`cargo size` work) and lists `thumbv7em-none-eabihf` under `targets` — `rustup`
+picks all of that up automatically inside the repo, so the `target add` above
+is mostly a belt-and-braces step for a fresh machine.
 
 ### udev rule, so you don't need `sudo` for every flash
 
@@ -298,9 +303,20 @@ quadrature state sequence alone, with "no way to check it against the
 physical mounting from source alone" — it has never been bench-verified.
 While you're turning each wheel forward in step 5, confirm that wheel's
 count is increasing, not decreasing. **If a wheel counts backwards**, the
-firmware's own fix is to swap that encoder's two channel wires (cheaper than
-patching the decode table) — do that at the connector, not in software, and
-re-run this procedure for that wheel afterward.
+firmware's own fix (its module doc, and plan §13.4 item 3) is in software:
+flip that wheel's sign inside `QuadChannel::new` / the decode — for instance
+by treating the other channel as `a` — then rebuild, reflash and re-run this
+procedure for that wheel. (Swapping that encoder's two channel wires at the
+connector has the same effect and needs no reflash, but it is a harness change
+to remember; the pin arguments to `encoders::init` are typed per physical pin
+and cannot be swapped in code.)
+
+**Speed check, also here.** Decode runs in the executor, not an interrupt
+handler, so a second edge arriving before the task samples the pins decodes as
+a diagonal jump and counts as zero (`docs/STATUS_OPEN.md` §3 item 10). Repeat
+the ten turns once slowly and once as fast as you can spin the wheel by hand:
+the two totals should agree. If the fast spin comes up short, the decode needs
+to move into the interrupt or onto a timer.
 
 **Expected: ~15,000 counts for the ten turns** (~1500 ticks/rev, this
 firmware's 4× decoding — see `docs/HARDWARE.md` §3 for exactly where that
@@ -393,20 +409,29 @@ system.
 cargo run -p rover-doctor -- --config config/rover.toml
 ```
 
+**Run this on the base PC (`192.168.1.10`), not on any other machine.**
+`rover-doctor` binds its own `[services] doctor` address
+(`192.168.1.10:7031`) before doing anything else; on a host without that IP the
+bind fails and it exits with status 2 and an error, printing no checks at all.
+(It does not report `NOT SEEN` from the wrong machine — it never gets as far as
+listening.)
+
 Before calibration, its drivetrain check is NO-GO. Run against this repo's
 checked-in `config/rover.toml` (still `metres_per_tick = 0.0` at the time of
 writing), it prints:
 
 ```
-[NO-GO   ] drivetrain calibrated -- metres_per_tick = 0.0 in [drivetrain] -- the drivetrain has never been calibrated. Run the procedures in docs/CALIBRATION.md before trusting speed_mps or driving autonomously (the reasoning behind them is in docs/RUST_REWRITE_PLAN.md section 2.6). There is no override for this check.
+[NO-GO   ] drivetrain calibrated -- metres_per_tick = 0.0 in [drivetrain] of config/rover.toml (the base PC's copy; the RPi's config/rover.toml must match it) -- the drivetrain has never been calibrated. Run the procedures in docs/CALIBRATION.md before trusting speed_mps or driving autonomously (the reasoning behind them is in docs/RUST_REWRITE_PLAN.md section 2.6). There is no override for this check.
 ```
 
 Once `metres_per_tick` is a positive number, the same check flips to GO —
 there is deliberately no flag to skip it in the meantime, and none appears
-once it passes either.
+once it passes either. The check reads **the base PC's** copy of
+`config/rover.toml` (it names the file it read) and cannot see the RPi's, so
+copy the calibrated values to the RPi's checkout too — `rover-control` reads
+the RPi's own file.
 
-`rover-doctor` also binds `[services] base` and listens ~10 s for the
-boards' UDP feeds before printing anything; with no rover on the LAN (as
-when running the command above from a bench PC that isn't `192.168.1.10`),
-every other check reports `NOT SEEN` rather than GO or NO-GO — that's
+The doctor then listens ~10 s for the boards' and the rover's UDP feeds before
+printing anything. With the rover not on the LAN, every check other than
+drivetrain calibration reports `NOT SEEN` rather than GO or NO-GO — that's
 expected and is a statement about the network, not about calibration.
