@@ -10,7 +10,7 @@
 //!   `max_ticks_per_sec` and stall detection — every threshold is carried
 //!   over exactly (plan §10).
 //! - [`SafetyGate`]: emergency stop on `MissionStatus.active` going false
-//!   and on `Command::EStop`.
+//!   (or going stale), on `Command::EStop`, and on the IMU feed going silent.
 //! - [`confidence_speed_scale`]: speed derating as the estimator's own
 //!   uncertainty grows, replacing the ROS2 `speed_lost_ratio` /
 //!   `detection_timeout_sec` cliff (plan §2.1 item 3, deviation 5 in §13.3).
@@ -39,6 +39,7 @@
 //! establishes for its own instance of this same trap.
 
 use crate::config::{AutocalConfig, StallConfig};
+use rover_estimator::MAX_SAMPLE_GAP_US;
 use rover_msgs::{ChassisCommand, Command, RoverState, SpeedLoopDebug, WheelSensors};
 
 // ===========================================================================
@@ -71,11 +72,24 @@ impl SteerLimiter {
     /// budget is never spent moving toward a command that was going to be
     /// clamped away anyway.
     pub fn apply(&mut self, cmd_deg: f32, dt_s: f32) -> f32 {
+        // `f32::clamp(NaN)` returns NaN, so a NaN request would store
+        // `prev_deg = NaN`, and the next call's `clamp(prev - step, prev +
+        // step)` asserts `min <= max`, which is false for NaN bounds: panic,
+        // i.e. a crashed control process. A non-finite request is rejected and
+        // the last good value held.
+        if !cmd_deg.is_finite() {
+            return self.prev_deg;
+        }
         let clamped = cmd_deg.clamp(-self.max_deg, self.max_deg);
-        let max_step = self.slew_deg_per_s * dt_s.max(0.0);
+        let max_step = self.slew_deg_per_s * if dt_s.is_finite() { dt_s.max(0.0) } else { 0.0 };
         let stepped = clamped.clamp(self.prev_deg - max_step, self.prev_deg + max_step);
         self.prev_deg = stepped;
         stepped
+    }
+
+    /// The last value returned, unchanged — for ticks whose input was rejected.
+    pub fn hold(&self) -> f32 {
+        self.prev_deg
     }
 
     /// Snap immediately to `deg` with no slew — used to centre the steering
@@ -247,6 +261,19 @@ impl SpeedController {
         self.stall_timing = false;
     }
 
+    /// Release the stall latch. Called ONLY on an operator/target stop
+    /// (`!drive_allowed`, or a zero duty *target*) — never inferred from the
+    /// commanded duty, because the latch itself forces that duty to zero
+    /// (`Actuator::tick_chassis_command`), which would clear it one sample
+    /// later and let the rover drive straight back into the blockage.
+    pub fn clear_stall_latch(&mut self) {
+        if self.stall_latched {
+            log::info!("rover-control: stall latch released by an explicit stop");
+        }
+        self.stall_latched = false;
+        self.stall_timing = false;
+    }
+
     #[cfg(test)]
     pub fn max_ticks_per_sec(&self) -> f32 {
         self.max_ticks_per_sec
@@ -414,9 +441,6 @@ impl SpeedController {
 
         if duty < self.stall.min_duty_pct {
             self.stall_timing = false;
-            if self.stall_latched && duty <= 0.0 {
-                self.stall_latched = false;
-            }
             return;
         }
 
@@ -446,32 +470,70 @@ impl SpeedController {
 // Emergency stop
 // ===========================================================================
 
+/// A `MissionStatus` older than this is treated as `active = false`.
+/// `rover-navigation` publishes one every 50 ms tick, so 0.5 s is ten missed
+/// frames: a dead/hung navigation process or a dead link must stop the rover
+/// rather than leave the last `active = true` latched forever.
+pub const MISSION_STATUS_TIMEOUT_S: f64 = 0.5;
+
+/// No `ImuSample` for this long closes the gate. The estimator's covariance
+/// and `lane_age_ms` only age inside `predict`, which only runs when an IMU
+/// sample arrives — without this, a dead IMU feed freezes an overconfident
+/// estimate and the rover keeps driving on it. 200 ms is 20 missed samples at
+/// 100 Hz.
+pub const IMU_STALE_TIMEOUT_S: f64 = 0.2;
+
 /// Whether the actuate stage is currently permitted to drive: the AND of
-/// the mission state machine's `active` flag and a local E-stop latch —
-/// two independent gates, either of which alone must be able to hold the
-/// rover stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// a *fresh* mission `active` flag, a *fresh* IMU feed and a local E-stop
+/// latch — independent gates, any one of which alone must be able to hold the
+/// rover stopped. Time is a caller-owned monotonic `f64` seconds counter
+/// (clock-free, like the rest of this module).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SafetyGate {
     mission_active: bool,
+    mission_seen_s: Option<f64>,
+    imu_seen_s: Option<f64>,
     estopped: bool,
 }
 
 impl SafetyGate {
-    /// Starts closed. `mission_active` defaults to `false` — the ROS2
-    /// node's own safe default was `cc_rcon_msg_ = true` ("halted"),
+    /// Starts closed: no `MissionStatus` and no IMU sample have arrived yet.
+    /// The ROS2 node's own safe default was `cc_rcon_msg_ = true` ("halted"),
     /// selected before any `tpc_gnss_mission_active` message had arrived.
     /// The rover must not drive before an explicit `MissionStatus` says it
-    /// may.
+    /// may, nor without a live IMU.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn drive_allowed(&self) -> bool {
-        self.mission_active && !self.estopped
+    pub fn drive_allowed(&self, now_s: f64) -> bool {
+        self.mission_fresh_active(now_s) && self.imu_fresh(now_s) && !self.estopped
     }
 
-    pub fn on_mission_status(&mut self, active: bool) {
+    /// `mission_active` as of `now_s`: the last reported flag, but only while
+    /// the report itself is younger than [`MISSION_STATUS_TIMEOUT_S`].
+    pub fn mission_fresh_active(&self, now_s: f64) -> bool {
+        self.mission_active
+            && self
+                .mission_seen_s
+                .is_some_and(|t| now_s - t <= MISSION_STATUS_TIMEOUT_S)
+    }
+
+    /// Whether an IMU sample has arrived within [`IMU_STALE_TIMEOUT_S`].
+    pub fn imu_fresh(&self, now_s: f64) -> bool {
+        self.imu_seen_s
+            .is_some_and(|t| now_s - t <= IMU_STALE_TIMEOUT_S)
+    }
+
+    pub fn on_mission_status(&mut self, active: bool, now_s: f64) {
         self.mission_active = active;
+        self.mission_seen_s = Some(now_s);
+    }
+
+    /// Record that an IMU sample (one that actually advanced the estimator)
+    /// arrived at `now_s`.
+    pub fn on_imu(&mut self, now_s: f64) {
+        self.imu_seen_s = Some(now_s);
     }
 
     /// Apply a base-station command that affects the drive gate.
@@ -539,6 +601,16 @@ pub fn confidence_speed_scale(cross_track_var_m2: f32, lane_age_ms: u16) -> f32 
     sigma_scale.min(age_scale)
 }
 
+/// Every field the actuate stage consumes from the estimator is finite.
+fn state_is_finite(s: &RoverState) -> bool {
+    s.cross_track_m.is_finite()
+        && s.heading_err_rad.is_finite()
+        && s.curvature_inv_m.is_finite()
+        && s.speed_mps.is_finite()
+        && s.gyro_bias_radps.is_finite()
+        && s.p_diag.iter().all(|p| p.is_finite())
+}
+
 /// `1.0` at or below `lo`, `0.0` at or above `hi`, linear in between.
 fn ramp_down(x: f32, lo: f32, hi: f32) -> f32 {
     if x <= lo {
@@ -596,6 +668,10 @@ pub struct Actuator {
     last_wheel: Option<(WheelSensors, f64)>,
     last_wheel_seen_s: Option<f64>,
     closed_loop_was_active: bool,
+    wheel_gap_warned: bool,
+    /// Whether the previous tick's inputs were rejected as non-finite, so the
+    /// warning logs on the transition, not at 50 Hz.
+    inputs_were_bad: bool,
 
     seq: u16,
 }
@@ -622,6 +698,8 @@ impl Actuator {
             last_wheel: None,
             last_wheel_seen_s: None,
             closed_loop_was_active: false,
+            wheel_gap_warned: false,
+            inputs_were_bad: false,
             seq: 0,
         }
     }
@@ -650,9 +728,17 @@ impl Actuator {
     /// so this whole module stays clock-free and unit-testable, matching
     /// `rover_estimator`'s own "pure math" style.
     ///
+    /// Wheel speed is differenced against the MCU's own `wheel.t_us`, not the
+    /// RPi arrival time: arrival is quantised to the 10 ms control tick and
+    /// jittered by the network, which at a 100 ms sample period is up to +-10%
+    /// speed noise straight into the PID. Only `now_s` itself (sensor
+    /// freshness, autocal/stall windows) stays on the RPi clock.
+    ///
     /// Returns `None` for the first sample ever seen (nothing to
-    /// difference yet), a duplicate/out-of-order timestamp, or while
-    /// `!drive_allowed` (no `SpeedLoopDebug` is published during an
+    /// difference yet), a duplicate timestamp, a `t_us` discontinuity (see
+    /// [`rover_estimator::MAX_SAMPLE_GAP_US`]: reordered packet or MCU reboot,
+    /// which also resets the tick counters — re-anchored, not differenced), or
+    /// while `!drive_allowed` (no `SpeedLoopDebug` is published during an
     /// emergency stop, matching `chassisSensorsCallback`'s early return).
     pub fn handle_wheel_sensors(
         &mut self,
@@ -662,15 +748,27 @@ impl Actuator {
         drive_allowed: bool,
     ) -> Option<SpeedLoopDebug> {
         self.last_wheel_seen_s = Some(now_s);
-        let (prev, prev_t) = self.last_wheel.replace((wheel, now_s))?;
-        let dt_s = (now_s - prev_t) as f32;
-        if dt_s <= 1e-3 {
+        let (prev, _) = self.last_wheel.replace((wheel, now_s))?;
+        let dt_us = wheel.t_us.wrapping_sub(prev.t_us);
+        if dt_us == 0 {
             return None;
         }
+        if dt_us > MAX_SAMPLE_GAP_US {
+            if !self.wheel_gap_warned {
+                log::warn!(
+                    "rover-control: wheel t_us jumped by {dt_us} us (reordered packet or MCU \
+                     reboot) — re-anchoring the speed loop"
+                );
+                self.wheel_gap_warned = true;
+            }
+            return None;
+        }
+        let dt_s = dt_us as f32 / 1_000_000.0;
 
         if !drive_allowed {
             self.speed.reset_pid(0.0);
             self.speed.clear_stall_timing();
+            self.speed.clear_stall_latch();
             return None;
         }
 
@@ -702,10 +800,34 @@ impl Actuator {
         now_s: f64,
         dt_s: f32,
     ) -> ChassisCommand {
-        let target_pct = self.current_target_duty_pct(state);
+        // A NaN/inf steer request or state (a diverged estimator, a bad
+        // sample) must never reach the limiter state or the wire: hold the
+        // last good steer, command zero throttle, and say so once.
+        let inputs_ok = steer_rad.is_finite() && state_is_finite(state);
+        if !inputs_ok && !self.inputs_were_bad {
+            log::error!(
+                "rover-control: non-finite steer request or estimator state (steer={steer_rad}, \
+                 state={state:?}) — holding last steer, throttle 0 until it recovers"
+            );
+        }
+        self.inputs_were_bad = !inputs_ok;
+        let target_pct = if inputs_ok {
+            self.current_target_duty_pct(state)
+        } else {
+            0.0
+        };
 
-        let steer_deg = if drive_allowed {
+        // Operator/target stop releases the stall latch (and only that does —
+        // see `SpeedController::clear_stall_latch`). A non-finite-input hold
+        // is not an operator stop, so it does not release it.
+        if !drive_allowed || (inputs_ok && target_pct <= 0.0) {
+            self.speed.clear_stall_latch();
+        }
+
+        let steer_deg = if drive_allowed && inputs_ok {
             self.steer.apply(steer_rad.to_degrees(), dt_s)
+        } else if drive_allowed {
+            self.steer.hold()
         } else {
             // Immediate centre, no slew — see `SteerLimiter::force_to`.
             self.steer.force_to(0.0);
@@ -732,7 +854,7 @@ impl Actuator {
             target_pct
         };
 
-        if !drive_allowed {
+        if !drive_allowed || !inputs_ok {
             // E-stop / mission inactive always wins, regardless of any
             // cached PID output.
             output_pct = 0.0;
@@ -808,6 +930,21 @@ mod tests {
         assert!(
             (out2 - 7.2).abs() < 1e-4,
             "expected cumulative 7.2deg, got {out2}"
+        );
+    }
+
+    #[test]
+    fn steer_limiter_rejects_non_finite_requests_and_holds_last_value() {
+        let mut l = SteerLimiter::new(45.0, 1_000_000.0);
+        assert_eq!(l.apply(10.0, 0.02), 10.0);
+        assert_eq!(l.apply(f32::NAN, 0.02), 10.0);
+        assert_eq!(l.apply(f32::INFINITY, 0.02), 10.0);
+        // Previously prev_deg became NaN here and this call panicked in clamp.
+        assert_eq!(l.apply(20.0, 0.02), 20.0);
+        assert_eq!(
+            l.apply(30.0, f32::NAN),
+            20.0,
+            "non-finite dt must not poison the slew budget"
         );
     }
 
@@ -995,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn stall_latch_clears_only_on_zero_commanded_duty() {
+    fn stall_latch_survives_the_zero_duty_it_forces_and_clears_only_on_explicit_stop() {
         let mut sc = SpeedController::new(0.3, 0.5, 0.0, 100.0, 15.0, autocal(false), stall(true));
         sc.set_last_commanded_duty(50.0);
         sc.on_sample(0.0, 0.0, 0.1, 0.0, 20.0);
@@ -1003,17 +1140,20 @@ mod tests {
         sc.on_sample(0.0, 0.0, 0.1, 3.0, 20.0);
         assert!(sc.is_stall_latched());
 
-        // Still commanding a nonzero duty: latch must survive.
-        sc.set_last_commanded_duty(20.0);
-        sc.on_sample(0.0, 0.0, 0.1, 3.1, 0.0);
+        // The latch forces the commanded duty to zero; that zero must NOT be
+        // read as an operator stop (the old behaviour cleared the latch here,
+        // one sample after it latched, and the rover drove back into the
+        // blockage).
+        for i in 0..10 {
+            sc.set_last_commanded_duty(0.0);
+            sc.on_sample(0.0, 0.0, 0.1, 3.1 + i as f64 * 0.1, 20.0);
+        }
         assert!(
             sc.is_stall_latched(),
-            "latch cleared without a zero commanded duty"
+            "latch cleared itself on forced zero duty"
         );
 
-        // Now commanded to a full stop: latch clears.
-        sc.set_last_commanded_duty(0.0);
-        sc.on_sample(0.0, 0.0, 0.1, 3.2, 0.0);
+        sc.clear_stall_latch();
         assert!(!sc.is_stall_latched());
     }
 
@@ -1056,6 +1196,13 @@ mod tests {
     }
 
     #[test]
+    fn confidence_scale_is_zero_for_a_filter_that_has_never_seen_a_lane() {
+        // A fresh Ekf reports lane_age_ms = u16::MAX (audit item 8): no
+        // full-speed driving on the zero-error prior before the first frame.
+        assert_eq!(confidence_speed_scale(1e-4, u16::MAX), 0.0);
+    }
+
+    #[test]
     fn confidence_scale_decreases_monotonically_with_sigma() {
         let a = confidence_speed_scale(0.05_f32.powi(2), 0);
         let b = confidence_speed_scale(0.2_f32.powi(2), 0);
@@ -1079,7 +1226,7 @@ mod tests {
     fn safety_gate_starts_closed() {
         let gate = SafetyGate::new();
         assert!(
-            !gate.drive_allowed(),
+            !gate.drive_allowed(0.0),
             "must not drive before any MissionStatus arrives"
         );
     }
@@ -1087,34 +1234,37 @@ mod tests {
     #[test]
     fn safety_gate_opens_on_mission_active_and_closes_on_inactive() {
         let mut gate = SafetyGate::new();
-        gate.on_mission_status(true);
-        assert!(gate.drive_allowed());
-        gate.on_mission_status(false);
-        assert!(!gate.drive_allowed());
+        gate.on_imu(0.0);
+        gate.on_mission_status(true, 0.0);
+        assert!(gate.drive_allowed(0.0));
+        gate.on_mission_status(false, 0.0);
+        assert!(!gate.drive_allowed(0.0));
     }
 
     #[test]
     fn safety_gate_estop_overrides_an_active_mission() {
         let mut gate = SafetyGate::new();
-        gate.on_mission_status(true);
-        assert!(gate.drive_allowed());
+        gate.on_imu(0.0);
+        gate.on_mission_status(true, 0.0);
+        assert!(gate.drive_allowed(0.0));
         gate.on_command(Command::EStop);
-        assert!(!gate.drive_allowed());
+        assert!(!gate.drive_allowed(0.0));
         // Mission still saying active does not reopen the gate.
-        gate.on_mission_status(true);
-        assert!(!gate.drive_allowed());
+        gate.on_mission_status(true, 0.0);
+        assert!(!gate.drive_allowed(0.0));
     }
 
     #[test]
     fn safety_gate_clear_estop_clears_the_latch() {
         let mut gate = SafetyGate::new();
-        gate.on_mission_status(true);
+        gate.on_imu(0.0);
+        gate.on_mission_status(true, 0.0);
         gate.on_command(Command::EStop);
-        assert!(!gate.drive_allowed());
+        assert!(!gate.drive_allowed(0.0));
         gate.on_command(Command::ClearEStop);
         // Latch cleared, but drive still gated on mission_active.
-        gate.on_mission_status(true);
-        assert!(gate.drive_allowed());
+        gate.on_mission_status(true, 0.0);
+        assert!(gate.drive_allowed(0.0));
     }
 
     /// Regression test for the defect `Command::ClearEStop` fixes: cancelling
@@ -1122,15 +1272,44 @@ mod tests {
     #[test]
     fn safety_gate_cancel_mission_does_not_clear_the_estop_latch() {
         let mut gate = SafetyGate::new();
-        gate.on_mission_status(true);
+        gate.on_imu(0.0);
+        gate.on_mission_status(true, 0.0);
         gate.on_command(Command::EStop);
-        assert!(!gate.drive_allowed());
+        assert!(!gate.drive_allowed(0.0));
         gate.on_command(Command::CancelMission);
-        gate.on_mission_status(true);
+        gate.on_mission_status(true, 0.0);
         assert!(
-            !gate.drive_allowed(),
+            !gate.drive_allowed(0.0),
             "CancelMission must not clear an E-stop latch"
         );
+    }
+
+    #[test]
+    fn safety_gate_stale_mission_status_closes_the_gate() {
+        let mut gate = SafetyGate::new();
+        gate.on_imu(0.0);
+        gate.on_mission_status(true, 0.0);
+        assert!(gate.drive_allowed(0.0));
+        // Navigation dies: no further MissionStatus. The latched `active`
+        // must not keep the rover driving.
+        gate.on_imu(MISSION_STATUS_TIMEOUT_S + 1.0);
+        assert!(!gate.drive_allowed(MISSION_STATUS_TIMEOUT_S + 1.0));
+        // And it reopens when a fresh active status arrives.
+        gate.on_mission_status(true, MISSION_STATUS_TIMEOUT_S + 1.0);
+        assert!(gate.drive_allowed(MISSION_STATUS_TIMEOUT_S + 1.0));
+    }
+
+    #[test]
+    fn safety_gate_stale_imu_closes_the_gate_until_it_resumes() {
+        let mut gate = SafetyGate::new();
+        gate.on_mission_status(true, 0.0);
+        assert!(!gate.drive_allowed(0.0), "no IMU yet: closed");
+        gate.on_imu(0.0);
+        assert!(gate.drive_allowed(0.0));
+        gate.on_mission_status(true, 0.5); // mission stays fresh
+        assert!(!gate.drive_allowed(IMU_STALE_TIMEOUT_S + 0.01));
+        gate.on_imu(0.5);
+        assert!(gate.drive_allowed(0.5));
     }
 
     // -- Actuator: end-to-end guard rails -----------------------------------
@@ -1304,14 +1483,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stall_latch_forces_the_chassis_command_to_zero_throttle() {
-        // A large reference speed saturates the open-loop target to 100%
-        // duty (well above stall_min_duty_pct=30). One `tick_chassis_command`
-        // first establishes `last_commanded_duty_pct` (there is no PID
-        // history yet, so it takes the open-loop path); then three
-        // stationary wheel samples — seed, start the stall timer, exceed
-        // `stall_timeout_s=2.0` — latch the stall.
+    /// Latch a stall through the real `Actuator` path: open-loop 100% duty
+    /// commanded, wheels stationary for > stall_timeout_s.
+    fn stalled_actuator() -> Actuator {
         let cfg = ActuatorConfig {
             reference_mps: 100.0,
             stall: stall(true),
@@ -1320,22 +1494,135 @@ mod tests {
         let mut act = Actuator::new(cfg);
         act.set_speed_limit_pct(100);
         act.tick_chassis_command(0.0, &state(0.0, 0), true, 0.0, 0.02);
-
-        let stationary = WheelSensors {
+        let w = |t_s: f64| WheelSensors {
             ticks_left: 0,
             ticks_right: 0,
-            t_us: 0,
+            t_us: (t_s * 1e6) as u32,
         };
-        act.handle_wheel_sensors(stationary, 0.0, &state(0.0, 0), true); // seeds
-        act.handle_wheel_sensors(stationary, 0.5, &state(0.0, 0), true); // starts the timer
-        assert!(!act.is_stall_latched(), "must not latch before the timeout");
-        act.handle_wheel_sensors(stationary, 3.0, &state(0.0, 0), true); // 2.5s blocked
-
+        // 10 Hz stationary samples (a real stream never has 2.5 s holes —
+        // that would be a t_us discontinuity and re-anchor).
+        for i in 0..=30 {
+            let t = i as f64 * 0.1;
+            act.handle_wheel_sensors(w(t), t, &state(0.0, 0), true);
+            if t < 2.0 {
+                assert!(!act.is_stall_latched(), "must not latch before the timeout");
+            }
+        }
         assert!(act.is_stall_latched());
+        act
+    }
+
+    #[test]
+    fn stall_latch_forces_the_chassis_command_to_zero_throttle() {
+        let mut act = stalled_actuator();
         let cmd = act.tick_chassis_command(0.0, &state(0.0, 0), true, 3.0, 0.02);
         assert_eq!(
             cmd.throttle, 0.0,
             "a latched stall must force zero throttle"
         );
+    }
+
+    #[test]
+    fn stall_latch_does_not_clear_itself_through_the_real_actuator_path() {
+        let mut act = stalled_actuator();
+        // Tick (forces last_commanded duty to 0), then keep feeding stationary
+        // wheel samples while driving is still allowed.
+        for i in 0..20 {
+            let t = 3.1 + i as f64 * 0.1;
+            let cmd = act.tick_chassis_command(0.0, &state(0.0, 0), true, t, 0.02);
+            assert_eq!(cmd.throttle, 0.0);
+            act.handle_wheel_sensors(
+                WheelSensors {
+                    ticks_left: 0,
+                    ticks_right: 0,
+                    t_us: (t * 1e6) as u32,
+                },
+                t,
+                &state(0.0, 0),
+                true,
+            );
+        }
+        assert!(
+            act.is_stall_latched(),
+            "latch cleared without an explicit stop"
+        );
+
+        // Operator stop (gate closed) releases it...
+        act.tick_chassis_command(0.0, &state(0.0, 0), false, 6.0, 0.02);
+        assert!(!act.is_stall_latched());
+        // ...and driving may resume at the normal target.
+        let cmd = act.tick_chassis_command(0.0, &state(0.0, 0), true, 6.1, 0.02);
+        assert!(cmd.throttle > 0.0);
+    }
+
+    // -- non-finite inputs (audit item 9) ---------------------------------
+
+    #[test]
+    fn nan_steer_request_holds_last_steer_zeroes_throttle_and_does_not_poison_the_limiter() {
+        let mut act = Actuator::new(actuator_cfg());
+        let mut last = act.tick_chassis_command(0.2, &state(0.0, 0), true, 0.0, 0.02);
+        for i in 0..5 {
+            last = act.tick_chassis_command(0.2, &state(0.0, 0), true, 0.02 * i as f64, 0.02);
+        }
+        assert!(last.steer > 0.0);
+        let bad = act.tick_chassis_command(f32::NAN, &state(0.0, 0), true, 1.0, 0.02);
+        assert_eq!(bad.steer, last.steer, "hold last good steer");
+        assert_eq!(bad.throttle, 0.0);
+        // Next good tick must not panic and must recover.
+        let good = act.tick_chassis_command(0.2, &state(0.0, 0), true, 1.1, 0.02);
+        assert!(good.steer.is_finite() && good.throttle > 0.0);
+    }
+
+    #[test]
+    fn non_finite_estimator_state_zeroes_throttle() {
+        let mut act = Actuator::new(actuator_cfg());
+        let mut s = state(0.0, 0);
+        s.heading_err_rad = f32::NAN;
+        let cmd = act.tick_chassis_command(0.1, &s, true, 1.0, 0.02);
+        assert_eq!(cmd.throttle, 0.0);
+        assert!(cmd.steer.is_finite());
+    }
+
+    // -- wheel speed from MCU timestamps (audit item 11) -------------------
+
+    #[test]
+    fn wheel_speed_uses_mcu_t_us_not_arrival_time() {
+        let mut act = Actuator::new(actuator_cfg());
+        let w = |ticks: i32, t_us: u32| WheelSensors {
+            ticks_left: ticks,
+            ticks_right: ticks,
+            t_us,
+        };
+        act.handle_wheel_sensors(w(0, 0), 0.00, &state(0.0, 0), true);
+        // 20 ticks in 100 ms of MCU time = 200 tps, but the packet arrived
+        // 130 ms of RPi time later (jitter / tick quantisation).
+        let dbg = act
+            .handle_wheel_sensors(w(20, 100_000), 0.13, &state(0.0, 0), true)
+            .unwrap();
+        assert!(
+            (dbg.measured_left_tps - 200.0).abs() < 1e-2,
+            "got {}",
+            dbg.measured_left_tps
+        );
+    }
+
+    #[test]
+    fn wheel_t_us_discontinuity_reanchors_instead_of_differencing() {
+        let mut act = Actuator::new(actuator_cfg());
+        let w = |ticks: i32, t_us: u32| WheelSensors {
+            ticks_left: ticks,
+            ticks_right: ticks,
+            t_us,
+        };
+        act.handle_wheel_sensors(w(50_000, 9_000_000), 0.0, &state(0.0, 0), true);
+        // MCU rebooted: counters restart near zero. wrapping dt ~ 4286 s.
+        assert!(act
+            .handle_wheel_sensors(w(3, 40_000), 0.1, &state(0.0, 0), true)
+            .is_none());
+        // Normal stream resumes from the new anchor.
+        let dbg = act
+            .handle_wheel_sensors(w(23, 140_000), 0.2, &state(0.0, 0), true)
+            .unwrap();
+        assert!((dbg.measured_left_tps - 200.0).abs() < 1e-2);
     }
 }

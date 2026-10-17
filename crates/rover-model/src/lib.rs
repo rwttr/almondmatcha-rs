@@ -44,7 +44,7 @@
 //! The plan (§2.2, §8.1) writes the Jacobian as a function of speed alone,
 //! `A(v)`. That is only exactly right at the nominal linearisation point
 //! `e_psi = 0`, `kappa = 0`: two entries of the true Jacobian
-//! (`∂ e_y_dot/∂v = e_psi`, `∂ e_psi_dot/∂v = -kappa`) vanish only there.
+//! (`∂ e_y_dot/∂v = e_psi`, `∂ e_psi_dot/∂v = +kappa`) vanish only there.
 //! [`process_jacobian`] takes the full state rather than `v` alone, because
 //! the estimator needs the exact Jacobian at its current belief, not just
 //! the nominal one — passing the full state costs nothing and is correct
@@ -116,8 +116,12 @@ pub fn process_derivative(x: &StateVector, gyro_radps: f32) -> StateVector {
     let mut dx = StateVector::zeros();
     // e_y_dot = v * sin(e_psi) ~= v * e_psi
     dx[state_idx::CROSS_TRACK] = v * e_psi;
-    // e_psi_dot = (w_gyro - b_g) - v * kappa
-    dx[state_idx::HEADING_ERR] = (gyro_radps - b_g) - v * kappa;
+    // e_psi_dot = (w_gyro - b_g) + v * kappa. Gyro z is CCW-positive, e_psi > 0
+    // means the rover points LEFT of the tangent, so a left turn raises e_psi.
+    // kappa > 0 is a RIGHT-hand curve: the tangent rotates clockwise at v*kappa,
+    // so a rover that is not yawing ends up further LEFT of it — e_psi rises.
+    // (A rover that follows the curve has gyro = -v*kappa and e_psi constant.)
+    dx[state_idx::HEADING_ERR] = (gyro_radps - b_g) + v * kappa;
     // kappa, v, b_g: random walks. Their deterministic derivative is zero;
     // the estimator's covariance update adds process noise Q separately.
     dx
@@ -129,7 +133,7 @@ pub fn process_derivative(x: &StateVector, gyro_radps: f32) -> StateVector {
 /// ```text
 ///           e_y  e_psi  kappa    v      b_g
 ///  e_y    [  0     v      0     e_psi    0  ]
-///  e_psi  [  0     0     -v    -kappa   -1  ]
+///  e_psi  [  0     0      v     kappa   -1  ]
 ///  kappa  [  0     0      0      0       0  ]
 ///  v      [  0     0      0      0       0  ]
 ///  b_g    [  0     0      0      0       0  ]
@@ -145,8 +149,8 @@ pub fn process_jacobian(x: &StateVector) -> StateMatrix {
     let mut f = StateMatrix::zeros();
     f[(state_idx::CROSS_TRACK, state_idx::HEADING_ERR)] = v;
     f[(state_idx::CROSS_TRACK, state_idx::SPEED)] = e_psi;
-    f[(state_idx::HEADING_ERR, state_idx::CURVATURE)] = -v;
-    f[(state_idx::HEADING_ERR, state_idx::SPEED)] = -kappa;
+    f[(state_idx::HEADING_ERR, state_idx::CURVATURE)] = v;
+    f[(state_idx::HEADING_ERR, state_idx::SPEED)] = kappa;
     f[(state_idx::HEADING_ERR, state_idx::GYRO_BIAS)] = -1.0;
     f
 }
@@ -161,17 +165,18 @@ pub fn discretize(f_c: &StateMatrix, dt_s: f32) -> StateMatrix {
 /// (radians), intended for the future LQR/MPC controllers (plan §8.1).
 ///
 /// Small-angle bicycle kinematics: a steering angle `delta` at speed `v`
-/// produces yaw rate `v / wheelbase * delta`, which enters the state
-/// derivative in exactly the same row as the gyro-rate term in
-/// [`process_derivative`] — both are "some yaw rate arriving at the
-/// heading-error equation," one measured, one commanded.
+/// produces a yaw rate of magnitude `v / wheelbase * delta`, in the same row as
+/// the gyro-rate term in [`process_derivative`]. Sign: `delta > 0` is steer
+/// RIGHT, which yaws the rover clockwise, i.e. gyro z = `-v/L * delta` (z-up,
+/// CCW-positive), and a clockwise turn DECREASES `e_psi` (rover points less
+/// left of the tangent). Hence `B[e_psi] = -v / wheelbase`.
 ///
 /// `rover-estimator` does **not** use this: the EKF takes the gyro reading
 /// directly as a measured input (see [`process_derivative`]'s `gyro_radps`
 /// argument) rather than inferring yaw rate from a commanded steering angle.
 pub fn control_b(v: f32, params: &VehicleParams) -> InputVector {
     let mut b = InputVector::zeros();
-    b[state_idx::HEADING_ERR] = v / params.wheelbase_m;
+    b[state_idx::HEADING_ERR] = -v / params.wheelbase_m;
     b
 }
 
@@ -197,8 +202,8 @@ mod tests {
         let dx = process_derivative(&x, 0.02);
 
         assert!((dx[state_idx::CROSS_TRACK] - 0.2 * 0.1).abs() < 1e-6);
-        // e_psi_dot = (0.02 - 0.01) - 0.2*0.5 = 0.01 - 0.1 = -0.09
-        assert!((dx[state_idx::HEADING_ERR] - (-0.09)).abs() < 1e-6);
+        // e_psi_dot = (0.02 - 0.01) + 0.2*0.5 = 0.01 + 0.1 = 0.11
+        assert!((dx[state_idx::HEADING_ERR] - 0.11).abs() < 1e-6);
         assert_eq!(dx[state_idx::CURVATURE], 0.0);
         assert_eq!(dx[state_idx::SPEED], 0.0);
         assert_eq!(dx[state_idx::GYRO_BIAS], 0.0);
@@ -211,8 +216,8 @@ mod tests {
 
         assert_eq!(f[(state_idx::CROSS_TRACK, state_idx::HEADING_ERR)], 0.2); // v
         assert_eq!(f[(state_idx::CROSS_TRACK, state_idx::SPEED)], 0.1); // e_psi
-        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::CURVATURE)], -0.2); // -v
-        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::SPEED)], -0.5); // -kappa
+        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::CURVATURE)], 0.2); // +v
+        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::SPEED)], 0.5); // +kappa
         assert_eq!(f[(state_idx::HEADING_ERR, state_idx::GYRO_BIAS)], -1.0);
 
         // Every other entry is zero: rows kappa/v/b_g are pure random walks,
@@ -241,7 +246,7 @@ mod tests {
         let f = process_jacobian(&x);
         assert_eq!(f[(state_idx::CROSS_TRACK, state_idx::HEADING_ERR)], v);
         assert_eq!(f[(state_idx::CROSS_TRACK, state_idx::SPEED)], 0.0);
-        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::CURVATURE)], -v);
+        assert_eq!(f[(state_idx::HEADING_ERR, state_idx::CURVATURE)], v);
         assert_eq!(f[(state_idx::HEADING_ERR, state_idx::SPEED)], 0.0);
     }
 
@@ -267,11 +272,26 @@ mod tests {
         let b = control_b(v, &params);
         for i in 0..EKF_STATES {
             if i == state_idx::HEADING_ERR {
-                assert!((b[i] - v / params.wheelbase_m).abs() < 1e-6);
+                assert!((b[i] + v / params.wheelbase_m).abs() < 1e-6);
             } else {
                 assert_eq!(b[i], 0.0);
             }
         }
+    }
+
+    #[test]
+    fn right_curve_without_yaw_raises_e_psi_and_following_it_holds_it() {
+        // kappa > 0 = right curve. Not yawing (gyro 0): rover drifts LEFT of the
+        // tangent, e_psi must rise. Following it (clockwise, gyro = -v*kappa): 0.
+        let x = state(0.0, 0.0, 0.5, 0.2, 0.0);
+        assert!(process_derivative(&x, 0.0)[state_idx::HEADING_ERR] > 0.0);
+        assert!(process_derivative(&x, -0.2 * 0.5)[state_idx::HEADING_ERR].abs() < 1e-7);
+    }
+
+    #[test]
+    fn right_steer_decreases_e_psi() {
+        let b = control_b(0.3, &VehicleParams::new(0.4875, 1.22));
+        assert!(b[state_idx::HEADING_ERR] < 0.0);
     }
 
     #[test]

@@ -39,13 +39,14 @@ mod time_utils;
 
 use clap::Parser;
 use gnss::{SpresenseAssembler, UbloxAssembler};
-use mission::{select_navigation_fix, Mission};
+use mission::{select_fresh_navigation_fix, Mission, GNSS_FIX_MAX_AGE_S};
 use rover_bus::{Bus, BusConfig, CommandReceiver};
 use rover_link::{PeerId, UdpLink};
 use rover_msgs::{CommandFrame, GnssFix, MissionStatus};
 use std::io::Read;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(about = "GNSS + mission state machine, replacing gnss_ublox_node / \
@@ -131,6 +132,21 @@ fn main() {
     let mut cmd_receiver = CommandReceiver::new();
     let mut rtk_fix = GnssFix::default();
     let mut backup_fix = GnssFix::default();
+    // Receive time of each stored fix. A fix is only as good as it is recent:
+    // without this the last fix was held forever (see `GNSS_FIX_MAX_AGE_S`).
+    let mut rtk_rx_at: Option<Instant> = None;
+    let mut backup_rx_at: Option<Instant> = None;
+    let start = Instant::now();
+
+    // `subscribe`, not `latest`: `latest` is newest-wins, so two `CommandFrame`s
+    // landing between ticks (an EStop followed by a Nop retransmit, say) would
+    // lose the first. The callback runs inside `poll`, once per frame, in
+    // order; the channel just hands them to this loop (same shape as
+    // rover-control's network thread).
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CommandFrame>();
+    bus.subscribe::<CommandFrame>(move |frame| {
+        let _ = cmd_tx.send(frame);
+    });
 
     log::info!(
         "rover-navigation ready: ublox={} spresense={} mission_state={:?}",
@@ -144,14 +160,16 @@ fn main() {
 
         for fix in ublox_rx.try_iter() {
             rtk_fix = fix;
+            rtk_rx_at = Some(Instant::now());
             let _ = bus.publish(&rtk_fix);
         }
         for fix in spresense_rx.try_iter() {
             backup_fix = fix;
+            backup_rx_at = Some(Instant::now());
             let _ = bus.publish(&backup_fix);
         }
 
-        if let Some(frame) = bus.latest::<CommandFrame>() {
+        for frame in cmd_rx.try_iter() {
             if let Some(cmd) = cmd_receiver.apply(frame) {
                 log::info!(
                     "applying command: {cmd:?} (mission state was {:?}, goal was {:?})",
@@ -162,8 +180,17 @@ fn main() {
             }
         }
 
-        let position = select_navigation_fix(&rtk_fix, &backup_fix);
-        let status: MissionStatus = mission.update(position);
+        let now = Instant::now();
+        let age_s = |t: Option<Instant>| t.map(|t| now.duration_since(t).as_secs_f64());
+        let position = select_fresh_navigation_fix(
+            &rtk_fix,
+            age_s(rtk_rx_at),
+            &backup_fix,
+            age_s(backup_rx_at),
+            GNSS_FIX_MAX_AGE_S,
+        );
+        let status: MissionStatus =
+            mission.update_at(position, now.duration_since(start).as_secs_f64());
         let _ = bus.publish(&status);
 
         std::thread::sleep(TICK_INTERVAL);
@@ -203,8 +230,21 @@ fn spawn_reader<A>(
                 match port.read(&mut buf) {
                     Ok(0) => continue,
                     Ok(n) => {
-                        for line in reader.feed(&buf[..n]) {
-                            if let Some(fix) = assembler.ingest(&line) {
+                        // A panic while parsing one line of line-noise used to
+                        // end this thread for good: no more fixes, the last
+                        // one held forever. Parse under `catch_unwind` so one
+                        // bad line costs one line.
+                        let lines = match guarded(name, "line framing", || reader.feed(&buf[..n])) {
+                            Some(lines) => lines,
+                            None => {
+                                reader = gnss::LineReader::new(MAX_LINE_LEN);
+                                continue;
+                            }
+                        };
+                        for line in lines {
+                            if let Some(Some(fix)) =
+                                guarded(name, "sentence parsing", || assembler.ingest(&line))
+                            {
                                 if tx.send(fix).is_err() {
                                     return; // main thread gone
                                 }
@@ -222,6 +262,18 @@ fn spawn_reader<A>(
     });
 }
 
+/// Run `f`, turning a panic into a logged `None` so a reader thread survives
+/// a malformed line.
+fn guarded<T>(name: &str, what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            log::error!("{name}: panic during {what} — dropping that input and carrying on");
+            None
+        }
+    }
+}
+
 /// Common interface over the two assemblers, so `spawn_reader` is written
 /// once instead of twice.
 trait GnssAssembler {
@@ -235,5 +287,30 @@ impl GnssAssembler for UbloxAssembler {
 impl GnssAssembler for SpresenseAssembler {
     fn ingest(&mut self, line: &str) -> Option<GnssFix> {
         SpresenseAssembler::ingest(self, line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_survives_a_panic_and_the_next_call_still_works() {
+        let r: Option<i32> = guarded("t", "boom", || panic!("bad line"));
+        assert_eq!(r, None);
+        assert_eq!(guarded("t", "fine", || 7), Some(7));
+    }
+
+    /// End to end through the real assembler: a lossy-UTF8 line that used to
+    /// panic inside `verify_and_strip` is now just dropped, and a good line
+    /// after it still yields a fix.
+    #[test]
+    fn ublox_assembler_survives_non_ascii_noise_then_parses_a_good_line() {
+        let mut a = UbloxAssembler::new();
+        assert!(guarded("u", "parse", || a.ingest("$GPGGA,1*\u{FFFD}\u{FFFD}")).is_some());
+        let body = "GPGGA,123456.00,1342.2030,N,10031.3912,E,1,08,0.9,10.0,M,0.0,M,,";
+        let cs = body.bytes().fold(0u8, |acc, b| acc ^ b);
+        let fix = a.ingest(&format!("${body}*{cs:02X}"));
+        assert!(fix.is_some());
     }
 }

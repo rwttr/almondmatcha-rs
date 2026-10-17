@@ -157,7 +157,7 @@ impl AppConfig {
             zero_rate_max_ticks: raw.estimator.zero_rate_max_ticks,
         };
 
-        Ok(Self {
+        let cfg = Self {
             predict_hz: raw.estimator.predict_hz,
             vehicle,
             estimator,
@@ -188,7 +188,43 @@ impl AppConfig {
             },
             command_rate_hz: raw.safety.command_rate_hz,
             metres_per_tick: raw.drivetrain.metres_per_tick,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject values that would otherwise panic far from the cause: a zero or
+    /// non-finite rate makes `Duration::from_secs_f32(1.0 / hz)` panic in
+    /// `main`, and a negative or NaN limit makes `f32::clamp(lo, hi)` assert
+    /// (`min <= max`) the first time a speed limit or steer is applied.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let positive = |name: &str, v: f32| {
+            if v.is_finite() && v > 0.0 {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{name} = {v} must be a finite number > 0"
+                )))
+            }
+        };
+        let non_negative = |name: &str, v: f32| {
+            if v.is_finite() && v >= 0.0 {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{name} = {v} must be a finite number >= 0"
+                )))
+            }
+        };
+        positive("estimator.predict_hz", self.predict_hz)?;
+        positive("safety.command_rate_hz", self.command_rate_hz)?;
+        positive("control.steer_max_deg", self.steer_max_deg)?;
+        non_negative("control.steer_slew_deg_per_s", self.steer_slew_deg_per_s)?;
+        non_negative("speed.limit_cap_pct", self.speed.limit_cap_pct)?;
+        non_negative("speed.sensor_timeout_s", self.speed.sensor_timeout_s)?;
+        positive("drivetrain.wheelbase_m", self.vehicle.wheelbase_m)?;
+        non_negative("drivetrain.metres_per_tick", self.metres_per_tick)?;
+        Ok(())
     }
 }
 
@@ -303,6 +339,8 @@ pub enum ConfigError {
     /// `control.law` named something not recognised as a law at all, not
     /// even a future one.
     UnknownLaw(String),
+    /// A value parsed fine but is out of range (see `AppConfig::validate`).
+    Invalid(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -315,6 +353,7 @@ impl fmt::Display for ConfigError {
                 "control.law = \"{name}\" is a planned controller (plan §8) that \
                  rover-control does not implement yet — only \"static_gain\" exists"
             ),
+            ConfigError::Invalid(msg) => write!(f, "invalid config value: {msg}"),
             ConfigError::UnknownLaw(name) => {
                 write!(f, "control.law = \"{name}\" is not a recognised controller")
             }
@@ -451,6 +490,35 @@ mod tests {
         let text = SAMPLE.replace(r#"law = "static_gain""#, r#"law = "pure_pursuit""#);
         let err = AppConfig::parse(&text).unwrap_err();
         assert!(matches!(err, ConfigError::UnknownLaw(l) if l == "pure_pursuit"));
+    }
+
+    #[test]
+    fn rejects_zero_predict_hz_instead_of_panicking_later() {
+        let text = SAMPLE.replace("predict_hz = 100.0", "predict_hz = 0.0");
+        let err = AppConfig::parse(&text).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m) if m.contains("predict_hz")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_negative_limit_cap_pct_instead_of_panicking_in_clamp() {
+        let text = SAMPLE.replace("limit_cap_pct = 40.0", "limit_cap_pct = -5.0");
+        let err = AppConfig::parse(&text).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid(m) if m.contains("limit_cap_pct")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_command_rate() {
+        let text = SAMPLE.replace("command_rate_hz = 50", "command_rate_hz = 0");
+        assert!(matches!(
+            AppConfig::parse(&text).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
     }
 
     #[test]

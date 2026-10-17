@@ -83,8 +83,10 @@ pub fn generate(scenario: Scenario, duration_s: f32, legacy_cfg: LegacyConfig) -
         let true_heading_err_rad = -true_cross_track_m.signum() * 0.02 * (1.0 - (-t_s / 2.0).exp());
 
         // Gyro z consistent with the curvature and forward speed: yaw rate
-        // for a bicycle model tracking this curvature at SPEED_MPS.
-        let gyro_z_radps = SPEED_MPS * true_curvature_inv_m;
+        // for a bicycle model tracking this curvature at SPEED_MPS. kappa > 0
+        // is a RIGHT-hand curve, which is a clockwise turn, and gyro z is
+        // CCW-positive (z-up) — so the rate is NEGATIVE: -v*kappa.
+        let gyro_z_radps = -SPEED_MPS * true_curvature_inv_m;
 
         let lane_valid = !in_dropout && i.is_multiple_of(CAMERA_DECIMATION);
         let wheel_valid = i.is_multiple_of(WHEEL_DECIMATION);
@@ -179,6 +181,23 @@ mod tests {
         for r in &trace.rows {
             assert!(r.ticks_left >= prev, "ticks_left must never go backward");
             prev = r.ticks_left;
+        }
+    }
+
+    #[test]
+    fn gyro_on_a_right_curve_is_clockwise_negative() {
+        let trace = generate(Scenario::Steady, 5.0, LegacyConfig::default());
+        let curved: Vec<_> = trace
+            .rows
+            .iter()
+            .filter(|r| r.curvature_inv_m > 0.0)
+            .collect();
+        assert!(!curved.is_empty());
+        for r in curved {
+            assert!(
+                r.gyro_z_radps < 0.0,
+                "right curve must read negative (CW) gyro z"
+            );
         }
     }
 }

@@ -20,8 +20,13 @@
 //! hasn't delivered a new one since the last tick, `t_us` is unchanged, the
 //! delta is zero, and this is treated as "nothing to advance" rather than a
 //! spurious zero-length predict.
+//!
+//! A *backwards* step (late/reordered packet) or a counter restart (MCU
+//! reboot) also differences, under `wrapping_sub`, to ~4295 s. Anything over
+//! [`rover_estimator::MAX_SAMPLE_GAP_US`] is therefore a discontinuity: no
+//! predict, re-anchor on the new timestamp, warn once.
 
-use rover_estimator::{Ekf, EstimatorConfig};
+use rover_estimator::{Ekf, EstimatorConfig, MAX_SAMPLE_GAP_US};
 use rover_model::VehicleParams;
 use rover_msgs::{EkfDebug, ImuSample, LaneMeasurement, RoverState, WheelSensors};
 
@@ -35,6 +40,12 @@ pub struct Estimator {
     /// difference against yet, mirroring `Ekf::correct_wheel_sensors`'s own
     /// "seed on the first call" idiom.
     last_imu_t_us: Option<u32>,
+    /// Raw (bias-uncorrected) gyro z of the newest `ImuSample`, whether or
+    /// not it produced a predict. The zero-rate update in
+    /// `Ekf::correct_wheel_sensors` measures `b_g` against exactly this; the
+    /// wheel feed has no gyro of its own.
+    last_gyro_z: f32,
+    imu_gap_warned: bool,
 }
 
 impl Estimator {
@@ -47,6 +58,8 @@ impl Estimator {
             ekf: Ekf::at_rest(params, initial_p_diag),
             cfg,
             last_imu_t_us: None,
+            last_gyro_z: 0.0,
+            imu_gap_warned: false,
         }
     }
 
@@ -56,9 +69,23 @@ impl Estimator {
     /// repeat of the same sample the previous tick already consumed).
     pub fn predict_from_imu(&mut self, sample: &ImuSample) -> Option<RoverState> {
         let gyro_z = sample.gyro_radps[2];
+        if gyro_z.is_finite() {
+            self.last_gyro_z = gyro_z;
+        }
         let prev_t_us = self.last_imu_t_us.replace(sample.t_us)?;
         let dt_us = sample.t_us.wrapping_sub(prev_t_us);
         if dt_us == 0 {
+            return None;
+        }
+        if dt_us > MAX_SAMPLE_GAP_US {
+            // Already re-anchored by the `replace` above.
+            if !self.imu_gap_warned {
+                log::warn!(
+                    "rover-control: IMU t_us jumped by {dt_us} us (reordered packet or MCU \
+                     reboot) — skipping this predict and re-anchoring"
+                );
+                self.imu_gap_warned = true;
+            }
             return None;
         }
         let dt_s = dt_us as f32 / 1_000_000.0;
@@ -75,10 +102,18 @@ impl Estimator {
     /// Wheel-tick correction: odometry while moving, zero-rate gyro-bias
     /// update while stationary. `throttle` is the last commanded throttle
     /// (from the actuate stage), used to decide which of the two this is —
-    /// see `Ekf::correct_wheel_sensors`.
-    pub fn correct_wheel(&mut self, wheel: &WheelSensors, throttle: f32, gyro_z: f32) {
+    /// see `Ekf::correct_wheel_sensors`. The zero-rate measurement is the
+    /// cached raw gyro z of the newest IMU sample ([`Self::last_gyro_z`]);
+    /// passing a constant 0.0 here (as an earlier version did) pins `b_g` to
+    /// zero and makes the bias unlearnable.
+    pub fn correct_wheel(&mut self, wheel: &WheelSensors, throttle: f32) {
         self.ekf
-            .correct_wheel_sensors(wheel, throttle, gyro_z, &self.cfg);
+            .correct_wheel_sensors(wheel, throttle, self.last_gyro_z, &self.cfg);
+    }
+
+    /// Raw gyro z of the newest `ImuSample` seen.
+    pub fn last_gyro_z(&self) -> f32 {
+        self.last_gyro_z
     }
 
     /// The current fused estimate, without advancing anything. Useful right
@@ -202,7 +237,6 @@ mod tests {
                 t_us: 0,
             },
             0.0,
-            0.0,
         );
         est.correct_wheel(
             &Wheel {
@@ -211,7 +245,55 @@ mod tests {
                 t_us: 100_000,
             },
             0.0,
-            0.0,
         );
+    }
+
+    #[test]
+    fn zero_rate_update_uses_the_latest_raw_gyro_so_bias_is_learnable() {
+        let mut est = Estimator::at_rest(params(), cfg(), [1e-2; 5]);
+        let wheel = |t_us| Wheel {
+            ticks_left: 0,
+            ticks_right: 0,
+            t_us,
+        };
+        // Stationary rover whose gyro reads a constant +0.02 rad/s offset.
+        est.predict_from_imu(&imu(0, 0.02));
+        est.correct_wheel(&wheel(0), 0.0); // seeds
+        for i in 1..=50u32 {
+            est.predict_from_imu(&imu(i * 10_000, 0.02));
+            est.correct_wheel(&wheel(i * 100_000), 0.0);
+        }
+        let b = est.state().gyro_bias_radps;
+        assert!(
+            (b - 0.02).abs() < 0.005,
+            "b_g did not learn the offset: {b}"
+        );
+    }
+
+    #[test]
+    fn backwards_or_rebooted_imu_timestamp_skips_the_predict_and_reanchors() {
+        let mut est = Estimator::at_rest(params(), cfg(), [1e-2; 5]);
+        est.predict_from_imu(&imu(5_000_000, 0.0));
+        est.predict_from_imu(&imu(5_010_000, 0.0)).unwrap();
+        let before = est.state();
+        // Late packet from 1 s ago: wrapping dt ~ 4294 s. Must not predict.
+        assert!(est.predict_from_imu(&imu(4_000_000, 1.0)).is_none());
+        assert_eq!(
+            est.state(),
+            before,
+            "a discontinuity must not advance the filter"
+        );
+        // Stream continues from the re-anchored timestamp with a normal dt.
+        let out = est.predict_from_imu(&imu(4_010_000, 1.0)).unwrap();
+        assert!((out.heading_err_rad - 0.01).abs() < 1e-5);
+    }
+
+    #[test]
+    fn non_finite_gyro_is_not_integrated() {
+        let mut est = Estimator::at_rest(params(), cfg(), [1e-2; 5]);
+        est.predict_from_imu(&imu(0, 0.0));
+        est.predict_from_imu(&imu(10_000, f32::NAN));
+        assert!(est.state().heading_err_rad.is_finite());
+        assert_eq!(est.last_gyro_z(), 0.0);
     }
 }

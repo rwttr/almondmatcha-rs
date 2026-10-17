@@ -285,15 +285,35 @@ fn cmd_run(
         );
         return ExitCode::FAILURE;
     }
-    if output.stats.rmse_deg > tolerance_rmse_deg {
+    // A NaN steer anywhere (compared or not, warm-up or not) is a failure in
+    // its own right: it would crash the real actuator. Checked first so the
+    // message names the cause rather than a NaN rmse.
+    if let Some(bad) = output
+        .rows
+        .iter()
+        .find(|r| !r.computed_steer_deg.is_finite())
+    {
         eprintln!(
-            "replay: FAIL — rmse {:.3} deg exceeds tolerance {:.3} deg",
+            "replay: FAIL — non-finite computed steer at t_us={} ({})",
+            bad.t_us, bad.computed_steer_deg
+        );
+        return ExitCode::FAILURE;
+    }
+    if !rmse_within_tolerance(output.stats.rmse_deg, tolerance_rmse_deg) {
+        eprintln!(
+            "replay: FAIL — rmse {:.3} deg exceeds tolerance {:.3} deg (or is not a number)",
             output.stats.rmse_deg, tolerance_rmse_deg
         );
         return ExitCode::FAILURE;
     }
     println!("replay: PASS (rmse within {tolerance_rmse_deg:.3} deg tolerance)");
     ExitCode::SUCCESS
+}
+
+/// `rmse > tol` is false for NaN, so the old gate PASSED a NaN rmse. Written
+/// as the positive condition so anything not provably within tolerance fails.
+fn rmse_within_tolerance(rmse_deg: f32, tol_deg: f32) -> bool {
+    rmse_deg <= tol_deg
 }
 
 fn cmd_sweep(
@@ -372,4 +392,16 @@ fn write_sweep_csv(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::rmse_within_tolerance;
+
+    #[test]
+    fn nan_rmse_fails_the_gate() {
+        assert!(!rmse_within_tolerance(f32::NAN, 3.0));
+        assert!(!rmse_within_tolerance(3.5, 3.0));
+        assert!(rmse_within_tolerance(0.7, 3.0));
+    }
 }

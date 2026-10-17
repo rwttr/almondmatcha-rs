@@ -37,7 +37,7 @@
 #![forbid(unsafe_code)]
 
 use rover_bus::{Bus, BusConfig, CommandReceiver};
-use rover_control::actuate::{Actuator, ActuatorConfig, SafetyGate};
+use rover_control::actuate::{Actuator, ActuatorConfig, SafetyGate, IMU_STALE_TIMEOUT_S};
 use rover_control::config::{AppConfig, ControllerLaw};
 use rover_control::estimate::Estimator;
 use rover_control::guide::{LateralController, StaticGain, StaticGainConfig};
@@ -102,14 +102,15 @@ fn main() {
     let net_handle =
         thread::spawn(move || network_thread(link, bus_config, inbound_tx, outbound_rx));
 
-    control_loop(app_config, &inbound_rx, &outbound_tx);
-
-    // control_loop never returns in normal operation; this is reachable
-    // only if it panics and unwinds, in which case there's nothing more
-    // useful to do than let the network thread's join (which will itself
-    // never return) report the situation.
-    drop(outbound_tx);
-    let _ = net_handle.join();
+    // `control_loop` is `-> !`: nothing after this call is reachable, panic
+    // included — a panic on this (main) thread unwinds out of `main` and ends
+    // the whole process, network thread with it, and the firmware command
+    // watchdog (plan §5.2) then stops the rover. The converse failure — the
+    // network thread panicking while this one lives — leaves the control loop
+    // with no inbound data at all; the IMU staleness gate
+    // (`IMU_STALE_TIMEOUT_S`) turns that into throttle 0 within 200 ms.
+    let _net_handle = net_handle;
+    control_loop(app_config, &inbound_rx, &outbound_tx)
 }
 
 /// One decoded message the control loop cares about, moved off the network
@@ -220,7 +221,7 @@ fn control_loop(
     cfg: AppConfig,
     inbound_rx: &mpsc::Receiver<Inbound>,
     outbound_tx: &mpsc::Sender<Outbound>,
-) {
+) -> ! {
     let mut estimator = Estimator::at_rest(cfg.vehicle, cfg.estimator, INITIAL_P_DIAG);
 
     let ControllerLaw::StaticGain(sg_cfg) = cfg.law;
@@ -261,9 +262,11 @@ fn control_loop(
     let mut last_throttle = 0.0_f32;
     let mut was_drive_allowed = false;
     let mut was_stall_latched = false;
+    let mut was_imu_fresh = false;
 
     loop {
         let tick_start = Instant::now();
+        let now_s = tick_start.duration_since(start).as_secs_f64();
 
         // Drain everything the network thread has forwarded since the last
         // tick, in arrival order, before computing anything this tick.
@@ -271,6 +274,10 @@ fn control_loop(
             match msg {
                 Inbound::Imu(sample) => {
                     if let Some(state) = estimator.predict_from_imu(&sample) {
+                        // Only a sample that advanced the estimator counts as
+                        // IMU liveness: a stuck feed repeating one `t_us`, or
+                        // a discontinuity, must not hold the gate open.
+                        gate.on_imu(now_s);
                         last_state = state;
                         let _ = outbound_tx.send(Outbound::State(last_state));
                     }
@@ -282,34 +289,42 @@ fn control_loop(
                     last_state = estimator.state();
                 }
                 Inbound::Wheel(wheel) => {
-                    // Gyro z for the zero-rate update: the newest estimate's
-                    // own bias-uncorrected reading isn't tracked separately
-                    // here, so reuse the last known state's speed-adjacent
-                    // context is unnecessary — `correct_wheel_sensors` only
-                    // needs the raw gyro rate, which the estimator does not
-                    // cache between IMU ticks. Passing 0.0 when no fresher
-                    // reading is available only affects the zero-rate
-                    // gyro-bias update's own measurement, not the odometry
-                    // path, and a stale-by-one-tick gyro rate is negligible
-                    // at these rates.
-                    estimator.correct_wheel(&wheel, last_throttle, 0.0);
+                    // The zero-rate update measures b_g against the newest raw
+                    // gyro z, which the estimator caches from the IMU feed (the
+                    // wheel feed has none). Passing a constant 0.0 here — as an
+                    // earlier version did — pins b_g to zero forever.
+                    estimator.correct_wheel(&wheel, last_throttle);
                     last_state = estimator.state();
 
-                    let drive_allowed = gate.drive_allowed();
-                    let elapsed = tick_start.duration_since(start).as_secs_f64();
+                    let drive_allowed = gate.drive_allowed(now_s);
                     if let Some(dbg) =
-                        actuator.handle_wheel_sensors(wheel, elapsed, &last_state, drive_allowed)
+                        actuator.handle_wheel_sensors(wheel, now_s, &last_state, drive_allowed)
                     {
                         let _ = outbound_tx.send(Outbound::SpeedDbg(dbg));
                     }
                 }
-                Inbound::Mission(status) => gate.on_mission_status(status.active),
+                Inbound::Mission(status) => gate.on_mission_status(status.active, now_s),
                 Inbound::Cmd(Command::SetSpeedLimit(pct)) => actuator.set_speed_limit_pct(pct),
                 Inbound::Cmd(cmd) => gate.on_command(cmd),
             }
         }
 
-        let drive_allowed = gate.drive_allowed();
+        // The estimator's P and lane_age_ms only age inside `predict`, which
+        // only runs on IMU arrival, so a silent IMU leaves a frozen,
+        // overconfident estimate; the gate closes (throttle 0, steer centred)
+        // until samples resume.
+        let imu_fresh = gate.imu_fresh(now_s);
+        if was_imu_fresh && !imu_fresh {
+            log::error!(
+                "rover-control: no IMU sample for > {:.0} ms — closing the drive gate until it resumes",
+                IMU_STALE_TIMEOUT_S * 1000.0
+            );
+        } else if !was_imu_fresh && imu_fresh {
+            log::info!("rover-control: IMU feed live — drive gate may open");
+        }
+        was_imu_fresh = imu_fresh;
+
+        let drive_allowed = gate.drive_allowed(now_s);
         if drive_allowed && !was_drive_allowed {
             // Resuming after a stop: reset any controller memory rather than
             // letting it pick back up from whatever it held while the
@@ -327,7 +342,7 @@ fn control_loop(
 
         let stall_latched = actuator.is_stall_latched();
         if stall_latched && !was_stall_latched {
-            log::error!("rover-control: drivetrain stall latched — commanding zero speed until an explicit stop is commanded");
+            log::error!("rover-control: drivetrain stall latched — commanding zero speed until driving is stopped (E-stop, mission end/stale, IMU loss, or a zero speed target)");
         }
         was_stall_latched = stall_latched;
 

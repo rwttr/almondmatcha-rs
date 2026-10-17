@@ -47,7 +47,15 @@ impl Stats {
         }
         let mean_abs_error_deg = errors.iter().map(|e| e.abs()).sum::<f32>() / n as f32;
         let rmse_deg = (errors.iter().map(|e| e * e).sum::<f32>() / n as f32).sqrt();
-        let max_abs_error_deg = errors.iter().fold(0.0_f32, |acc, e| acc.max(e.abs()));
+        // `f32::max` returns the non-NaN operand, so a plain fold would
+        // silently skip a NaN error and report a finite max. Propagate it.
+        let max_abs_error_deg = errors.iter().fold(0.0_f32, |acc, e| {
+            if acc.is_nan() || e.is_nan() {
+                f32::NAN
+            } else {
+                acc.max(e.abs())
+            }
+        });
         Self {
             n_compared: n,
             mean_abs_error_deg,
@@ -115,7 +123,8 @@ pub fn run(
                 ticks_right: row.ticks_right,
                 t_us: row.t_us as u32,
             };
-            estimator.correct_wheel(&wheel, row.throttle, row.gyro_z_radps);
+            // Zero-rate gyro comes from the estimator's cached IMU gyro z.
+            estimator.correct_wheel(&wheel, row.throttle);
             last_state = estimator.state();
         }
 
@@ -281,5 +290,13 @@ mod tests {
         let out_with_warmup = run(&trace, vehicle(), estimator_cfg(), static_gain_cfg(), 2.0);
         assert_eq!(out_no_warmup.rows.len(), out_with_warmup.rows.len());
         assert!(out_with_warmup.stats.n_compared < out_no_warmup.stats.n_compared);
+    }
+
+    #[test]
+    fn nan_error_propagates_into_every_stat_including_max() {
+        let st = Stats::from_errors(&[1.0, f32::NAN, 2.0]);
+        assert!(st.rmse_deg.is_nan());
+        assert!(st.mean_abs_error_deg.is_nan());
+        assert!(st.max_abs_error_deg.is_nan(), "max fold skipped the NaN");
     }
 }

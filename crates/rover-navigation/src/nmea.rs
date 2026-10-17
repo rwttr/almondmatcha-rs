@@ -50,16 +50,28 @@ fn verify_and_strip(sentence: &str) -> Result<&str, NmeaError> {
     let body = sentence.strip_prefix('$').unwrap_or(sentence);
     let star = body.rfind('*').ok_or(NmeaError::BadChecksum)?;
     let (data, tail) = body.split_at(star);
-    let hex = &tail[1..]; // skip '*'
-    if hex.len() < 2 {
+    let hex = &tail.as_bytes()[1..]; // skip '*' (one ASCII byte)
+                                     // The serial line is decoded lossily, so noise can put multi-byte U+FFFD
+                                     // after the '*'. Slicing `&str` at byte 2 then lands inside a character
+                                     // and PANICS (which used to kill the reader thread for good). Work on
+                                     // bytes and demand two ASCII hex digits.
+    if hex.len() < 2 || !hex[0].is_ascii_hexdigit() || !hex[1].is_ascii_hexdigit() {
         return Err(NmeaError::BadChecksum);
     }
-    let claimed = u8::from_str_radix(&hex[..2], 16).map_err(|_| NmeaError::BadChecksum)?;
+    let claimed = (hex_val(hex[0]) << 4) | hex_val(hex[1]);
     let computed = data.bytes().fold(0u8, |acc, b| acc ^ b);
     if claimed != computed {
         return Err(NmeaError::BadChecksum);
     }
     Ok(data)
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => b - b'A' + 10, // caller has checked is_ascii_hexdigit
+    }
 }
 
 /// Map a GGA fix-quality digit onto the ordered [`FixQuality`] enum.
@@ -124,12 +136,19 @@ pub struct Gga {
 }
 
 fn parse_hhmmss(field: &str) -> Result<(u32, u32, f64), NmeaError> {
+    // `str::get` (not `[a..b]`) so a multi-byte character straddling an index
+    // is a parse error instead of a panic.
+    let part = |a, b| field.get(a..b).ok_or(NmeaError::BadNumber);
     if field.len() < 6 {
         return Err(NmeaError::BadNumber);
     }
-    let hour: u32 = field[0..2].parse().map_err(|_| NmeaError::BadNumber)?;
-    let minute: u32 = field[2..4].parse().map_err(|_| NmeaError::BadNumber)?;
-    let second: f64 = field[4..].parse().map_err(|_| NmeaError::BadNumber)?;
+    let hour: u32 = part(0, 2)?.parse().map_err(|_| NmeaError::BadNumber)?;
+    let minute: u32 = part(2, 4)?.parse().map_err(|_| NmeaError::BadNumber)?;
+    let second: f64 = field
+        .get(4..)
+        .ok_or(NmeaError::BadNumber)?
+        .parse()
+        .map_err(|_| NmeaError::BadNumber)?;
     Ok((hour, minute, second))
 }
 
@@ -144,6 +163,11 @@ fn parse_hhmmss(field: &str) -> Result<(u32, u32, f64), NmeaError> {
 /// exactly this; one function covers both here.)
 fn parse_lat_lon(value: &str, hemisphere: &str) -> Result<f64, NmeaError> {
     let raw: f64 = value.parse().map_err(|_| NmeaError::BadNumber)?;
+    // `"NaN"`/`"inf"` parse successfully as f64; a NaN position would flow
+    // into the mission's distance maths.
+    if !raw.is_finite() {
+        return Err(NmeaError::BadNumber);
+    }
     let degrees = (raw / 100.0).trunc();
     let minutes = raw - degrees * 100.0;
     let mut decimal = degrees + minutes / 60.0;
@@ -211,6 +235,9 @@ pub fn parse_gga(sentence: &str) -> Result<Gga, NmeaError> {
     } else {
         tokens[9].parse().map_err(|_| NmeaError::BadNumber)?
     };
+    if !alt_m.is_finite() || !hdop.is_finite() {
+        return Err(NmeaError::BadNumber);
+    }
 
     Ok(Gga {
         hour,
@@ -284,14 +311,15 @@ pub fn parse_rmc(sentence: &str) -> Result<Rmc, NmeaError> {
     if date.len() < 6 {
         return Err(NmeaError::BadNumber);
     }
-    let day: u32 = date[0..2].parse().map_err(|_| NmeaError::BadNumber)?;
-    let month: u32 = date[2..4].parse().map_err(|_| NmeaError::BadNumber)?;
+    let dpart = |a, b| date.get(a..b).ok_or(NmeaError::BadNumber);
+    let day: u32 = dpart(0, 2)?.parse().map_err(|_| NmeaError::BadNumber)?;
+    let month: u32 = dpart(2, 4)?.parse().map_err(|_| NmeaError::BadNumber)?;
     // NMEA's `ddmmyy` carries no century. `gnss_ublox_node.cpp::parseDate`
     // always assumed 20xx (`"20" + date_str.substr(4, 2)`); this rover will
     // never see a pre-2000 fix, so the same assumption is kept rather than
     // adding a century-pivot heuristic NMEA itself has no way to confirm.
     let year: i32 = 2000
-        + date[4..6]
+        + dpart(4, 6)?
             .parse::<i32>()
             .map_err(|_| NmeaError::BadNumber)?;
 
@@ -323,6 +351,34 @@ mod tests {
     }
 
     // ---- checksum ---------------------------------------------------
+
+    #[test]
+    fn non_ascii_after_the_star_is_a_checksum_error_not_a_panic() {
+        // Lossy UTF-8 decoding of line noise yields U+FFFD (3 bytes). The old
+        // `&hex[..2]` sliced inside it and panicked.
+        for line in [
+            "$GPGGA,1*\u{FFFD}\u{FFFD}",
+            "$GPGGA,1*A\u{FFFD}",
+            "$GPGGA,1*\u{FFFD}",
+            "$GPGGA,1*é1",
+        ] {
+            assert_eq!(parse_gga(line), Err(NmeaError::BadChecksum), "{line:?}");
+            assert_eq!(parse_rmc(line), Err(NmeaError::BadChecksum), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_time_field_is_an_error_not_a_panic() {
+        // 'é' is 2 bytes, so a `[0..2]`-style slice at byte 1 is mid-character.
+        let s = with_checksum("GPGGA,é12345,,,,,0,00,,,M,,M,,");
+        assert!(parse_gga(&s).is_err());
+    }
+
+    #[test]
+    fn nan_latitude_is_rejected() {
+        let s = with_checksum("GPGGA,123456.00,NaN,N,10000.0000,E,1,08,0.9,10.0,M,0.0,M,,");
+        assert_eq!(parse_gga(&s), Err(NmeaError::BadNumber));
+    }
 
     #[test]
     fn rejects_bad_checksum() {

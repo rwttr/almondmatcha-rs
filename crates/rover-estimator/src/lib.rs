@@ -79,6 +79,18 @@ use rover_msgs::{state_idx, EkfDebug, LaneMeasurement, RoverState, WheelSensors,
 
 pub use config::{EstimatorConfig, LaneNoise, ProcessNoise};
 
+/// Largest forward gap between two consecutive samples of one feed (IMU or
+/// wheel `t_us`) that is still treated as the same continuous stream. The
+/// counters are free-running `u32` microseconds differenced with
+/// `wrapping_sub`; a late/reordered packet (sample N arriving after N+1) or an
+/// MCU reboot (counter restarts near 0) makes that difference ~2^32 us =
+/// 4295 s, which would be integrated as a 71-minute predict step (or a
+/// near-zero odometry speed). Anything above this is a discontinuity: skip the
+/// step and re-anchor on the new timestamp. 0.5 s is 5x the 10 Hz wheel
+/// period and 50x the 100 Hz IMU period: well above any real jitter, well
+/// below the time the filter could be trusted to coast on.
+pub const MAX_SAMPLE_GAP_US: u32 = 500_000;
+
 /// The filter. Owns its belief (`x`, `P`) and just enough bookkeeping
 /// (previous wheel sample, a one-shot warning flag) to make its updates
 /// well-defined; nothing here touches a clock, a socket, or a file.
@@ -87,11 +99,16 @@ pub struct Ekf {
     x: StateVector,
     p: StateMatrix,
     params: VehicleParams,
-    /// Milliseconds since the last *received* camera measurement (gated or
-    /// not). Saturates rather than wraps — see the module docs.
+    /// Milliseconds since the last *accepted* camera update (a gated or
+    /// invalid frame does not reset it — see the module docs). Starts at
+    /// `u16::MAX`: before any camera frame has ever been accepted the filter
+    /// has no lane information at all, and `0` would read as "perfectly fresh"
+    /// and let the speed derating (`confidence_speed_scale`) drive at full
+    /// speed on the zero-error prior. Saturates rather than wraps.
     lane_age_ms: u16,
     last_wheel: Option<WheelSensors>,
     odometry_disabled_warned: bool,
+    wheel_gap_warned: bool,
 }
 
 impl Ekf {
@@ -111,9 +128,10 @@ impl Ekf {
             x: initial_state,
             p,
             params,
-            lane_age_ms: 0,
+            lane_age_ms: u16::MAX,
             last_wheel: None,
             odometry_disabled_warned: false,
+            wheel_gap_warned: false,
         }
     }
 
@@ -132,6 +150,12 @@ impl Ekf {
     /// `gyro_radps` is the raw (bias-uncorrected) gyro z-axis reading; the
     /// process model subtracts the filter's own bias estimate internally.
     pub fn predict(&mut self, gyro_radps: f32, dt_s: f32, cfg: &EstimatorConfig) {
+        // A NaN gyro or dt would turn x and P into NaN for the rest of the
+        // run (no update can recover a NaN covariance); a negative dt would
+        // shrink P. Skip the step instead.
+        if !gyro_radps.is_finite() || !dt_s.is_finite() || dt_s < 0.0 {
+            return;
+        }
         // Linearise at the pre-step estimate, then advance the mean with the
         // same nonlinear model the Jacobian was taken from.
         let f_c = process_jacobian(&self.x);
@@ -217,7 +241,9 @@ impl Ekf {
         };
 
         let nis = (y.transpose() * s_inv * y)[(0, 0)];
-        let gated = nis > cfg.nis_gate;
+        // `nis > gate` is false for NaN, which would ACCEPT a NaN measurement
+        // and poison x and P permanently. Anything non-finite is gated.
+        let gated = !nis.is_finite() || nis > cfg.nis_gate;
 
         if !gated {
             // Reset only on an ACCEPTED update. `lane_age_ms` answers "how
@@ -282,6 +308,19 @@ impl Ekf {
         if dt_us == 0 {
             return; // duplicate sample, nothing to difference
         }
+        if dt_us > MAX_SAMPLE_GAP_US {
+            // Reordered sample or MCU reboot (see `MAX_SAMPLE_GAP_US`): the
+            // tick counters are not comparable either. `last_wheel` was
+            // already replaced above, so this re-anchors on the new sample.
+            if !self.wheel_gap_warned {
+                log::warn!(
+                    "rover-estimator: wheel t_us jumped by {dt_us} us (reordered packet or MCU \
+                     reboot) — skipping this odometry/zero-rate step and re-anchoring"
+                );
+                self.wheel_gap_warned = true;
+            }
+            return;
+        }
         let dt_s = dt_us as f32 / 1_000_000.0;
 
         let delta_left = wheel.ticks_left.wrapping_sub(prev.ticks_left);
@@ -328,6 +367,9 @@ impl Ekf {
     /// is one implementation instead of two hand-derived ones that could
     /// disagree.
     fn scalar_update(&mut self, idx: usize, z: f32, r: f32) {
+        if !z.is_finite() {
+            return; // never let a NaN/inf reading into x or P
+        }
         let y = z - self.x[idx];
         let s = self.p[(idx, idx)] + r;
         if s <= 0.0 || s.is_nan() {

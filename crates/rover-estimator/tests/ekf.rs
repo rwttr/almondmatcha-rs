@@ -107,9 +107,10 @@ fn constant_curvature_arc_is_tracked() {
     let cfg = cfg(0.0);
     let true_kappa = 0.5_f32;
     let true_v = 0.2_f32;
-    // Vehicle exactly on the arc (e_y = e_psi = 0 throughout): maintaining
-    // that requires a true yaw rate of v * kappa.
-    let true_yaw_rate = true_v * true_kappa;
+    // Vehicle exactly on the arc (e_y = e_psi = 0 throughout): kappa > 0 is a
+    // RIGHT-hand curve, so following it means turning clockwise, and gyro z is
+    // CCW-positive: the true yaw rate is -v * kappa.
+    let true_yaw_rate = -true_v * true_kappa;
 
     let mut x0 = StateVector::zeros();
     x0[state_idx::SPEED] = true_v; // kappa starts at the wrong value, 0.0
@@ -156,6 +157,10 @@ fn constant_curvature_arc_is_tracked() {
 fn lane_dropout_coasts_without_diverging() {
     let cfg = cfg(0.0);
     let mut ekf = Ekf::at_rest(params(), [1e-3, 1e-3, 1e-3, 1e-3, 1e-6]);
+    // Start from a genuinely fresh lane (a new filter reads u16::MAX, see
+    // `fresh_filter_has_no_lane_information`) so the 3 s of ageing is exact.
+    ekf.correct_camera(&lane_measurement(0.0, 0.0, 0.0, 0), &cfg);
+    assert_eq!(ekf.state().lane_age_ms, 0);
     let p0 = ekf.state().p_diag;
 
     // A real (small, unmodelled) gyro bias in the raw reading -- the filter
@@ -468,4 +473,104 @@ fn gated_measurements_do_not_refresh_lane_age() {
         "lane_age_ms must track ACCEPTED information, not camera liveness; got {} ms",
         ekf.state().lane_age_ms
     );
+}
+
+// ---------------------------------------------------------------------------
+// Process-model sign (audit item 1): predict-only, no camera.
+// ---------------------------------------------------------------------------
+
+/// A rover following a steady RIGHT curve (kappa > 0) turns clockwise, so
+/// z-up gyro reads -v*kappa and e_psi must stay constant with no camera help.
+/// With the old `- v*kappa` term this drifts at 2*v*kappa = 0.2 rad/s.
+#[test]
+fn steady_right_arc_with_consistent_gyro_holds_e_psi_predict_only() {
+    let cfg = cfg(0.0);
+    let (v, kappa) = (0.2_f32, 0.5_f32);
+    let mut x0 = StateVector::zeros();
+    x0[state_idx::SPEED] = v;
+    x0[state_idx::CURVATURE] = kappa;
+    x0[state_idx::HEADING_ERR] = 0.03;
+    let mut ekf = Ekf::new(params(), x0, [1e-2; 5]);
+    for _ in 0..200 {
+        ekf.predict(-v * kappa, DT, &cfg);
+    }
+    let s = ekf.state();
+    assert!(
+        (s.heading_err_rad - 0.03).abs() < 1e-4,
+        "e_psi drifted on a consistent arc: {}",
+        s.heading_err_rad
+    );
+}
+
+/// Same arc, rover NOT yawing: it ends up pointing left of the tangent.
+#[test]
+fn right_curve_without_yaw_increases_e_psi() {
+    let cfg = cfg(0.0);
+    let mut x0 = StateVector::zeros();
+    x0[state_idx::SPEED] = 0.2;
+    x0[state_idx::CURVATURE] = 0.5;
+    let mut ekf = Ekf::new(params(), x0, [1e-2; 5]);
+    for _ in 0..100 {
+        ekf.predict(0.0, DT, &cfg);
+    }
+    assert!(ekf.state().heading_err_rad > 0.09);
+}
+
+// ---------------------------------------------------------------------------
+// Audit items 3, 8, 9 at the filter level.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fresh_filter_has_no_lane_information() {
+    let ekf = Ekf::at_rest(params(), [1e-2; 5]);
+    assert_eq!(ekf.state().lane_age_ms, u16::MAX);
+}
+
+#[test]
+fn nan_camera_measurement_is_gated_and_does_not_poison_state() {
+    let cfg = cfg(0.0);
+    let mut ekf = Ekf::at_rest(params(), [1e-2; 5]);
+    let dbg = ekf
+        .correct_camera(&lane_measurement(f32::NAN, 0.0, 0.0, 0), &cfg)
+        .unwrap();
+    assert!(dbg.gated);
+    let s = ekf.state();
+    assert!(s.cross_track_m.is_finite() && s.p_diag.iter().all(|p| p.is_finite()));
+    assert_eq!(
+        s.lane_age_ms,
+        u16::MAX,
+        "a gated frame must not count as fresh"
+    );
+}
+
+#[test]
+fn nan_gyro_predict_is_skipped() {
+    let cfg = cfg(0.0);
+    let mut ekf = Ekf::at_rest(params(), [1e-2; 5]);
+    ekf.predict(f32::NAN, DT, &cfg);
+    assert!(ekf.state().heading_err_rad.is_finite());
+}
+
+#[test]
+fn wheel_t_us_discontinuity_is_skipped_and_reanchors() {
+    let mut cfg = cfg(0.001);
+    cfg.zero_rate_max_ticks = 0;
+    let mut ekf = Ekf::at_rest(params(), [1e-2; 5]);
+    let w = |l: i32, t: u32| WheelSensors {
+        ticks_left: l,
+        ticks_right: l,
+        t_us: t,
+    };
+    ekf.correct_wheel_sensors(&w(0, 5_000_000), 0.5, 0.0, &cfg); // seed
+                                                                 // Reordered/rebooted: counter jumps "backwards" -> wrapping dt ~ 4290 s.
+    ekf.correct_wheel_sensors(&w(100, 4_000_000), 0.5, 0.0, &cfg);
+    assert_eq!(
+        ekf.state().speed_mps,
+        0.0,
+        "discontinuity must not feed odometry"
+    );
+    // Next sample is a normal 0.1 s step from the re-anchored one: 20 ticks
+    // * 1 mm / 0.1 s = 0.2 m/s measured -> speed moves toward it.
+    ekf.correct_wheel_sensors(&w(120, 4_100_000), 0.5, 0.0, &cfg);
+    assert!(ekf.state().speed_mps > 0.1, "got {}", ekf.state().speed_mps);
 }

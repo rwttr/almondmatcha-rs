@@ -90,11 +90,22 @@ pub fn parse_line(line: &str) -> Result<SpresenseFix, SpresenseParseError> {
         .parse()
         .map_err(|_| SpresenseParseError::BadValue("longitude"))?;
 
+    // `"latitude":NaN` parses as `Ok(NaN)` in Rust; the Spresense does emit it
+    // before it has a position. A non-finite position must be an error, not a
+    // fix whose lat/lon poison the mission's distance.
+    if !lat_deg.is_finite() {
+        return Err(SpresenseParseError::BadValue("latitude"));
+    }
+    if !lon_deg.is_finite() {
+        return Err(SpresenseParseError::BadValue("longitude"));
+    }
+
     let num_satellites = find_field(line, "numSatellites")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let alt_m = find_field(line, "altitude")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|a| a.is_finite())
         .unwrap_or(0.0);
     let time_str = find_field(line, "time").unwrap_or_default().to_string();
 
@@ -167,5 +178,19 @@ mod tests {
     fn bad_fix_value_is_an_error() {
         let line = r#"{"fix":"maybe","latitude":1.0,"longitude":2.0}"#;
         assert_eq!(parse_line(line), Err(SpresenseParseError::BadValue("fix")));
+    }
+
+    #[test]
+    fn nan_or_inf_position_is_rejected() {
+        let nan = r#"{"time":"2025-01-04 14:30:52","numSatellites":7,"fix":true,"latitude":NaN,"longitude":100.5,"altitude":1.0}"#;
+        assert_eq!(
+            parse_line(nan),
+            Err(SpresenseParseError::BadValue("latitude"))
+        );
+        let inf = r#"{"fix":true,"latitude":13.7,"longitude":inf}"#;
+        assert_eq!(
+            parse_line(inf),
+            Err(SpresenseParseError::BadValue("longitude"))
+        );
     }
 }

@@ -33,13 +33,48 @@ use rover_msgs::{Command, GnssFix, MissionGoal, MissionState, MissionStatus};
 /// silently carried forward. This function prefers the RTK fix whenever it
 /// is usable and falls back to the backup receiver only when RTK is not.
 pub fn select_navigation_fix(rtk: &GnssFix, backup: &GnssFix) -> Option<(f64, f64)> {
-    if rtk.is_usable() {
+    if usable(rtk) {
         Some((rtk.lat_deg, rtk.lon_deg))
-    } else if backup.is_usable() {
+    } else if usable(backup) {
         Some((backup.lat_deg, backup.lon_deg))
     } else {
         None
     }
+}
+
+/// A fix older than this is unusable. The receivers send ~1-10 Hz, so 2 s is
+/// several missed sentences; before this existed `main` held the last fix
+/// forever, so an unplugged or hung receiver kept reporting its last
+/// "RTK fixed" position and the mission kept driving on it.
+pub const GNSS_FIX_MAX_AGE_S: f64 = 2.0;
+
+/// No usable fix for longer than this pauses the mission (`active = false`);
+/// it resumes, uncancelled, when a fix returns.
+pub const GNSS_LOSS_PAUSE_S: f64 = 5.0;
+
+/// `GnssFix::is_usable` plus a finite lat/lon: a Spresense `"latitude":NaN`
+/// parses as a number and `is_usable` only looks at fix type and satellites.
+fn usable(fix: &GnssFix) -> bool {
+    fix.is_usable() && fix.lat_deg.is_finite() && fix.lon_deg.is_finite()
+}
+
+/// [`select_navigation_fix`] with receive-age expiry: a fix whose age is
+/// `None` (never received) or `> max_age_s` is treated as no fix at all.
+pub fn select_fresh_navigation_fix(
+    rtk: &GnssFix,
+    rtk_age_s: Option<f64>,
+    backup: &GnssFix,
+    backup_age_s: Option<f64>,
+    max_age_s: f64,
+) -> Option<(f64, f64)> {
+    let fresh = |fix: &GnssFix, age: Option<f64>| {
+        if age.is_some_and(|a| a <= max_age_s) {
+            *fix
+        } else {
+            GnssFix::default()
+        }
+    };
+    select_navigation_fix(&fresh(rtk, rtk_age_s), &fresh(backup, backup_age_s))
 }
 
 /// The mission state machine.
@@ -52,6 +87,10 @@ pub struct Mission {
     goal: Option<MissionGoal>,
     arrival_radius_m: f32,
     last_distance_remaining_m: f32,
+    /// Start (caller's clock, seconds) of the current run of ticks with no
+    /// usable fix; `None` while a fix is present.
+    no_fix_since_s: Option<f64>,
+    paused_for_no_fix: bool,
 }
 
 impl Mission {
@@ -66,12 +105,16 @@ impl Mission {
                 goal: Some(goal),
                 arrival_radius_m: config.arrival_radius_m,
                 last_distance_remaining_m: 0.0,
+                no_fix_since_s: None,
+                paused_for_no_fix: false,
             },
             None => Self {
                 state: MissionState::Idle,
                 goal: None,
                 arrival_radius_m: config.arrival_radius_m,
                 last_distance_remaining_m: 0.0,
+                no_fix_since_s: None,
+                paused_for_no_fix: false,
             },
         }
     }
@@ -139,7 +182,16 @@ impl Mission {
         }
 
         self.state = match self.state {
-            MissionState::Armed if position.is_some() => MissionState::Running,
+            // A goal that is already inside the arrival radius when the first
+            // fix lands is Arrived NOW: going via Running published one tick
+            // of `active = true` and let the rover creep before stopping.
+            MissionState::Armed if position.is_some() => {
+                if self.last_distance_remaining_m <= self.arrival_radius_m {
+                    MissionState::Arrived
+                } else {
+                    MissionState::Running
+                }
+            }
             MissionState::Running if position.is_some() => {
                 if self.last_distance_remaining_m <= self.arrival_radius_m {
                     MissionState::Arrived
@@ -156,6 +208,39 @@ impl Mission {
             target: self.goal,
             state: self.state,
         }
+    }
+}
+
+impl Mission {
+    /// [`Self::update`] plus GNSS-loss pausing, on a caller-owned monotonic
+    /// clock (`now_s`, seconds). While a `Running` mission has had no usable
+    /// position for more than [`GNSS_LOSS_PAUSE_S`], the published status is
+    /// `active = false` — the rover stops rather than dead-reckoning on a
+    /// goal it can no longer measure against. The mission state is NOT
+    /// changed (not cancelled, not faulted), so `active` returns the moment a
+    /// fix does. Logged once per pause/resume edge.
+    pub fn update_at(&mut self, position: Option<(f64, f64)>, now_s: f64) -> MissionStatus {
+        let mut status = self.update(position);
+        if position.is_some() {
+            self.no_fix_since_s = None;
+            if self.paused_for_no_fix {
+                log::info!("rover-navigation: GNSS fix back — resuming the mission");
+                self.paused_for_no_fix = false;
+            }
+        } else {
+            let since = *self.no_fix_since_s.get_or_insert(now_s);
+            if self.state == MissionState::Running && now_s - since > GNSS_LOSS_PAUSE_S {
+                if !self.paused_for_no_fix {
+                    log::warn!(
+                        "rover-navigation: no usable GNSS fix for > {GNSS_LOSS_PAUSE_S:.0} s — \
+                         pausing the mission (active=false) until a fix returns"
+                    );
+                    self.paused_for_no_fix = true;
+                }
+                status.active = false;
+            }
+        }
+        status
     }
 }
 
@@ -244,7 +329,7 @@ mod mission_tests {
     #[test]
     fn armed_moves_to_running_once_position_is_available() {
         let mut m = Mission::new(&config(2.0, Some((0.0, 0.0))));
-        let status = m.update(Some((0.0, 0.0)));
+        let status = m.update(Some((0.001, 0.0))); // ~111 m from the goal
         assert_eq!(m.state(), MissionState::Running);
         assert!(status.active);
     }
@@ -268,7 +353,7 @@ mod mission_tests {
     #[test]
     fn arrives_within_the_configured_radius() {
         let mut m = Mission::new(&config(5.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186))); // Armed -> Running
+        m.update(Some((13.746717, 100.523186))); // Armed -> Running, ~1.1 km out
                                                  // ~2 m away, inside a 5 m arrival radius.
         let status = m.update(Some((13.736735, 100.523186)));
         assert_eq!(m.state(), MissionState::Arrived);
@@ -278,7 +363,7 @@ mod mission_tests {
     #[test]
     fn keeps_running_outside_the_arrival_radius() {
         let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186)));
+        m.update(Some((13.746717, 100.523186)));
         // ~1.1 km away — nowhere near a 2 m radius.
         let status = m.update(Some((13.746717, 100.523186)));
         assert_eq!(m.state(), MissionState::Running);
@@ -289,7 +374,7 @@ mod mission_tests {
     #[test]
     fn distance_holds_its_last_value_through_a_gnss_gap() {
         let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186)));
+        m.update(Some((13.746717, 100.523186)));
         let first = m.update(Some((13.746717, 100.523186)));
         // GNSS drops out this tick.
         let second = m.update(None);
@@ -300,7 +385,7 @@ mod mission_tests {
     #[test]
     fn cancel_mission_clears_the_goal_and_stops() {
         let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186))); // now Running
+        m.update(Some((13.746717, 100.523186))); // now Running
         m.apply_command(Command::CancelMission);
         assert_eq!(m.state(), MissionState::Cancelled);
         assert_eq!(m.goal(), None);
@@ -311,7 +396,7 @@ mod mission_tests {
     #[test]
     fn estop_halts_into_fault_regardless_of_state() {
         let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186))); // Running
+        m.update(Some((13.746717, 100.523186))); // Running
         m.apply_command(Command::EStop);
         assert_eq!(m.state(), MissionState::Fault);
         let status = m.update(Some((13.736717, 100.523186)));
@@ -357,7 +442,7 @@ mod mission_tests {
     #[test]
     fn speed_limit_and_nop_do_not_change_mission_state() {
         let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186))); // Running
+        m.update(Some((13.746717, 100.523186))); // Running
         m.apply_command(Command::SetSpeedLimit(50));
         m.apply_command(Command::Nop);
         assert_eq!(m.state(), MissionState::Running);
@@ -377,12 +462,77 @@ mod mission_tests {
     #[test]
     fn arrived_does_not_resume_running_on_its_own() {
         let mut m = Mission::new(&config(5.0, Some((13.736717, 100.523186))));
-        m.update(Some((13.736717, 100.523186)));
+        m.update(Some((13.746717, 100.523186))); // Armed -> Running, far away
         m.update(Some((13.736717, 100.523186))); // Arrived (distance ~0)
         assert_eq!(m.state(), MissionState::Arrived);
         // Even if fed a position again, Arrived is terminal until a new command.
         let status = m.update(Some((13.746717, 100.523186)));
         assert_eq!(m.state(), MissionState::Arrived);
         assert!(!status.active);
+    }
+
+    // ---- audit item 6: arrival, GNSS loss, freshness --------------------
+
+    #[test]
+    fn goal_already_inside_the_arrival_radius_goes_straight_to_arrived() {
+        let mut m = Mission::new(&config(5.0, Some((13.736717, 100.523186))));
+        let status = m.update(Some((13.736717, 100.523186)));
+        assert_eq!(m.state(), MissionState::Arrived);
+        assert!(!status.active, "not even one tick of active=true");
+    }
+
+    #[test]
+    fn no_usable_fix_for_over_5s_pauses_then_resumes_without_cancelling() {
+        let far = Some((13.746717, 100.523186));
+        let mut m = Mission::new(&config(2.0, Some((13.736717, 100.523186))));
+        assert!(m.update_at(far, 0.0).active);
+        // Loss begins at t=1.
+        assert!(m.update_at(None, 1.0).active, "a short gap keeps driving");
+        assert!(m.update_at(None, 5.9).active);
+        let paused = m.update_at(None, 6.5);
+        assert!(
+            !paused.active,
+            "> 5 s with no fix must publish active=false"
+        );
+        assert_eq!(m.state(), MissionState::Running, "paused, not cancelled");
+        assert!(m.goal().is_some());
+        // Fix returns: drive again, same mission.
+        let resumed = m.update_at(far, 7.0);
+        assert!(resumed.active);
+        assert_eq!(m.state(), MissionState::Running);
+        // And a later short gap does not inherit the old loss start.
+        assert!(m.update_at(None, 8.0).active);
+    }
+
+    fn fix(lat: f64, lon: f64) -> GnssFix {
+        GnssFix {
+            lat_deg: lat,
+            lon_deg: lon,
+            fix: rover_msgs::FixQuality::RtkFixed,
+            sats: 12,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stale_fix_is_unusable() {
+        let rtk = fix(1.0, 2.0);
+        let backup = fix(9.0, 9.0);
+        let sel = |ra, ba| select_fresh_navigation_fix(&rtk, ra, &backup, ba, GNSS_FIX_MAX_AGE_S);
+        assert_eq!(sel(Some(0.1), Some(0.1)), Some((1.0, 2.0)));
+        assert_eq!(
+            sel(Some(3.0), Some(0.1)),
+            Some((9.0, 9.0)),
+            "stale RTK falls back"
+        );
+        assert_eq!(sel(Some(3.0), Some(3.0)), None);
+        assert_eq!(sel(None, None), None, "never received");
+    }
+
+    #[test]
+    fn non_finite_lat_lon_is_unusable_even_with_a_fix_type() {
+        let rtk = fix(f64::NAN, 2.0);
+        let backup = fix(9.0, f64::INFINITY);
+        assert_eq!(select_navigation_fix(&rtk, &backup), None);
     }
 }
