@@ -141,14 +141,18 @@ fn main() {
     });
 
     log::info!("ground-station ready, bound {bind_addr}, logging under {run_dir_path}");
-    println!("commands: estop | clearestop | cancel | goal <lat> <lon> | speed <pct> | nop");
+    println!("{}", command_parse::command_hint());
 
     let mut next_redraw = Instant::now();
+    // Anything the operator needs to read goes through this, not `println!`:
+    // the 200 ms full-screen redraw would erase a printed line almost at once.
+    let mut notice = display::Notice::default();
 
     loop {
         bus.poll();
 
         while let Ok(line) = cmd_rx.try_recv() {
+            let mut msgs: Vec<String> = Vec::new();
             match command_parse::parse_command(&line) {
                 Ok(cmd) => {
                     let is_estop = matches!(cmd, rover_msgs::Command::EStop);
@@ -166,26 +170,25 @@ fn main() {
                             None => format!("E-STOP discarded queued command {:?}", d.body),
                         };
                         log::warn!("{msg}");
-                        println!("\n{msg}");
+                        msgs.push(msg);
                     }
                     if is_estop {
-                        // Printed immediately, not just on the next redraw --
-                        // an operator who just pressed Enter on "estop"
-                        // should see the disclaimer without waiting for the
-                        // next 200 ms tick.
-                        match sender.in_flight() {
-                            Some((seq, _)) => println!("\nSending E-STOP (cmd_seq={seq})."),
-                            None => println!("\nSending E-STOP."),
-                        }
-                        println!("{}", display::ESTOP_DISCLAIMER);
+                        // The disclaimer itself is on every redraw already.
+                        msgs.push(match sender.in_flight() {
+                            Some((seq, _)) => format!("Sending E-STOP (cmd_seq={seq})."),
+                            None => "Sending E-STOP.".to_string(),
+                        });
                     } else if sender.queue_len() > 0 {
-                        println!(
-                            "\nQueued behind the unacknowledged command ({} waiting).",
+                        msgs.push(format!(
+                            "Queued behind the unacknowledged command ({} waiting).",
                             sender.queue_len()
-                        );
+                        ));
                     }
                 }
-                Err(e) => println!("\ncommand error: {e}"),
+                Err(e) => msgs.push(format!("command error: {e}")),
+            }
+            if !msgs.is_empty() {
+                notice.set(msgs.join("\n>> "), Instant::now());
             }
         }
 
@@ -205,7 +208,12 @@ fn main() {
                 .map(|t| now.duration_since(t).as_millis() as u64);
             let status = link::classify(age_ms);
             let t = latest_telemetry.borrow();
-            let pending_seq = sender.in_flight().map(|(seq, _)| seq);
+            let command = display::CommandStatus {
+                in_flight: sender.in_flight(),
+                queue_len: sender.queue_len(),
+                session: sender.session(),
+                last_acked_seq: t.last_cmd_seq,
+            };
             print!(
                 "{}",
                 display::render_dashboard(
@@ -216,8 +224,8 @@ fn main() {
                     &t.mission,
                     &t.power,
                     t.health,
-                    pending_seq,
-                    t.last_cmd_seq,
+                    &command,
+                    notice.visible(now),
                 )
             );
         }

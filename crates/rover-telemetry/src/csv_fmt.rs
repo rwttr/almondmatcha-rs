@@ -90,12 +90,19 @@ pub fn format_chassis_status_row(timestamp_us: u64, c: &ChassisStatus) -> String
 }
 
 pub const SPEED_LOOP_DEBUG_HEADER: &str =
-    "Timestamp_us,Measured_Left_TPS,Measured_Right_TPS,Target_TPS,Error_Pct,PID_Output_Pct\n";
+    "Timestamp_us,Measured_Left_TPS,Measured_Right_TPS,Measured_Avg_TPS,Target_TPS,Error_Pct,PID_Output_Pct\n";
 
 pub fn format_speed_loop_debug_row(timestamp_us: u64, d: &SpeedLoopDebug) -> String {
     format!(
-        "{timestamp_us},{},{},{},{},{}\n",
-        d.measured_left_tps, d.measured_right_tps, d.target_tps, d.error_pct, d.pid_output_pct
+        "{timestamp_us},{},{},{},{},{},{}\n",
+        d.measured_left_tps,
+        d.measured_right_tps,
+        // Derived, not on the wire: the mean of the two wheels, the raw
+        // process variable `docs/CSV_LOGGING.md` lists for this file.
+        (d.measured_left_tps + d.measured_right_tps) / 2.0,
+        d.target_tps,
+        d.error_pct,
+        d.pid_output_pct
     )
 }
 
@@ -273,7 +280,7 @@ mod tests {
             pid_output_pct: 32.0,
         };
         let row = format_speed_loop_debug_row(7_000, &d);
-        assert_eq!(row, "7000,100,98,100,1.5,32\n");
+        assert_eq!(row, "7000,100,98,99,100,1.5,32\n");
         assert_same_column_count(SPEED_LOOP_DEBUG_HEADER, &row);
     }
 

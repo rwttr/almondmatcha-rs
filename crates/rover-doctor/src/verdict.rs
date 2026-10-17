@@ -78,8 +78,12 @@ pub struct DrivetrainConfig {
 }
 
 /// Configuration-derived facts [`evaluate`] needs beyond what is on the bus.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DoctorConfig {
+    /// The config file these values were read from, as given on the command
+    /// line. Reported by the calibration check: this is the *base PC's*
+    /// copy, which is not necessarily what the RPi is running.
+    pub source: String,
     pub drivetrain: DrivetrainConfig,
     /// `[estimator] lane_stale_ms` — the same threshold the estimator and
     /// `rover-telemetry`'s `HealthBits::LANE_STALE` use, so this check can
@@ -144,13 +148,23 @@ fn post_check(obs: &Observations) -> CheckResult {
         };
     };
     let mut failures = Vec::new();
-    if !chassis.post_ok() {
+    // `post_ok()` is vacuously true when `post_run` is empty, so a board
+    // that ran no POST at all (stale firmware, a bug, a cleared mask) would
+    // read as "passed every check that ran". Nothing verified is not GO.
+    for (name, d) in [("chassis", &chassis), ("sensors", &sensors)] {
+        if d.post_run.0 == 0 {
+            failures.push(format!(
+                "{name} (no POST checks ran -- nothing was verified)"
+            ));
+        }
+    }
+    if chassis.post_run.0 != 0 && !chassis.post_ok() {
         failures.push(format!(
             "chassis (failed mask 0x{:04X})",
             chassis.post_failures().0
         ));
     }
-    if !sensors.post_ok() {
+    if sensors.post_run.0 != 0 && !sensors.post_ok() {
         failures.push(format!(
             "sensors (failed mask 0x{:04X})",
             sensors.post_failures().0
@@ -307,26 +321,34 @@ fn health_bits_check(obs: &Observations) -> CheckResult {
 /// downstream is meaningless until `docs/CALIBRATION.md`'s procedures are
 /// run, and there is no flag to skip this check, because a silenced
 /// calibration warning is worse than a GO nobody should trust.
+///
+/// The value checked is read from `cfg.source`, **the base PC's** copy of
+/// the config, not the RPi's — the doctor cannot see the RPi's file, so
+/// both outputs say which file was read and that the RPi's copy must match.
 fn drivetrain_check(cfg: &DoctorConfig) -> CheckResult {
     if cfg.drivetrain.metres_per_tick > 0.0 {
         CheckResult {
             name: "drivetrain calibrated",
             verdict: Verdict::Go,
             detail: format!(
-                "metres_per_tick = {} (see [drivetrain] in config/rover.toml)",
-                cfg.drivetrain.metres_per_tick
+                "metres_per_tick = {} in [drivetrain] of {} (the base PC's copy; the \
+                 RPi's config/rover.toml must carry the same value -- not checked here)",
+                cfg.drivetrain.metres_per_tick, cfg.source
             ),
         }
     } else {
         CheckResult {
             name: "drivetrain calibrated",
             verdict: Verdict::NoGo,
-            detail: "metres_per_tick = 0.0 in [drivetrain] -- the drivetrain has never been \
-                     calibrated. Run the procedures in docs/CALIBRATION.md before trusting \
-                     speed_mps or driving autonomously (the reasoning behind them is in \
-                     docs/RUST_REWRITE_PLAN.md section 2.6). There is no override for \
-                     this check."
-                .to_string(),
+            detail: format!(
+                "metres_per_tick = 0.0 in [drivetrain] of {} (the base PC's copy; the RPi's \
+                 config/rover.toml must match it) -- the drivetrain has never been \
+                 calibrated. Run the procedures in docs/CALIBRATION.md before trusting \
+                 speed_mps or driving autonomously (the reasoning behind them is in \
+                 docs/RUST_REWRITE_PLAN.md section 2.6). There is no override for \
+                 this check.",
+                cfg.source
+            ),
         }
     }
 }
@@ -470,6 +492,7 @@ mod tests {
 
     fn calibrated_config() -> DoctorConfig {
         DoctorConfig {
+            source: "config/rover.toml".to_string(),
             drivetrain: DrivetrainConfig {
                 metres_per_tick: 0.0004,
             },
@@ -646,6 +669,7 @@ mod tests {
     #[test]
     fn uncalibrated_drivetrain_is_no_go_and_never_not_seen() {
         let cfg = DoctorConfig {
+            source: "config/rover.toml".to_string(),
             drivetrain: DrivetrainConfig {
                 metres_per_tick: 0.0,
             },
@@ -657,6 +681,40 @@ mod tests {
         assert!(r.detail.contains("docs/CALIBRATION.md"));
         assert!(r.detail.contains("RUST_REWRITE_PLAN.md"));
         assert!(r.detail.contains("2.6"));
+        assert!(r.detail.contains("config/rover.toml"));
+        assert!(r.detail.contains("RPi"));
+    }
+
+    #[test]
+    fn calibration_go_names_the_file_read_and_the_rpi_caveat() {
+        let mut cfg = calibrated_config();
+        cfg.source = "/base/pc/rover.toml".to_string();
+        let r = find(
+            &evaluate(&healthy_observations(), &cfg),
+            "drivetrain calibrated",
+        )
+        .clone();
+        assert_eq!(r.verdict, Verdict::Go);
+        assert!(r.detail.contains("/base/pc/rover.toml"), "{}", r.detail);
+        assert!(r.detail.contains("RPi"), "{}", r.detail);
+    }
+
+    #[test]
+    fn board_that_ran_no_post_is_no_go() {
+        for board in [BoardId::Chassis, BoardId::Sensors] {
+            let mut obs = healthy_observations();
+            let mut d = healthy_diag(board);
+            d.post_run = PostBits(0);
+            d.post_pass = PostBits(0);
+            match board {
+                BoardId::Chassis => obs.chassis_diag = Some(d),
+                BoardId::Sensors => obs.sensors_diag = Some(d),
+            }
+            let results = evaluate(&obs, &calibrated_config());
+            let r = find(&results, "board POST");
+            assert_eq!(r.verdict, Verdict::NoGo, "{board:?}");
+            assert!(r.detail.contains("no POST checks ran"), "{}", r.detail);
+        }
     }
 
     #[test]

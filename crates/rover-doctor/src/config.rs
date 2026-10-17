@@ -16,12 +16,15 @@ impl DoctorConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, DoctorConfigError> {
         let text = std::fs::read_to_string(path.as_ref())
             .map_err(|e| DoctorConfigError::Io(path.as_ref().display().to_string(), e))?;
-        Self::parse(&text)
+        let mut cfg = Self::parse(&text)?;
+        cfg.source = path.as_ref().display().to_string();
+        Ok(cfg)
     }
 
     pub fn parse(toml_text: &str) -> Result<Self, DoctorConfigError> {
         let raw: RawConfig = toml::from_str(toml_text).map_err(DoctorConfigError::Toml)?;
         Ok(Self {
+            source: "<inline>".to_string(),
             drivetrain: DrivetrainConfig {
                 metres_per_tick: raw.drivetrain.metres_per_tick,
             },
@@ -108,6 +111,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/rover.toml");
         let cfg = DoctorConfig::load(path).expect("config/rover.toml must parse");
         assert_eq!(cfg.lane_stale_ms, 500);
+        assert!(cfg.source.ends_with("config/rover.toml"), "{}", cfg.source);
         // The real config is genuinely uncalibrated today -- see
         // `verdict.rs`'s `drivetrain_check` doc comment. If this ever
         // starts failing because someone calibrated the rover, that is

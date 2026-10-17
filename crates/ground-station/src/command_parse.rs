@@ -21,8 +21,15 @@ use std::fmt;
 pub enum ParseCommandError {
     Empty,
     UnknownCommand,
-    BadArgCount { expected: usize, got: usize },
+    BadArgCount {
+        expected: usize,
+        got: usize,
+    },
     BadNumber,
+    /// `nan`/`inf` parse as valid `f64`s but are not coordinates.
+    NotFinite,
+    LatOutOfRange,
+    LonOutOfRange,
     SpeedOutOfRange,
 }
 
@@ -31,18 +38,38 @@ impl fmt::Display for ParseCommandError {
         match self {
             ParseCommandError::Empty => write!(f, "empty input"),
             ParseCommandError::UnknownCommand => {
-                write!(
-                    f,
-                    "unknown command (try: estop, clearestop, cancel, goal <lat> <lon>, speed <pct>, nop)"
-                )
+                write!(f, "unknown command ({})", command_hint())
             }
             ParseCommandError::BadArgCount { expected, got } => {
                 write!(f, "expected {expected} argument(s), got {got}")
             }
             ParseCommandError::BadNumber => write!(f, "could not parse a number"),
+            ParseCommandError::NotFinite => write!(f, "coordinates must be finite numbers"),
+            ParseCommandError::LatOutOfRange => write!(f, "latitude must be within -90..=90"),
+            ParseCommandError::LonOutOfRange => write!(f, "longitude must be within -180..=180"),
             ParseCommandError::SpeedOutOfRange => write!(f, "speed limit must be 0..=100"),
         }
     }
+}
+
+/// Every command as `(usage shown to the operator, accepted words)`. The
+/// dashboard hint, the startup banner and the unknown-command error are all
+/// built from this, so a command cannot be accepted by [`parse_command`] yet
+/// missing from the hint (`clearestop` once was). A test checks that every
+/// word listed here really parses.
+pub const COMMANDS: &[(&str, &[&str])] = &[
+    ("estop", &["estop", "e"]),
+    ("clearestop", &["clearestop", "ce"]),
+    ("cancel", &["cancel", "c"]),
+    ("goal <lat> <lon>", &["goal", "g"]),
+    ("speed <pct>", &["speed", "s"]),
+    ("nop", &["nop"]),
+];
+
+/// `commands: estop | clearestop | ...`, from [`COMMANDS`].
+pub fn command_hint() -> String {
+    let usages: Vec<&str> = COMMANDS.iter().map(|(u, _)| *u).collect();
+    format!("commands: {}", usages.join(" | "))
 }
 
 /// Parse one line of operator input.
@@ -84,6 +111,20 @@ pub fn parse_command(line: &str) -> Result<Command, ParseCommandError> {
             require_args(&args, 2)?;
             let lat_deg: f64 = args[0].parse().map_err(|_| ParseCommandError::BadNumber)?;
             let lon_deg: f64 = args[1].parse().map_err(|_| ParseCommandError::BadNumber)?;
+            // `f64::from_str` accepts "nan" and "inf"; a goal there would be
+            // armed and then fail every distance computation downstream.
+            // Range checks are the cheap guard against a swapped lat/lon or
+            // a dropped decimal point, which would otherwise send the rover
+            // toward a point on the other side of the planet.
+            if !lat_deg.is_finite() || !lon_deg.is_finite() {
+                return Err(ParseCommandError::NotFinite);
+            }
+            if lat_deg.abs() > 90.0 {
+                return Err(ParseCommandError::LatOutOfRange);
+            }
+            if lon_deg.abs() > 180.0 {
+                return Err(ParseCommandError::LonOutOfRange);
+            }
             Ok(Command::SetMissionGoal(MissionGoal { lat_deg, lon_deg }))
         }
         "speed" | "s" => {
@@ -180,6 +221,64 @@ mod tests {
             parse_command("goal abc 2.0"),
             Err(ParseCommandError::BadNumber)
         );
+    }
+
+    #[test]
+    fn goal_rejects_non_finite_coordinates() {
+        for line in [
+            "goal nan 100",
+            "goal 13 NaN",
+            "goal inf 100",
+            "goal 13 -inf",
+            "goal infinity 1",
+        ] {
+            assert_eq!(
+                parse_command(line),
+                Err(ParseCommandError::NotFinite),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_rejects_out_of_range_coordinates_but_accepts_the_limits() {
+        assert_eq!(
+            parse_command("goal 90.1 100"),
+            Err(ParseCommandError::LatOutOfRange)
+        );
+        assert_eq!(
+            parse_command("goal -91 100"),
+            Err(ParseCommandError::LatOutOfRange)
+        );
+        assert_eq!(
+            parse_command("goal 13 180.5"),
+            Err(ParseCommandError::LonOutOfRange)
+        );
+        assert_eq!(
+            parse_command("goal 13 -181"),
+            Err(ParseCommandError::LonOutOfRange)
+        );
+        assert!(parse_command("goal 90 180").is_ok());
+        assert!(parse_command("goal -90 -180").is_ok());
+    }
+
+    #[test]
+    fn every_listed_command_word_parses_and_is_in_the_hint() {
+        let hint = command_hint();
+        for (usage, words) in COMMANDS {
+            assert!(hint.contains(usage), "{usage} missing from {hint}");
+            for w in *words {
+                // Dummy args are fine: only "unknown word" is a failure here.
+                for line in [w.to_string(), format!("{w} 1"), format!("{w} 1 2")] {
+                    assert_ne!(
+                        parse_command(&line),
+                        Err(ParseCommandError::UnknownCommand),
+                        "{line}"
+                    );
+                }
+            }
+        }
+        assert!(hint.contains("clearestop"));
     }
 
     #[test]

@@ -13,8 +13,11 @@
 //! Every function here is pure: given a value, return the string. `main.rs`
 //! is the only place that actually writes to a terminal.
 
+use crate::command_parse::command_hint;
 use crate::link::LinkStatus;
-use rover_msgs::{GnssFix, HealthBits, MissionStatus, PowerSample, RoverState};
+use rover_msgs::{Command, GnssFix, HealthBits, MissionStatus, PowerSample, RoverState};
+
+use std::time::{Duration, Instant};
 
 /// Printed once, unconditionally, on every redraw and again immediately
 /// after an E-stop is sent — the whole point of "label it honestly" is that
@@ -71,6 +74,11 @@ pub fn format_power_line(power: &PowerSample) -> String {
 /// Every [`HealthBits`] flag paired with the label shown in the dashboard.
 /// One place, so the display and any future consumer name the same flags
 /// the same way.
+///
+/// Must name every flag `rover-msgs` defines: the dashboard is the operator's
+/// only view of health, and an unnamed bit reads as "Health: OK" (bits 8-10
+/// once did). `format_health_line` also prints any bit missing from this
+/// table as `UNKNOWN_BIT_n`, so a flag added later cannot vanish silently.
 const HEALTH_FLAG_LABELS: &[(HealthBits, &str)] = &[
     (HealthBits::CHASSIS_STALE, "CHASSIS_STALE"),
     (HealthBits::SENSORS_STALE, "SENSORS_STALE"),
@@ -80,14 +88,23 @@ const HEALTH_FLAG_LABELS: &[(HealthBits, &str)] = &[
     (HealthBits::WATCHDOG_TRIPPED, "WATCHDOG_TRIPPED"),
     (HealthBits::STALL_DETECTED, "STALL_DETECTED"),
     (HealthBits::ESTIMATOR_DIVERGED, "ESTIMATOR_DIVERGED"),
+    (HealthBits::BOARD_POST_FAIL, "BOARD_POST_FAIL"),
+    (HealthBits::BOARD_RESET, "BOARD_RESET"),
+    (HealthBits::LINK_DEGRADED, "LINK_DEGRADED"),
 ];
 
 pub fn format_health_line(health: HealthBits) -> String {
-    let flags: Vec<&str> = HEALTH_FLAG_LABELS
+    let mut flags: Vec<String> = HEALTH_FLAG_LABELS
         .iter()
         .filter(|(bit, _)| health.contains(*bit))
-        .map(|(_, label)| *label)
+        .map(|(_, label)| label.to_string())
         .collect();
+    let known = HEALTH_FLAG_LABELS.iter().fold(0u16, |m, (b, _)| m | b.0);
+    for n in 0..16 {
+        if health.0 & !known & (1 << n) != 0 {
+            flags.push(format!("UNKNOWN_BIT_{n}"));
+        }
+    }
     if flags.is_empty() {
         "Health:   OK".to_string()
     } else {
@@ -95,12 +112,60 @@ pub fn format_health_line(health: HealthBits) -> String {
     }
 }
 
-pub fn format_command_line(pending_cmd_seq: Option<u16>, last_acked_cmd_seq: u16) -> String {
-    match pending_cmd_seq {
-        Some(seq) => {
-            format!("Command:  cmd_seq={seq} pending ack (rover last echoed {last_acked_cmd_seq})")
-        }
-        None => format!("Command:  none pending (rover last echoed {last_acked_cmd_seq})"),
+/// How long the last operator message (command error, E-STOP discard
+/// warning, "Sending E-STOP") stays on screen. The dashboard clears and
+/// redraws every 200 ms, so anything merely `println!`ed between redraws is
+/// gone almost at once — exactly when the operator most needs to read it.
+pub const NOTICE_HOLD: Duration = Duration::from_secs(5);
+
+/// The last operator-facing message and when it was raised.
+#[derive(Debug, Default)]
+pub struct Notice {
+    current: Option<(String, Instant)>,
+}
+
+impl Notice {
+    /// Replace the message (the newest always wins) and restart its timer.
+    pub fn set(&mut self, text: String, now: Instant) {
+        self.current = Some((text, now));
+    }
+
+    /// The message, if it is still within [`NOTICE_HOLD`].
+    pub fn visible(&self, now: Instant) -> Option<&str> {
+        self.current
+            .as_ref()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < NOTICE_HOLD)
+            .map(|(t, _)| t.as_str())
+    }
+}
+
+/// `CommandSender` state for the dashboard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandStatus {
+    /// `(cmd_seq, command)` awaiting an ack.
+    pub in_flight: Option<(u16, Command)>,
+    /// Commands queued behind the in-flight one.
+    pub queue_len: usize,
+    pub session: u16,
+    /// `Telemetry::last_cmd_seq` — what the rover last echoed.
+    pub last_acked_seq: u16,
+}
+
+pub fn format_command_line(c: &CommandStatus) -> String {
+    let queue = if c.queue_len > 0 {
+        format!(", {} queued", c.queue_len)
+    } else {
+        String::new()
+    };
+    match &c.in_flight {
+        Some((seq, cmd)) => format!(
+            "Command:  {cmd:?} cmd_seq={seq} pending ack{queue} (rover last echoed {}; session {:#06x})",
+            c.last_acked_seq, c.session
+        ),
+        None => format!(
+            "Command:  none pending (rover last echoed {}; session {:#06x})",
+            c.last_acked_seq, c.session
+        ),
     }
 }
 
@@ -117,8 +182,8 @@ pub fn render_dashboard(
     mission: &MissionStatus,
     power: &PowerSample,
     health: HealthBits,
-    pending_cmd_seq: Option<u16>,
-    last_acked_cmd_seq: u16,
+    command: &CommandStatus,
+    notice: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str("\x1B[2J\x1B[H");
@@ -139,11 +204,17 @@ pub fn render_dashboard(
     out.push('\n');
     out.push_str(&format_health_line(health));
     out.push('\n');
-    out.push_str(&format_command_line(pending_cmd_seq, last_acked_cmd_seq));
+    out.push_str(&format_command_line(command));
     out.push('\n');
     out.push_str(ESTOP_DISCLAIMER);
     out.push('\n');
-    out.push_str("commands: estop | cancel | goal <lat> <lon> | speed <pct> | nop\n");
+    out.push_str(&command_hint());
+    out.push('\n');
+    if let Some(n) = notice {
+        out.push_str(">> ");
+        out.push_str(n);
+        out.push('\n');
+    }
     out
 }
 
@@ -213,11 +284,102 @@ mod tests {
         assert!(line.contains("Running"));
     }
 
+    fn idle_status() -> CommandStatus {
+        CommandStatus {
+            in_flight: None,
+            queue_len: 0,
+            session: 0xabcd,
+            last_acked_seq: 6,
+        }
+    }
+
     #[test]
     fn command_line_distinguishes_pending_from_acked() {
-        assert!(format_command_line(Some(7), 6).contains("cmd_seq=7 pending"));
-        assert!(format_command_line(None, 6).contains("none pending"));
-        assert!(format_command_line(None, 6).contains("echoed 6"));
+        let mut c = idle_status();
+        c.in_flight = Some((7, Command::EStop));
+        let line = format_command_line(&c);
+        assert!(line.contains("cmd_seq=7 pending"));
+        assert!(line.contains("EStop"));
+        let idle = format_command_line(&idle_status());
+        assert!(idle.contains("none pending"));
+        assert!(idle.contains("echoed 6"));
+        assert!(idle.contains("0xabcd"));
+    }
+
+    #[test]
+    fn command_line_shows_queue_length() {
+        let mut c = idle_status();
+        c.in_flight = Some((7, Command::Nop));
+        c.queue_len = 3;
+        assert!(format_command_line(&c).contains("3 queued"));
+        c.queue_len = 0;
+        assert!(!format_command_line(&c).contains("queued"));
+    }
+
+    #[test]
+    fn every_defined_health_bit_has_a_label() {
+        // Bits 0..=10 are everything rover-msgs defines as of writing; the
+        // last one named is the highest, so a new bit past it needs a label
+        // (and this range extending) -- until then the UNKNOWN_BIT fallback
+        // below keeps it visible.
+        for n in 0..=10u16 {
+            assert!(
+                HEALTH_FLAG_LABELS.iter().any(|(b, _)| b.0 == 1 << n),
+                "health bit {n} has no dashboard label"
+            );
+            let line = format_health_line(HealthBits(1 << n));
+            assert_ne!(line, "Health:   OK", "bit {n}");
+            assert!(!line.contains("UNKNOWN"), "bit {n}: {line}");
+        }
+        for b in [
+            HealthBits::BOARD_POST_FAIL,
+            HealthBits::BOARD_RESET,
+            HealthBits::LINK_DEGRADED,
+        ] {
+            assert!(!format_health_line(b).contains("OK"));
+        }
+    }
+
+    #[test]
+    fn undefined_health_bits_are_still_shown() {
+        let line = format_health_line(HealthBits(1 << 12));
+        assert!(line.contains("UNKNOWN_BIT_12"), "{line}");
+    }
+
+    #[test]
+    fn notice_persists_for_the_hold_time_then_clears() {
+        let t0 = Instant::now();
+        let mut n = Notice::default();
+        assert_eq!(n.visible(t0), None);
+        n.set("command error: x".to_string(), t0);
+        assert_eq!(
+            n.visible(t0 + Duration::from_millis(400)),
+            Some("command error: x")
+        );
+        assert!(n
+            .visible(t0 + NOTICE_HOLD - Duration::from_millis(1))
+            .is_some());
+        assert_eq!(n.visible(t0 + NOTICE_HOLD), None);
+        // The newest message replaces and restarts the timer.
+        n.set("second".to_string(), t0 + Duration::from_secs(4));
+        assert_eq!(n.visible(t0 + Duration::from_secs(7)), Some("second"));
+    }
+
+    #[test]
+    fn dashboard_shows_the_notice_and_the_full_command_hint() {
+        let out = render_dashboard(
+            LinkStatus::Live { age_ms: 10 },
+            &GnssFix::default(),
+            &GnssFix::default(),
+            &RoverState::default(),
+            &MissionStatus::default(),
+            &PowerSample::default(),
+            HealthBits::NONE,
+            &idle_status(),
+            Some("command error: boom"),
+        );
+        assert!(out.contains(">> command error: boom"));
+        assert!(out.contains("clearestop"));
     }
 
     #[test]
@@ -239,8 +401,8 @@ mod tests {
             &MissionStatus::default(),
             &PowerSample::default(),
             HealthBits::NONE,
+            &idle_status(),
             None,
-            0,
         );
         assert!(out.contains(ESTOP_DISCLAIMER));
         assert!(out.starts_with("\x1B[2J\x1B[H"));

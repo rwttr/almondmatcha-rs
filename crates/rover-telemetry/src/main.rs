@@ -115,6 +115,10 @@ struct SharedState {
     backup_fix: GnssFix,
     acks: ack::AckTracker,
     stall_detected: bool,
+    /// When the last `SpeedLoopDebug` arrived — `stall_detected` is only as
+    /// fresh as this, see `health::effective_stall`.
+    speed_loop_seen: Option<Instant>,
+    rover_state_seen: Option<Instant>,
 
     chassis_seen: Option<Instant>,
     power_seen: Option<Instant>,
@@ -192,7 +196,9 @@ fn main() {
     {
         let state = state.clone();
         bus.subscribe::<RoverState>(move |s| {
-            state.borrow_mut().rover_state = s;
+            let mut st = state.borrow_mut();
+            st.rover_state = s;
+            st.rover_state_seen = Some(Instant::now());
             rover_state_log.log(csv_fmt::format_rover_state_row(now_us(), &s));
         });
     }
@@ -244,11 +250,17 @@ fn main() {
     {
         let state = state.clone();
         let stall_detector = stall_detector.clone();
+        let clock_start = Instant::now();
         bus.subscribe::<SpeedLoopDebug>(move |d| {
             speed_loop_log.log(csv_fmt::format_speed_loop_debug_row(now_us(), &d));
-            let now_s = now_us() as f64 / 1_000_000.0;
+            // Monotonic clock: the stall timeout is a duration, and a
+            // wall-clock step (NTP, GNSS time sync on the RPi) mid-run would
+            // otherwise fake or hide a stall.
+            let now_s = clock_start.elapsed().as_secs_f64();
             let stalled = stall_detector.borrow_mut().observe(&d, now_s);
-            state.borrow_mut().stall_detected = stalled;
+            let mut st = state.borrow_mut();
+            st.stall_detected = stalled;
+            st.speed_loop_seen = Some(Instant::now());
         });
     }
     {
@@ -292,13 +304,19 @@ fn main() {
                 backup_gnss_ms: s
                     .backup_seen
                     .map(|t| now.duration_since(t).as_millis() as u64),
+                estimator_ms: s
+                    .rover_state_seen
+                    .map(|t| now.duration_since(t).as_millis() as u64),
             };
+            let speed_loop_age_ms = s
+                .speed_loop_seen
+                .map(|t| now.duration_since(t).as_millis() as u64);
             let health = compute_health(
                 &ages,
                 s.rover_state.lane_age_ms,
                 telemetry_config.lane_stale_ms,
                 s.chassis_status.as_ref(),
-                s.stall_detected,
+                health::effective_stall(s.stall_detected, speed_loop_age_ms),
                 &s.rover_state,
                 board_health.borrow().bits(),
             );

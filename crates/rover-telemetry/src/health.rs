@@ -66,6 +66,28 @@ pub const BACKUP_GNSS_STALE_MS: u64 = 1000;
 /// drive it.
 pub const ESTIMATOR_DIVERGED_VAR_M2: f32 = 1.0;
 
+/// How old the last `RoverState` may be before the estimator is treated as
+/// silent. `RoverState` is a ~100 Hz feed, so 500 ms is dozens of missed
+/// frames — generous, yet still well inside the time it takes an operator to
+/// notice a rover driving blind. Without this, `SharedState`'s default
+/// `RoverState` (`lane_age_ms = 0`, `p_diag = 0`) reads as a perfectly
+/// confident, perfectly fresh estimator when nothing has ever been heard.
+pub const ESTIMATOR_STALE_MS: u64 = 500;
+
+/// How long `stall_detected` stays meaningful after the last `SpeedLoopDebug`.
+/// The speed loop publishes at ~4 Hz+, so 1 s is several missed frames. Past
+/// that the last verdict is a stale guess: a stall flag latched from a dead
+/// feed would be shown forever, and a "not stalled" one would hide a stall.
+pub const SPEED_LOOP_STALE_MS: u64 = 1000;
+
+/// The stall verdict to report, given the detector's last output and the age
+/// of the `SpeedLoopDebug` it was computed from. Unknown (never seen or
+/// stale) reports `false`: the stall bit asserts a positive finding, and a
+/// silent chassis is already surfaced by `CHASSIS_STALE`.
+pub fn effective_stall(detected: bool, speed_loop_age_ms: Option<u64>) -> bool {
+    detected && speed_loop_age_ms.is_some_and(|a| a <= SPEED_LOOP_STALE_MS)
+}
+
 /// Time since each feed was last seen, in milliseconds. `None` means "never
 /// seen at all this run" — treated the same as "stale" (older than any
 /// threshold), since a feed that has never reported is at least as
@@ -76,6 +98,10 @@ pub struct FeedAges {
     pub sensors_ms: Option<u64>,
     pub rtk_ms: Option<u64>,
     pub backup_gnss_ms: Option<u64>,
+    /// Age of the last `RoverState`. `None` = never received. Folded in here
+    /// (not a separate argument) because it is the same kind of fact as the
+    /// others: how long since a feed was last heard.
+    pub estimator_ms: Option<u64>,
 }
 
 /// Compute every [`HealthBits`] flag from the current feed ages plus the
@@ -117,6 +143,18 @@ pub fn compute_health(
     if ages.sensors_ms.is_none_or(|a| a > SENSORS_STALE_MS) {
         health.set(HealthBits::SENSORS_STALE);
     }
+    // A silent estimator makes every number in `state` (`lane_age_ms`,
+    // `p_diag`) either a zero default or a frozen last value, so neither the
+    // lane check nor the divergence check below can be trusted. Both bits are
+    // raised: LANE_STALE because the lane age is unknowable, and
+    // ESTIMATOR_DIVERGED because "the estimator's output cannot be trusted"
+    // is exactly what that bit means to the operator and no bit says "estimator
+    // absent" (adding one would be a wire change).
+    let estimator_silent = ages.estimator_ms.is_none_or(|a| a > ESTIMATOR_STALE_MS);
+    if estimator_silent {
+        health.set(HealthBits::LANE_STALE);
+        health.set(HealthBits::ESTIMATOR_DIVERGED);
+    }
     if lane_age_ms > lane_stale_ms {
         health.set(HealthBits::LANE_STALE);
     }
@@ -132,7 +170,12 @@ pub fn compute_health(
     if stall_detected {
         health.set(HealthBits::STALL_DETECTED);
     }
-    if state.cross_track_var() > ESTIMATOR_DIVERGED_VAR_M2 {
+    // Read `p_diag` directly: `RoverState::cross_track_var()` clamps with
+    // `f32::max(0.0)`, which returns 0.0 for NaN, so a NaN covariance — the
+    // classic signature of a blown-up EKF — would read as perfectly healthy.
+    // Non-finite is diverged.
+    let var = state.p_diag[rover_msgs::state_idx::CROSS_TRACK];
+    if !var.is_finite() || var > ESTIMATOR_DIVERGED_VAR_M2 {
         health.set(HealthBits::ESTIMATOR_DIVERGED);
     }
     health.set(board_bits);
@@ -244,6 +287,7 @@ mod tests {
             sensors_ms: Some(10),
             rtk_ms: Some(10),
             backup_gnss_ms: Some(10),
+            estimator_ms: Some(10),
         }
     }
 
@@ -266,6 +310,70 @@ mod tests {
             HealthBits::NONE,
         );
         assert_eq!(h, HealthBits::NONE);
+    }
+
+    #[test]
+    fn never_seen_estimator_is_lane_stale_and_diverged() {
+        let mut ages = fresh_ages();
+        ages.estimator_ms = None;
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
+        assert!(h.contains(HealthBits::LANE_STALE));
+        assert!(h.contains(HealthBits::ESTIMATOR_DIVERGED));
+    }
+
+    #[test]
+    fn old_estimator_is_lane_stale_and_diverged_but_at_threshold_is_fine() {
+        let mut ages = fresh_ages();
+        ages.estimator_ms = Some(ESTIMATOR_STALE_MS);
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
+        assert_eq!(h, HealthBits::NONE);
+        ages.estimator_ms = Some(ESTIMATOR_STALE_MS + 1);
+        let h = compute_health(
+            &ages,
+            0,
+            500,
+            None,
+            false,
+            &healthy_state(),
+            HealthBits::NONE,
+        );
+        assert!(h.contains(HealthBits::LANE_STALE));
+        assert!(h.contains(HealthBits::ESTIMATOR_DIVERGED));
+    }
+
+    #[test]
+    fn nan_or_infinite_covariance_is_diverged() {
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut st = healthy_state();
+            st.p_diag[rover_msgs::state_idx::CROSS_TRACK] = bad;
+            let h = compute_health(&fresh_ages(), 0, 500, None, false, &st, HealthBits::NONE);
+            assert!(h.contains(HealthBits::ESTIMATOR_DIVERGED), "{bad}");
+        }
+    }
+
+    #[test]
+    fn stall_verdict_expires_when_speed_loop_debug_goes_quiet() {
+        assert!(effective_stall(true, Some(10)));
+        assert!(effective_stall(true, Some(SPEED_LOOP_STALE_MS)));
+        assert!(!effective_stall(true, Some(SPEED_LOOP_STALE_MS + 1)));
+        assert!(!effective_stall(true, None));
+        assert!(!effective_stall(false, Some(10)));
     }
 
     #[test]
