@@ -69,19 +69,21 @@
 //! decode work per edge is a handful of instructions. It is the best option
 //! available on this pin assignment, not a silent downgrade to "good enough."
 //!
-//! # Sign convention — needs bench verification
+//! # Sign convention - needs bench verification
 //!
-//! The ROS 2 handlers carried a comment ("sign inverted to match physical
-//! mounting") establishing which rotation direction counts up. This firmware
-//! defines its own forward/reverse convention from the quadrature state
-//! sequence (`00 -> 01 -> 11 -> 10 -> 00` counts up) with no way to check it
-//! against the physical mounting from source alone. **Bench-verify**: spin
-//! each wheel forward by hand and confirm `ticks_left`/`ticks_right`
-//! increase; if a wheel counts backwards, swap that encoder's two channel
-//! pins in [`init`]'s argument order (cheaper than patching the table).
+//! The decode counts `A rising while B is high` as +1 (`00 -> 01 -> 11 -> 10
+//! -> 00` counts up in the `(a << 1) | b` state encoding below), which matches
+//! the old `encoder_control.cpp` handlers (the ROS 2 comment there says the
+//! sign was "inverted to match physical mounting"). That is a transcription
+//! from source, not a measurement: whether +1 is physical *forward* for each
+//! wheel still needs a bench check. Spin each wheel forward by hand and
+//! confirm `ticks_left`/`ticks_right` increase; if one counts backwards, flip
+//! its sign inside [`QuadChannel::new`] / the decode (e.g. swap which channel
+//! is treated as `a`) - the pin arguments to [`init`] are typed per physical
+//! pin and cannot be swapped between channels.
+use core::future::poll_fn;
 use core::sync::atomic::{AtomicI32, Ordering};
-
-use embassy_futures::select::{select, Either};
+use core::task::Poll;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::Pull;
 use embassy_stm32::peripherals::{EXTI15, EXTI3, EXTI4, EXTI5, PA15, PB3, PB4, PB5};
@@ -158,18 +160,51 @@ impl QuadChannel {
         }
     }
 
-    /// Run forever: wait for an edge on either channel, decode the
+    /// Run forever: wait for the pair's state to change, decode the
     /// transition, and accumulate it into `counter`.
     ///
-    /// Waiting on both channels with `select` (rather than, say, only ever
-    /// watching channel A) is what makes this 4x rather than 2x — every edge
-    /// on either wire produces a decode, not just edges on one of them.
+    /// Waiting on both channels (rather than, say, only ever watching channel
+    /// A) is what makes this 4x rather than 2x - every edge on either wire
+    /// produces a decode, not just edges on one of them.
+    ///
+    /// # Why this polls by hand instead of `select(wait_for_any_edge, ...)`
+    ///
+    /// `wait_for_any_edge` (embassy-stm32 0.6.0 `exti`) re-configures the EXTI
+    /// line when it is first polled, and configuring clears the line's
+    /// pending bit. With `select` rebuilt every loop iteration, an edge that
+    /// lands between "pins read after the last wake" and "futures re-armed"
+    /// is silently discarded, and the next edge then looks like a diagonal
+    /// two-bit jump (decoded as 0) - two ticks lost for one missed edge.
+    /// Instead each poll here arms both lines (`poll_for_any_edge`: waker
+    /// registered, line left enabled) and *then* samples the pins, so any
+    /// edge before the arm is visible in the sample and any edge after it
+    /// raises the interrupt and wakes this task again. The decode is driven
+    /// by "sampled state differs from last decoded state", not by "an
+    /// interrupt fired", so a spurious or duplicate wake is harmless.
+    ///
+    /// # Remaining limitation
+    ///
+    /// Decoding still runs in the executor, not in the interrupt. If a second
+    /// edge arrives before this task gets to sample (an interrupt-to-task
+    /// latency of order tens of microseconds if nothing else is running, more
+    /// if the UDP/I2C tasks hold the executor), the pair has moved two states
+    /// and that step decodes as a diagonal (0, two ticks lost). Edge rate at
+    /// rover speeds is far below that; if the bench tick-count check (plan
+    /// §2.6) shows a shortfall at speed, the fix is decoding in the EXTI ISR
+    /// or hardware timer mode, not more tuning here.
     async fn run(mut self, counter: &'static AtomicI32) -> ! {
         loop {
-            match select(self.ch_a.wait_for_any_edge(), self.ch_b.wait_for_any_edge()).await {
-                Either::First(()) | Either::Second(()) => {}
-            }
-            let new_state = state(self.ch_a.is_high(), self.ch_b.is_high());
+            let new_state = poll_fn(|cx| {
+                self.ch_a.poll_for_any_edge(cx);
+                self.ch_b.poll_for_any_edge(cx);
+                let s = state(self.ch_a.is_high(), self.ch_b.is_high());
+                if s != self.last_state {
+                    Poll::Ready(s)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             let idx = ((self.last_state as usize) << 2) | new_state as usize;
             self.last_state = new_state;
             let delta = QUAD_DELTA[idx] as i32;
@@ -338,8 +373,8 @@ pub async fn calibration_task() -> ! {
         ticker.next().await;
         let l = TICKS_LEFT.load(Ordering::Relaxed);
         let r = TICKS_RIGHT.load(Ordering::Relaxed);
-        let dl = l - prev_l;
-        let dr = r - prev_r;
+        let dl = l.wrapping_sub(prev_l);
+        let dr = r.wrapping_sub(prev_r);
         prev_l = l;
         prev_r = r;
         defmt::info!(

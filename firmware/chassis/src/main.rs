@@ -26,12 +26,15 @@
 //!
 //! # Startup order
 //!
-//! Network first, then sensors, then actuation. The board must be able to
-//! report a failed IMU init over UDP, which means the stack has to be up
-//! before the thing that might fail. The drivetrain comes last and starts
-//! tripped: the watchdog's first `select` cannot resolve before either a
-//! real command arrives or the 200 ms timeout fires, so an unattended board
-//! sits with zero throttle rather than whatever the pins powered up as.
+//! Motors first (constructed stopped: H-bridge enables low, PWM at 0 %, servo
+//! centred - so the drive pins are driven, not floating, for the seconds the
+//! Ethernet link takes to come up), then network, then sensors. The board
+//! must be able to report a failed IMU init over UDP, which means the stack
+//! has to be up before the thing that might fail. The motors are only
+//! *handed to* [`watchdog::run`] last, and it starts **tripped**: nothing is
+//! applied until a zero-throttle command re-arms it (plan §5.2), so a reset
+//! mid-drive (IWDG, brown-out) cannot resume the previous throttle from the
+//! first streamed command.
 
 #![no_std]
 #![no_main]
@@ -48,7 +51,7 @@ use core::sync::atomic::Ordering;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::udp::UdpSocket;
-use embassy_net::Stack;
+use embassy_net::{IpAddress, Stack};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_time::{Duration, Timer};
 use rover_msgs::{
@@ -57,7 +60,7 @@ use rover_msgs::{
 
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::config::{CHASSIS_STATUS_DEST, IWDG_TIMEOUT_US, STATUS_PUBLISH_HZ};
+use crate::config::{CHASSIS_STATUS_DESTS, CONTROL_ADDR, IWDG_TIMEOUT_US, STATUS_PUBLISH_HZ};
 use crate::watchdog::{CMD_SIGNAL, STATUS};
 
 /// Marks the IMU as absent in [`ChassisStatus::fault`].
@@ -86,6 +89,18 @@ async fn main(spawner: Spawner) {
 
     let mut post = diag::Post::new();
     post.record(PostBits::CLOCK, diag::check_clock());
+
+    // --- Actuation (stopped) ------------------------------------------------
+    // Before any `.await`: until this runs the H-bridge pins are floating
+    // inputs. `Motors::new` drives all four enables low and leaves every PWM
+    // channel at 0 % duty. They stay in this state until `watchdog::run`
+    // (below, at the very end) takes ownership; it starts tripped.
+    let mut motors = motor::Motors::new(
+        p.TIM2, p.PA3, p.TIM3, p.PA6, p.TIM1, p.PE11, p.PF12, p.PD15, p.PF13, p.PE9,
+    );
+    let motor_post = motors.post_check();
+    post.record(PostBits::SENSOR_B, motor_post.motor_pwm_ok);
+    post.record(PostBits::SENSOR_C, motor_post.servo_pwm_ok);
 
     // --- Network -----------------------------------------------------------
     let stack = net::init(
@@ -129,14 +144,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(defmt::unwrap!(rx_task(socket)));
     spawner.spawn(defmt::unwrap!(status_task(stack)));
 
-    // --- Actuation ----------------------------------------------------------
-    let mut motors = motor::Motors::new(
-        p.TIM2, p.PA3, p.TIM3, p.PA6, p.TIM1, p.PE11, p.PF12, p.PD15, p.PF13, p.PE9,
-    );
-    let motor_post = motors.post_check();
-    post.record(PostBits::SENSOR_B, motor_post.motor_pwm_ok);
-    post.record(PostBits::SENSOR_C, motor_post.servo_pwm_ok);
-
     // `IndependentWatchdog` is clocked from the LSI, which keeps running
     // through a hung task, a spinning interrupt, or a deadlocked bus — which
     // is exactly the point. It is unleashed inside `watchdog::run` and petted
@@ -162,7 +169,7 @@ async fn main(spawner: Spawner) {
     )));
 
     info!(
-        "chassis-fw ready: motors armed, watchdog {} ms",
+        "chassis-fw ready: motors held stopped until a zero-throttle command, watchdog {} ms",
         config::CMD_TIMEOUT_MS
     );
     watchdog::run(motors, iwdg).await
@@ -170,15 +177,19 @@ async fn main(spawner: Spawner) {
 
 /// Decode inbound [`ChassisCommand`] datagrams into the command mailbox.
 ///
-/// Deliberately does no validation beyond decoding: clamping, safety limits
-/// and the timeout all live in [`watchdog::run`], which is the single place
-/// allowed to touch the motors. A receive task that could also veto commands
-/// would be a second, quieter safety policy to keep in step with the first.
+/// Only datagrams from `config::CONTROL_ADDR` (source IP *and* port) are
+/// accepted: any other host on the LAN could otherwise drive the rover. Beyond
+/// that and decoding, deliberately no validation here: clamping, sequence
+/// freshness, safety limits and the timeout all live in [`watchdog::run`],
+/// which is the single place allowed to touch the motors (a receive task that
+/// could also veto commands would be a second, quieter safety policy to keep
+/// in step with the first). This task never feeds the watchdog timer itself;
+/// only a command `watchdog::run` accepts does.
 #[embassy_executor::task]
 async fn rx_task(socket: UdpSocket<'static>) -> ! {
     let mut buf = [0u8; 256];
     loop {
-        let Ok((n, _meta)) = socket.recv_from(&mut buf).await else {
+        let Ok((n, meta)) = socket.recv_from(&mut buf).await else {
             // embassy-net surfaces an oversized datagram as an error rather
             // than truncating. Nothing this board receives is anywhere near
             // the buffer size, so this means something is wrong upstream —
@@ -186,6 +197,13 @@ async fn rx_task(socket: UdpSocket<'static>) -> ! {
             warn!("rx: recv_from failed");
             continue;
         };
+
+        if meta.endpoint.addr != IpAddress::Ipv4(CONTROL_ADDR.0)
+            || meta.endpoint.port != CONTROL_ADDR.1
+        {
+            warn!("rx: dropping datagram from non-control source");
+            continue;
+        }
 
         let Ok(frame) = Frame::parse(&buf[..n]) else {
             warn!("rx: runt datagram, {} bytes", n);
@@ -230,15 +248,15 @@ async fn status_task(stack: Stack<'static>) -> ! {
         let n = encode_frame(&status, seq, &mut buf);
         seq = seq.wrapping_add(1);
 
-        if socket
-            .send_to(&buf[..n], CHASSIS_STATUS_DEST)
-            .await
-            .is_err()
-        {
-            // A full transmit buffer or an unreachable peer. Telemetry is
-            // best-effort by design — the next frame is 200 ms away and
-            // carries the same state, so dropping this one costs nothing.
-            warn!("status: send failed");
+        // telemetry for observability, control so rover-control can see the
+        // trip and re-arm with a zero-throttle command (plan §5.2).
+        for &dest in &CHASSIS_STATUS_DESTS {
+            if socket.send_to(&buf[..n], dest).await.is_err() {
+                // A full transmit buffer or an unreachable peer. Telemetry is
+                // best-effort by design — the next frame is 200 ms away and
+                // carries the same state, so dropping this one costs nothing.
+                warn!("status: send failed");
+            }
         }
 
         Timer::after(period).await;

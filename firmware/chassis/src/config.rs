@@ -36,38 +36,55 @@ pub const SELF_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 pub const SELF_PORT: u16 = 7010;
 
 /// `[services] control` address. `ChassisCommand` arrives *from* here (the
-/// RPi's actuation task); nothing in this crate needs to send there.
+/// RPi's actuation task) and is accepted from nowhere else (`main::rx_task`
+/// checks ip and port); `ChassisStatus` and `ImuSample` are sent here.
 pub const CONTROL_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7001);
 
 /// `[services] telemetry` address.
 pub const TELEMETRY_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 1), 7003);
 
-/// `[base]` - the base-station PC. On the same `/24` as every other host on
+/// `[services] base` - the base-station PC. On the same `/24` as every other host on
 /// this closed LAN (`SELF_IP`'s static config carries no gateway at all -
 /// see `net.rs::init`), so it's directly reachable with no routing hop.
 pub const BASE_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 10), 7030);
 
-/// Per-message-type destination table. No message this board publishes needs
-/// more than one destination, so each is a single address rather than a
-/// list — but naming them by message type (not by host) is what makes it
-/// obvious at the call site *why* that destination was chosen, and keeps a
-/// future second destination (like `WheelSensors` on the sensors board, which
-/// needs two) a one-line change here rather than a call-site rewrite.
-pub const IMU_SAMPLE_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
-pub const CHASSIS_STATUS_DEST: (Ipv4Address, u16) = TELEMETRY_ADDR;
+/// `[services] doctor` - `rover-doctor` on the base-station PC. Its own port
+/// (7031): it used to share `base`'s 7030 with the ground station, and only
+/// one process can bind a UDP port. It reads `BoardDiagnostics` straight off
+/// the wire to judge POST/reset-cause/link.
+pub const DOCTOR_ADDR: (Ipv4Address, u16) = (Ipv4Address::new(192, 168, 1, 10), 7031);
 
-/// `[routes] BoardDiagnostics = ["telemetry", "base"]` - the one message
-/// this board publishes to *two* destinations, not one: `rover-telemetry`'s
-/// health-tracking and the base-station operator both need this board's
+/// Per-message-type destination table. Naming destinations by message type
+/// (not by host) makes it obvious at the call site *why* that destination was
+/// chosen, and keeps adding one a one-line change here.
+pub const IMU_SAMPLE_DEST: (Ipv4Address, u16) = CONTROL_ADDR;
+
+/// `ChassisStatus` goes to `telemetry` (observability) AND `control`:
+/// `rover-control` needs `watchdog_tripped` to know the board is disarmed
+/// and must be re-armed by streaming an explicit zero-throttle command
+/// (plan §5.2). Without it the host cannot tell why its commands are ignored.
+pub const CHASSIS_STATUS_DESTS: [(Ipv4Address, u16); 2] = [TELEMETRY_ADDR, CONTROL_ADDR];
+
+/// `[routes] BoardDiagnostics = ["telemetry", "base", "doctor"]` - published to
+/// *three* destinations: `rover-telemetry`'s health-tracking, the
+/// base-station operator and `rover-doctor` all need this board's
 /// self-test/reset-cause/PHY-health report, and neither should have to
 /// relay it to the other. See `diag::publish_task`.
-pub const BOARD_DIAGNOSTICS_DESTS: [(Ipv4Address, u16); 2] = [TELEMETRY_ADDR, BASE_ADDR];
+pub const BOARD_DIAGNOSTICS_DESTS: [(Ipv4Address, u16); 3] =
+    [TELEMETRY_ADDR, BASE_ADDR, DOCTOR_ADDR];
 
 /// Locally-administered MAC (U/L bit set, OUI zeroed) - there is no vendor
 /// assignment to collide with on a closed LAN with five fixed hosts. The last
 /// octet mirrors the board's IP host part (`.2`) purely so a packet capture
 /// is legible; it has no protocol meaning.
 pub const MAC_ADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+/// `[speed] limit_cap_pct = 40` - hard ceiling on drive duty, "independent of
+/// any controller". Enforced here in `motor::Motors::set_drive` regardless of
+/// what a `ChassisCommand` asks for, so a host-side bug (or a compromised
+/// sender) cannot command more than 40 % duty. Fraction of full PWM, not
+/// percent. Keep in step with `config/rover.toml`.
+pub const MAX_DUTY_FRACTION: f32 = 0.40;
 
 /// `[safety] command_timeout_ms` - plan §5.2: ten missed frames at the 50 Hz
 /// command rate. This is the single most important constant in this crate:

@@ -70,6 +70,13 @@ pub fn init(
 ) -> Option<Imu> {
     let mut cfg = embassy_stm32::i2c::Config::default();
     cfg.frequency = khz(400);
+    // Default is 1 s per blocking transaction, which on a stuck bus stalls
+    // the whole executor (every PWM write, the command watchdog, the UDP
+    // stack) for twice the IWDG window. A healthy 400 kHz transaction of a
+    // few bytes takes well under 1 ms; 5 ms is generous and bounds the
+    // stall. No SCL bus-recovery (9-clock) sequence is attempted: that needs
+    // the pins back as GPIO, which the HAL's I2C type does not give back.
+    cfg.timeout = embassy_time::Duration::from_millis(5);
     let i2c = I2c::new_blocking(i2c1, scl, sda, cfg);
 
     let mut imu = Lsm6dsv16x::new_i2c(i2c, I2CAddress::I2cAddH, Delay);
@@ -85,12 +92,26 @@ pub fn init(
     // there is no interrupt for "done", so poll `reset_get` per the vendor
     // driver's own example. This blocks the caller (board bring-up, before
     // the executor's other tasks are spawned), which is fine here.
-    loop {
+    //
+    // Bounded: a sensor that never reports Ready would otherwise hang boot
+    // before the IWDG exists, with motors un-driven and no diagnostics sent.
+    // 100 tries x 1 ms is far beyond the datasheet's reset time; on
+    // exhaustion fall through to the "IMU absent" path like any other init
+    // failure.
+    let mut ready = false;
+    for _ in 0..100 {
         match imu.reset_get() {
-            Ok(Reset::Ready) => break,
-            Ok(_) => continue,
+            Ok(Reset::Ready) => {
+                ready = true;
+                break;
+            }
+            Ok(_) => embassy_time::block_for(Duration::from_millis(1)),
             Err(_) => return None,
         }
+    }
+    if !ready {
+        warn!("imu: reset did not complete");
+        return None;
     }
 
     imu.block_data_update_set(1).ok()?;

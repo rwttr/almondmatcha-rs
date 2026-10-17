@@ -42,8 +42,8 @@ use embassy_stm32::timer::GeneralInstance4Channel;
 use embassy_stm32::Peri;
 
 use crate::config::{
-    CMD_EPSILON, MOTOR_PWM_HZ, SERVO_CENTER_DEG, SERVO_DUTY_MAX, SERVO_DUTY_MIN, SERVO_PWM_HZ,
-    STEER_MAX_DEG,
+    CMD_EPSILON, MAX_DUTY_FRACTION, MOTOR_PWM_HZ, SERVO_CENTER_DEG, SERVO_DUTY_MAX, SERVO_DUTY_MIN,
+    SERVO_PWM_HZ, STEER_MAX_DEG,
 };
 
 /// `fdr_msg` from the old wire, reconstructed from `sign(steer)`. Named
@@ -193,7 +193,13 @@ impl<'d> Motors<'d> {
     /// this directly so the ramp can vary throttle without also touching the
     /// steering servo on every step.
     pub fn set_drive(&mut self, throttle: f32) {
-        let duty_percent = (throttle.clamp(-1.0, 1.0).abs() * 100.0) as u8;
+        // Hard cap (`config::MAX_DUTY_FRACTION`) applied here, at the single
+        // point every drive output passes through, whatever the command said.
+        let duty = (throttle.clamp(-1.0, 1.0).abs()).min(MAX_DUTY_FRACTION);
+        // 0.01 % resolution (the old `u8` percent quantised to 1 %), same
+        // denominator the servo path uses.
+        const DENOM: u32 = 10_000;
+        let num = (duty * DENOM as f32) as u32;
 
         let (enable_forward, enable_backward) = match drive_dir(throttle) {
             DriveDir::Forward => (true, false),
@@ -209,8 +215,8 @@ impl<'d> Motors<'d> {
         self.right_fwd.set_level(level(enable_backward));
         self.right_bwd.set_level(level(enable_forward));
 
-        self.right_pwm.ch1().set_duty_cycle_percent(duty_percent);
-        self.left_pwm.ch2().set_duty_cycle_percent(duty_percent);
+        self.right_pwm.ch1().set_duty_cycle_fraction(num, DENOM);
+        self.left_pwm.ch2().set_duty_cycle_fraction(num, DENOM);
     }
 
     /// Power-on self-test for `PostBits::SENSOR_B` (motor PWM) and

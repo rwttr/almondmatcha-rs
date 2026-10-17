@@ -39,10 +39,16 @@
 //! "control task" the way chassis's motor-owning watchdog is one — so this
 //! task, the only one on this board with a safety-relevant duty, takes that
 //! role. It pets on a fixed [`IWDG_PET_INTERVAL_MS`] tick that runs
-//! independently of whether any UDP traffic arrives at all, so a hang in the
-//! encoder or power tasks (a stuck I2C transaction, a deadlocked executor)
-//! still resets the board even though this task itself would otherwise keep
-//! running.
+//! independently of whether any UDP traffic arrives at all.
+//!
+//! What that does and does not catch: the ticker is serviced by the shared
+//! executor, so anything that *blocks the executor* (a blocking I2C call
+//! stuck on a hung bus, a spinning interrupt, a panic) stops the pet and
+//! resets the board. A task that is merely stuck at an `.await` does NOT stop
+//! the pet - the executor keeps running the other tasks - so a wedged
+//! encoder or power *task* is not caught by the IWDG. Blocking I2C is
+//! therefore given a short timeout (see `power::init`) so a bad bus costs
+//! milliseconds rather than the whole IWDG window.
 use defmt::warn;
 use embassy_futures::select::{select, Either};
 use embassy_net::udp::UdpSocket;

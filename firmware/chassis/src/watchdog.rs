@@ -46,7 +46,7 @@ use embassy_stm32::peripherals::IWDG;
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use rover_msgs::ChassisCommand;
 
 use crate::config::{CMD_EPSILON, CMD_TIMEOUT_MS, RAMP_STEPS, RAMP_TIME_MS};
@@ -61,7 +61,7 @@ pub static CMD_SIGNAL: Signal<CriticalSectionRawMutex, ChassisCommand> = Signal:
 /// Watchdog/status state the periodic `ChassisStatus` publisher (in
 /// `main.rs`) reads. Plain atomics rather than a `Mutex`: three independent
 /// fields, each written by exactly one task (this one) and read by exactly
-/// one other, so there is no multi-field invariant to protect.
+/// one other (`watchdog_tripped` starts `true`: the board boots disarmed), so there is no multi-field invariant to protect.
 pub struct SharedStatus {
     pub seq_echo: AtomicU16,
     pub watchdog_tripped: AtomicBool,
@@ -72,7 +72,7 @@ impl SharedStatus {
     pub const fn new() -> Self {
         Self {
             seq_echo: AtomicU16::new(0),
-            watchdog_tripped: AtomicBool::new(false),
+            watchdog_tripped: AtomicBool::new(true),
             fault: AtomicU8::new(0),
         }
     }
@@ -80,10 +80,44 @@ impl SharedStatus {
 
 pub static STATUS: SharedStatus = SharedStatus::new();
 
+/// Wrap-aware "is `seq` newer than `last`": the nearer half of the `u16`
+/// space counts as newer (same half-range rule as `Telemetry::last_cmd_seq`
+/// handling in `rover-msgs`). Equal is *not* newer, so a duplicated datagram
+/// is dropped too.
+fn seq_newer(seq: u16, last: u16) -> bool {
+    seq.wrapping_sub(last) as i16 > 0
+}
+
 /// Runs forever. Owns the motors, the command mailbox, and the IWDG.
+///
+/// # Starts tripped
+///
+/// `tripped` is true from boot and `STATUS.watchdog_tripped` says so: after a
+/// mid-drive reset (IWDG, brown-out) the rover-control stream is still
+/// running, and applying its first non-zero command would resume driving
+/// without anyone having re-armed. Per §5.2, recovery needs an explicit
+/// zero-throttle command - at boot exactly as after a timeout.
+///
+/// # Freshness
+///
+/// `ChassisCommand.seq` is used to drop stale/duplicated/reordered commands
+/// while armed. `last_seq` is forgotten whenever tripped, so a restarted
+/// rover-control (seq from 0) resyncs on its re-arming command. While armed a
+/// restart is *not* accepted (seq looks old) - it is dropped until the
+/// 200 ms timeout trips, after which it resyncs.
+///
+/// # The timer is fed only by accepted commands
+///
+/// The timeout is an absolute `deadline` moved only when a command is
+/// accepted (or re-arms). A plain `Timer::after` per loop iteration would
+/// restart on every *dropped* command too, letting a flood of stale
+/// datagrams keep a dead controller's last throttle alive indefinitely.
 pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'static, IWDG>) -> ! {
     let cmd_timeout = Duration::from_millis(CMD_TIMEOUT_MS);
-    let mut tripped = false;
+    let mut tripped = true;
+    STATUS.watchdog_tripped.store(true, Ordering::Relaxed);
+    let mut last_seq: Option<u16> = None;
+    let mut deadline = Instant::now() + cmd_timeout;
     // Last throttle actually applied to the drivetrain, signed. The ramp
     // needs this to decelerate *through* zero along the direction the
     // vehicle was already moving, not to snap the H-bridge direction pins
@@ -95,24 +129,39 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'sta
     iwdg.unleash();
 
     loop {
-        match select(CMD_SIGNAL.wait(), Timer::after(cmd_timeout)).await {
+        match select(CMD_SIGNAL.wait(), Timer::at(deadline)).await {
             Either::First(cmd) => {
                 if !tripped {
-                    motors.apply(cmd.steer, cmd.throttle);
-                    last_throttle = cmd.throttle;
-                    STATUS.seq_echo.store(cmd.seq, Ordering::Relaxed);
+                    if last_seq.is_some_and(|last| !seq_newer(cmd.seq, last)) {
+                        // Stale, duplicate or reordered: dropped, and the
+                        // deadline is deliberately NOT moved.
+                        warn!("watchdog: stale ChassisCommand seq {}, dropped", cmd.seq);
+                    } else {
+                        motors.apply(cmd.steer, cmd.throttle);
+                        last_throttle = cmd.throttle;
+                        last_seq = Some(cmd.seq);
+                        STATUS.seq_echo.store(cmd.seq, Ordering::Relaxed);
+                        deadline = Instant::now() + cmd_timeout;
+                    }
                 } else if cmd.throttle.abs() < CMD_EPSILON {
                     // Explicit zero-throttle command: re-arm. Note this
                     // command's own steer/throttle are *not* applied - only
                     // the trip is cleared, so the packet that re-arms the
                     // board can never itself be the one that moves it. The
                     // next command applies normally on the following
-                    // iteration.
+                    // iteration. Its seq becomes the new baseline.
                     tripped = false;
+                    last_seq = Some(cmd.seq);
+                    STATUS.seq_echo.store(cmd.seq, Ordering::Relaxed);
+                    STATUS.watchdog_tripped.store(false, Ordering::Relaxed);
+                    deadline = Instant::now() + cmd_timeout;
+                } else {
+                    // Still tripped and this command carries non-zero
+                    // throttle - ignored entirely, by design (plan: "recovery
+                    // ... only after an explicit zero-throttle command").
+                    // Forget the seq so the controller's numbering can restart.
+                    last_seq = None;
                 }
-                // else: still tripped and this command carries non-zero
-                // throttle - ignored entirely, by design (plan: "recovery
-                // ... only after an explicit zero-throttle command").
             }
             Either::Second(_) => {
                 if !tripped {
@@ -120,20 +169,26 @@ pub async fn run(mut motors: Motors<'static>, mut iwdg: IndependentWatchdog<'sta
                         "watchdog: no ChassisCommand for {}ms, tripping",
                         CMD_TIMEOUT_MS
                     );
+                    tripped = true;
+                    last_seq = None;
+                    // Publish the trip *before* the 300 ms ramp so
+                    // ChassisStatus reports it immediately.
+                    STATUS.watchdog_tripped.store(true, Ordering::Relaxed);
+                    // Centre first (see module doc comment for why this order
+                    // differs from the plan's sketch), then ramp throttle
+                    // down over RAMP_TIME so the drivetrain decelerates
+                    // smoothly, along whichever direction it was already
+                    // moving, rather than stepping to zero.
+                    motors.set_steering(0.0);
+                    ramp_throttle_to_zero(&mut motors, &mut iwdg, last_throttle).await;
+                    last_throttle = 0.0;
                 }
-                tripped = true;
-                // Centre first (see module doc comment for why this order
-                // differs from the plan's sketch), then ramp throttle down
-                // over RAMP_TIME so the drivetrain decelerates smoothly,
-                // along whichever direction it was already moving, rather
-                // than stepping to zero.
-                motors.set_steering(0.0);
-                ramp_throttle_to_zero(&mut motors, &mut iwdg, last_throttle).await;
-                last_throttle = 0.0;
+                // Already tripped (e.g. still waiting at boot): nothing to
+                // ramp; this wake only exists to pet the IWDG below.
+                deadline = Instant::now() + cmd_timeout;
             }
         }
 
-        STATUS.watchdog_tripped.store(tripped, Ordering::Relaxed);
         // The only place this crate pets the IWDG - see module doc comment.
         iwdg.pet();
     }

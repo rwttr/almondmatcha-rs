@@ -68,6 +68,13 @@ pub fn init(
 ) -> (Option<Power>, bool) {
     let mut cfg = embassy_stm32::i2c::Config::default();
     cfg.frequency = khz(400);
+    // Default is 1 s per blocking transaction, which on a stuck bus stalls
+    // the whole executor (every PWM write, the command watchdog, the UDP
+    // stack) for twice the IWDG window. A healthy 400 kHz transaction of a
+    // few bytes takes well under 1 ms; 5 ms is generous and bounds the
+    // stall. No SCL bus-recovery (9-clock) sequence is attempted: that needs
+    // the pins back as GPIO, which the HAL's I2C type does not give back.
+    cfg.timeout = embassy_time::Duration::from_millis(5);
     let i2c = I2c::new_blocking(i2c1, scl, sda, cfg);
 
     let mut dev = INA226::new(i2c, INA226_ADDR);

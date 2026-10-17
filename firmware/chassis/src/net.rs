@@ -42,6 +42,7 @@ use embassy_stm32::eth::{
 use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::{InterruptHandler as RngInterruptHandler, Rng};
 use embassy_stm32::{bind_interrupts, Peri};
+use embassy_time::{Duration, Instant};
 use static_cell::StaticCell;
 
 use crate::config::{MAC_ADDR, SELF_IP};
@@ -69,8 +70,9 @@ const SOCKET_COUNT: usize = 4;
 // borrow: `Ethernet` is moved into the `embassy_net::Runner` and then into
 // `net_task`, so nothing outside this module can ever reach
 // `Ethernet::phy_mut()` again after `init()` returns. `Lan8742a::poll_link`
-// (called by the runner on its own schedule, ~500ms by default per
-// `GenericPhy`) is the only writer; `phy_status()` is the only reader, from
+// (called by the runner on every poll - embassy-net asks for link state
+// each time it polls the device, not on a fixed timer - and rate-limited
+// to `DIAG_REFRESH_PERIOD` below) is the only writer; `phy_status()` is the only reader, from
 // `diag::publish_task`. `Ordering::Relaxed` throughout: these are
 // independent scalars with no ordering relationship to protect, exactly the
 // same reasoning `watchdog.rs`'s `SharedStatus` uses for the same shape.
@@ -164,8 +166,8 @@ const REG_ANAR: u8 = 0x04;
 const REG_SPECIAL_MODES: u8 = 0x12;
 
 /// Set once [`Lan8742a::log_strap_config`] has logged its one-time ANAR /
-/// MODE[2:0] report. `poll_link` runs on `GenericPhy`'s own schedule
-/// (~500ms by default) for the life of the program, so without this latch
+/// MODE[2:0] report. `poll_link` runs on every runner poll for the life of
+/// the program (diagnostics are throttled to ~1 Hz), so without this latch
 /// the same line would repeat forever instead of appearing once at
 /// bring-up - same reasoning as the existing address-scan latch below.
 static STRAP_CONFIG_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -194,8 +196,19 @@ fn decode_mode_straps(mode: u8) -> &'static str {
 /// One, per the task spec: if nothing answers on the first scan, later scans
 /// are no more likely to find anything (address discovery is a boot-time
 /// property of the wiring, not something that changes at runtime), so
-/// repeating it every 500ms forever would only waste MDIO transactions.
+/// repeating it on every poll forever would only waste MDIO transactions.
 const MAX_ADDR_SCAN_ATTEMPTS: u8 = 1;
+
+/// Minimum spacing between diagnostic refreshes. embassy-net's runner calls
+/// `Phy::poll_link` (via the driver's `link_state`) on every poll of the
+/// interface - i.e. on essentially every packet and timer wake, many times a
+/// second under load - and a refresh is five blocking MDIO register reads
+/// (each a busy-wait on the SMA block) plus the strap-log reads. 1 Hz is more
+/// than the 1 Hz `BoardDiagnostics` publisher can use. The link-state read
+/// itself (the delegated `GenericPhy::poll_link`) stays on every call; a
+/// link up/down transition also forces an immediate refresh so POST sees the
+/// resolved speed/duplex as soon as the link comes up.
+const DIAG_REFRESH_PERIOD: Duration = Duration::from_secs(1);
 
 /// Snapshot of what [`Lan8742a`] has learned about the PHY, for
 /// `diag::publish_task`. See the module doc comment above for why this is
@@ -257,6 +270,9 @@ pub struct Lan8742a<SM: StationManagement> {
     /// `MAX_ADDR_SCAN_ATTEMPTS` so a PHY that never answers doesn't cost an
     /// extra 32-address MDIO sweep on every single poll forever.
     scan_attempts: u8,
+    /// When diagnostics were last refreshed, and the link state seen then.
+    last_refresh: Option<Instant>,
+    last_up: bool,
 }
 
 impl<SM: StationManagement> Lan8742a<SM> {
@@ -265,6 +281,8 @@ impl<SM: StationManagement> Lan8742a<SM> {
             inner,
             addr: None,
             scan_attempts: 0,
+            last_refresh: None,
+            last_up: false,
         }
     }
 
@@ -344,11 +362,10 @@ impl<SM: StationManagement> Lan8742a<SM> {
     /// enabled", and for why this is `defmt`-only rather than added to the
     /// wire.
     ///
-    /// One-shot, guarded by `STRAP_CONFIG_LOGGED`: `poll_link` calls this on
-    /// every poll (~500ms per `GenericPhy`'s default) for the life of the
-    /// program, but the strap configuration is latched once at PHY reset
+    /// One-shot, guarded by `STRAP_CONFIG_LOGGED`: `poll_link` calls this at
+    /// the ~1 Hz diagnostics rate for the life of the program, but the strap configuration is latched once at PHY reset
     /// and never changes afterwards, so logging it more than once would
-    /// only spam the log at 2 Hz forever.
+    /// only spam the log at 1 Hz forever.
     ///
     /// Logs at `info!` when the PHY advertises 100BASE-TX full duplex (ANAR
     /// bit 8 set); at `warn!` when it does not, since the link can then
@@ -421,9 +438,18 @@ impl<SM: StationManagement> Phy for Lan8742a<SM> {
             self.scan_for_address();
         }
 
-        if let Some(addr) = self.addr {
-            self.refresh_diagnostics(addr);
-            self.log_strap_config(addr);
+        let now = Instant::now();
+        let due = up != self.last_up
+            || self
+                .last_refresh
+                .is_none_or(|t| now.duration_since(t) >= DIAG_REFRESH_PERIOD);
+        if due {
+            self.last_up = up;
+            self.last_refresh = Some(now);
+            if let Some(addr) = self.addr {
+                self.refresh_diagnostics(addr);
+                self.log_strap_config(addr);
+            }
         }
 
         up
@@ -568,7 +594,10 @@ macro_rules! tx_socket {
         use ::embassy_net::udp::{PacketMetadata, UdpSocket};
         use ::static_cell::StaticCell;
 
-        const BUF_LEN: usize = 128;
+        // 256: `BoardDiagnostics` goes to three destinations back to back
+        // (3 x 47 B > 128), and a send that cannot fit waits for the runner
+        // to drain, which would stall the publisher needlessly.
+        const BUF_LEN: usize = 256;
         const META_LEN: usize = 4;
 
         static RX_META: StaticCell<[PacketMetadata; META_LEN]> = StaticCell::new();
@@ -608,7 +637,10 @@ pub fn clock_config() -> embassy_stm32::Config {
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL216,
             divp: Some(PllPDiv::DIV2),
-            divq: None,
+            // VCO = 8 MHz / 4 * 216 = 432 MHz; /9 = 48 MHz for the RNG (and
+            // USB/SDMMC if ever used), which clocks from PLLQ by default.
+            // PLLQ's reset value is 0, an illegal divider.
+            divq: Some(PllQDiv::DIV9),
             divr: None,
         });
         config.rcc.ahb_pre = AHBPrescaler::DIV1;

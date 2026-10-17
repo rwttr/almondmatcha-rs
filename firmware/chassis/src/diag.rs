@@ -214,8 +214,8 @@ pub async fn publish_task(
         seq = seq.wrapping_add(1);
 
         // `config/rover.toml` routes `BoardDiagnostics = ["telemetry",
-        // "base"]` - two destinations, unlike every other message this
-        // board publishes. A failed send to either one counts against the
+        // "base", "doctor"]` - three destinations. The shared `tx_socket!`
+        // buffer (256 B, 4 metadata slots) holds all three copies at once. A failed send to either one counts against the
         // same saturating counter; see `BoardDiagnostics::tx_drops`' doc
         // comment and `config::BOARD_DIAGNOSTICS_DESTS`.
         for &dest in &BOARD_DIAGNOSTICS_DESTS {
