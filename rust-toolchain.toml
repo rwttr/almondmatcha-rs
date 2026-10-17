@@ -3,6 +3,7 @@
 # docs, and the behaviour of a never-flashed safety image, should not change
 # because a new stable shipped. Bump deliberately, rebuild both firmware
 # crates, and update the size figures in docs/STATUS_DONE.md in the same commit.
+# rust-src is for rust-analyzer, which cannot load std without it.
 channel    = "1.99.1"
-components = ["rustfmt", "clippy", "llvm-tools"]
+components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
 targets    = ["thumbv7em-none-eabihf"]
