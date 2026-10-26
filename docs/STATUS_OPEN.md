@@ -8,20 +8,22 @@ This file is deliberately the pessimistic half. It exists so that nobody has
 to infer what is missing by reading a list of accomplishments and noticing an
 absence.
 
-**The one-line version: the software is written and tested, and as of
-2026-10-17 none of it has ever run on the rover.** Every item in §1 must be
-cleared before a field run means anything. (The 2026-10-17 audit fixed a
-long list of faults in the software — `STATUS_DONE.md` §8 — and found a few
-more things only a bench can settle: §3 items 8-10, and §8 here.)
+**The one-line version, as of 2026-10-26: the whole stack runs on the rover's
+hardware on a bench, and nothing has driven yet.** The first bench session
+(`STATUS_DONE.md` §9) flashed both boards, passed the PHY gate, calibrated the
+drivetrain, deployed the RPi and Jetson, and fixed four defects only hardware
+could show. What is left is the part that moves: steering, motors, the
+watchdog, the D5/D6 re-tune — §7 has the order — plus what the bench turned up
+and did not close (§9). (The 2026-10-17 audit's software fixes are
+`STATUS_DONE.md` §8.)
 
 ---
 
 ## 1. Hard blockers
 
-Four things block a meaningful field run. **None of them is now a coding
-task** — §1.3's code is fixed and what remains of it is a bench session. That
-is the uncomfortable part: no amount of further development clears any of
-them.
+Four things blocked a meaningful field run. After 2026-10-26, §1.1 is mostly
+cleared and §1.2's bring-up is done; §1.3's re-tune and §1.4's missing
+recording remain, and neither is a coding task.
 
 ### 1.1 The drivetrain is uncalibrated
 
@@ -49,47 +51,27 @@ against.
 ⚠️ Calibrate against **4×** decoding. A constant measured against the old 2×
 firmware reads exactly double the true speed.
 
-`rover-doctor` fails loudly on this today. That failure is correct and there
-is no flag to skip it.
+`rover-doctor`'s drivetrain check now reports GO on the calibrated config (it
+failed loudly before, correctly, with no flag to skip it).
 
-### 1.2 Nothing has ever been flashed
+### 1.2 Flashing and first bring-up — done on the bench, 2026-10-26
 
-As of 2026-10-17. A bench session had been pencilled in for 2026-09-21; it did
-not happen, and no board has been flashed since. Every firmware claim is a
-claim about a binary that compiles, not one that has run. The LAN8742A PHY
-against Embassy's `GenericPhy` is the gate that decides whether any of it is
-real — see §3 below and `RUST_REWRITE_PLAN.md` §13.4a.
+Until 2026-10-26 nothing had been flashed, and every firmware claim was a claim
+about a binary that compiled. That is no longer true: both boards run this
+branch's firmware, pass POST, link at 100 Mb/s full duplex, and talk to the
+RPi and the base station. The PHY gate (`RUST_REWRITE_PLAN.md` §13.4a) passed
+on both. `STATUS_DONE.md` §9 has the evidence; `docs/CALIBRATION.md` §§1-3 has
+the commands, including the `--speed 1000` this bench's ST-Links need.
 
-This applies to the board self-diagnostics too, and the irony is worth stating
-plainly: **the power-on self-test has itself never executed.** It is
-scaffolding for the first bring-up, not evidence about it.
+What bring-up did **not** cover, because the rover never moved: the motors and
+servo under PWM, the command watchdog firing on a lost link, the IWDG on a hung
+task. Those are §6 criteria 3-4 and §7 steps 1-2.
 
-**First bench session, in order** (the Linux base PC, `192.168.1.10`, both
-NUCLEOs on USB; `docs/CALIBRATION.md` §§1-3 has the commands):
-
-1. **Install the toolchain on that PC** (`docs/CALIBRATION.md` §2): the apt
-   prerequisites, `probe-rs-tools`, the udev rule — then **replug both
-   boards** so the kernel re-evaluates permissions. It is a fresh machine for
-   this stack and this is the step that bites.
-2. **Identify the two probes before flashing anything.** `probe-rs list` with
-   both cables in shows two ST-Links. Sensors (`192.168.1.6`) is
-   `066DFF3932504E3043014542`, corroborated by git history; chassis
-   (`192.168.1.2`) is `066AFF3932504E3043101915`, recovered from the old
-   `flash_chassis` OpenOCD alias with no second source. Confirm both against
-   `probe-rs list` as the first act of the session, and correct the table in
-   `docs/CALIBRATION.md` §1 if the chassis value disagrees.
-3. **Always pass `--probe`.** With both ST-Links attached `probe-rs run`
-   picks whichever enumerates first, and that order is not stable across
-   replugs — so the `cargo run --release` shortcut is not safe on this bench;
-   use `probe-rs run --probe 0483:374b:<serial> …`.
-4. **Flash the sensors board with the `calibration` image** and run Procedure
-   A (`docs/CALIBRATION.md` §3.1, §5): the first time any of this firmware
-   meets silicon. Then flash the chassis board and **read its `defmt` output
-   for the PHY strap warning** (§3.1) before unplugging the cable. If the
-   boards are also on the LAN, `rover-tap --as control --type WheelSensors`
-   reads the same counts without reflashing — but it needs the RPi's
-   `192.168.1.1` address, so it is the fallback, not the plan
-   (`docs/CALIBRATION.md` §4).
+For the next person flashing these boards: always pass `--probe` (two
+ST-Links, unstable enumeration order) and `--speed 1000`; reflash the sensors
+board with the field image after calibration work; and note that a fresh
+flash resets the boards' uptime and `BoardDiagnostics` reset cause to
+`software`.
 
 ### 1.3 D5 — the heading sign: **fixed in software, re-tune outstanding**
 
@@ -139,10 +121,10 @@ they actually stand:
 
 | §11 Risk | Status |
 |---|---|
-| **PHY bring-up on F767ZI** | **Open — still the hard gate.** Exposure is unchanged; diagnosis is much better. The boards report PHY identity, negotiated speed, duplex and symbol errors, and now also `ANAR` and the `MODE[2:0]` straps — see §3.1, which is a concrete, likely failure mode that was invisible before. See plan §13.4a. |
+| **PHY bring-up on F767ZI** | **Closed on the bench, 2026-10-26.** Both boards link at 100 Mb/s full duplex with zero symbol errors; straps read `MODE[2:0]=111`, `ANAR=0x01e1` (§3.1's failure mode did not occur). Not yet proven under motor noise or vibration. |
 | **Control regression from the port** | **Partly closed.** Replay gate passes against a frozen oracle; the lane port is exact against the vendored original. Field parity unproven — see §1.4. |
 | **Sign-convention inversion** | **Sign closed; gain re-tune open.** Worth remembering how it went wrong: the mitigation was "documented §10, unit-tested", and that documentation is exactly what let D5 hide — the prose asserted a convention nothing checked against the consuming model. See §1.3. The 2026-10-17 audit found a second one of the same kind inside the EKF (the curvature term of the process model had the wrong sign, and its tests had shared the error — plan §2.2), so the entry stays "closed" only for the two signs anyone has checked; the gyro's own sign is §3 item 8. |
-| **Encoder constant wrong after 2×→4×** | **Open**, but now checkable: `HARDWARE.md` §3 records an expected value, so the calibration run either confirms it or disagrees loudly. |
+| **Encoder constant wrong after 2×→4×** | **Closed.** Measured at 4×: ~1,396 ticks/rev on both wheels (`HARDWARE.md` §3). The expected ~1,500 was a recollection and was ~7 % high; the measurement disagreed with it, as intended. |
 | **RTK bandwidth over 433 MHz** | Deferred to phase 2. Untouched. |
 | **No command uplink when disconnected** | **Architecturally answered** — goals preload from `[mission]` and the base station is non-essential by design — but the LoRa link itself is phase 2. |
 | **EKF tuning eats time** | **Open.** "Seed `R` from measured variance" still requires a recording that does not exist (see §1.4 for why none does). The other half — "log innovations from day one" — *is* done, via `EkfDebug`. |
@@ -150,10 +132,10 @@ they actually stand:
 | **Jetson Python bus drifts from Rust** | **Closed.** Golden-byte fixtures checked from both languages, both directions. |
 | **No ROS 2 escape hatch** | Accepted. `main` is intact in `RoboticsGG/almondmatcha` (not this repository). Criterion 10 ("`main` still builds") has not been re-verified recently. |
 
-**Three closed or mostly closed out of ten, and the largest is untouched.**
-That is not a failure of the rewrite — most of these were always going to close
-on hardware, and there has been no hardware. It is a caution against reading a
-green test suite as progress against this table.
+**Five closed or mostly closed out of ten, including the largest** — the PHY,
+closed by the first bench session. The rest close on a driving rover or a
+radio link, not a bench. It remains a caution against reading a green test
+suite as progress against this table.
 
 The sign-convention entry is the one worth learning from: it was listed as
 mitigated by documentation and unit tests, and both were true — the docs stated
@@ -166,13 +148,16 @@ cannot fail is not a mitigation.
 ## 3. Hardware-verification debt
 
 `RUST_REWRITE_PLAN.md` §13.4 holds the full list in risk order. In brief, and
-none of it is closable from a desk:
+none of it is closable from a desk. Items 1-3 closed on the 2026-10-26 bench
+(`STATUS_DONE.md` §9.1); the numbering is kept so references stay valid.
 
-1. **LAN8742A PHY** against `GenericPhy` — the hard gate. See §3.1.
-2. **I2C1 on PB8/PB9** — inherited from the mbed target's generic pin names,
-   never confirmed against the physical board.
-3. **Encoder sign convention** — defined from first principles; needs a wheel
-   turned by hand while watching tick counts.
+1. ~~**LAN8742A PHY** against `GenericPhy`~~ — **passed on both boards**,
+   2026-10-26. See §3.1.
+2. ~~**I2C1 on PB8/PB9**~~ — **confirmed on both boards**: the LSM6DSV16X and
+   the INA226 both answer.
+3. ~~**Encoder sign convention**~~ — **verified by hand**: both wheels count up
+   turning forward. The same check found the left/right **sides** swapped
+   (plan §13.3b D8, fixed).
 4. **Software EXTI decode under load** — could in principle miss edges while
    competing with UDP and I²C interrupts. Unmeasured.
 5. **TIM1 left-motor PWM** — the only channel on an advanced-control timer.
@@ -209,7 +194,10 @@ none of it is closable from a desk:
     EXTI interrupt handler or onto a hardware timer. (At the recalled ~1500
     ticks/rev and 0.20 m/s the tick rate is only ~760/s, so this may never
     bite at cruise; it is the fast hand-spin and any burst of load that would
-    show it.)
+    show it.) **Partial evidence, 2026-10-26:** six 10-turn hand runs at
+    irregular speeds (up to ~860 ticks/s in a single second) agreed to 0.07 %
+    on one wheel — no sign of lost counts at hand speed. A fast spin and a
+    loaded drive are still unchecked.
 
 ### 3.1 The `ANAR` / strap gap — the most likely way the PHY bites
 
@@ -230,6 +218,10 @@ has the full table and the reasoning.
 
 *(Found by evaluating the `eth-phy-lan87xx` crate, which was **not** adopted —
 plan §13.4a says why — but whose documentation flagged this.)*
+
+**Bench result, 2026-10-26: did not occur.** Both boards log
+`ANAR=0x01e1 advertises 100BASE-TX full duplex; MODE[2:0]=111 (all capable,
+auto-neg enabled)` and link at 100 full. `ANAR` stays unwritten.
 
 ### 3.2 What the self-test cannot tell you
 
@@ -268,13 +260,17 @@ belief at capture time and ignores frames older than `lane_max_age_ms`.
 `lane_detection.csv` logs both new figures, so the lag is now measurable from
 a field run.
 
-**Still open, and hardware-only:**
+**Measured on the bench, 2026-10-26:** the D415 reports the `global_time`
+domain, so frames are stamped from the sensor's own capture time, and
+**capture-to-publish is a median 59 ms** (54-62 ms, p95 61 ms) with 0 dropped
+frames over 617 frames at 29.8 fps — well under the ~100 ms that had been
+reasoned, and under `lane_max_age_ms = 250`.
 
-- The ~100 ms is still reasoning, not a measurement. The first run with
-  `--csv` replaces it with `capture_age_ms`.
-- The D415 timestamp mapping (`camera.py`'s `_capture_ns`) is unverified on
-  hardware. If the camera reports `hardware_clock`, perception logs that it
-  fell back to arrival time and reported ages are underestimates.
+**Still open:**
+
+- That figure is with **no lane in view** (the rover faces a bench). Detection
+  on a real track may take longer; re-read `capture_age_ms` from the first
+  field run.
 - Compensation changes closed-loop behaviour, so it belongs in the D5
   re-tune. `lane_latency_compensation = false` restores the old behaviour for
   an A/B comparison.
@@ -292,8 +288,9 @@ while frame N was detected. `HARDWARE.md` §7 half-admits it: the stages sum to
 detect now serialize. The IPC and the overlap went together.
 
 Probably still a large net win, since `wait_for_frames` usually returns an
-already-queued frame rather than blocking. **But end-to-end latency has never
-been measured on this stack** — reasoning, not a result.
+already-queued frame rather than blocking. The camera half has now been measured
+(§5.1: 59 ms capture-to-publish); **end to end, through the EKF and the
+chassis, it has not** — reasoning, not a result.
 
 Related, and closed with D6: `camera.py` now drains librealsense's queue to
 the newest frame on every read, so a slow detector drops frames (counted in
@@ -310,12 +307,12 @@ are met.
 | # | Criterion | Blocked by |
 |---|---|---|
 | 2 | Replay reproduces recorded ROS 2 steering | §1.4 — no recording exists |
-| 3 | Watchdog: Ethernet pulled, throttle ramps to zero | §1.2 — never flashed |
-| 4 | IWDG: hang the control task, board resets | §1.2 |
-| 5 | E-stop end to end with `cmd_seq` echoed | §1.2 |
-| 6 | Commanded 0.20 m/s measured as 0.20 ± 0.02 | §1.1 — no metric speed exists |
-| 7 | 100 Hz IMU at the estimator, latency measured | §1.2, and §5.1 for why "latency measured" is harder than it looks |
-| 8 | EKF coasts a ≥3 s lane dropout without divergence | §1.2 |
+| 3 | Watchdog: Ethernet pulled, throttle ramps to zero | boards run (§1.2) — needs the motors powered and commanded; §7 step 2 |
+| 4 | IWDG: hang the control task, board resets | boards run — needs a deliberately hung task; §7 step 2 |
+| 5 | E-stop end to end with `cmd_seq` echoed | stack runs end to end — needs `ground-station` driving a mission; §7 step 3 |
+| 6 | Commanded 0.20 m/s measured as 0.20 ± 0.02 | metric speed now exists (§1.1) — needs a rolling rover, and ideally Procedure B first |
+| 7 | 100 Hz IMU at the estimator, latency measured | IMU reaches `rover-control` — rate and latency not yet measured; §5.1 for why latency is harder than it looks |
+| 8 | EKF coasts a ≥3 s lane dropout without divergence | needs a driving rover and a real lane; and §9's speed-at-rest drift first |
 | 9 | One full field circuit at parity, CSVs compared | everything above |
 | 10 | `main` still builds and still drives | not re-verified recently |
 
@@ -323,25 +320,28 @@ are met.
 
 ## 7. What to do next, in order
 
-1. **Calibrate the drivetrain** (§1.1). Twenty minutes, no hardware risk,
-   unblocks criterion 6 and turns every logged speed into a real number.
-   Run Procedure A first and let it double as the encoder checks (§3 items 3
-   and 10).
-2. **Flash both boards on the bench** (§1.2, which has the order of
-   operations) and get past the PHY gate. This is the decision point for the
-   whole branch. `rover-doctor` and `board_diagnostics.csv` are there to tell
-   you what happened.
-3. **Confirm the servo direction on blocks** (§1.3), and the gyro z sign
-   (§3 item 8). Sixty seconds each. The camera sign fix is settled in
-   software; these check the hardware mappings below it.
-4. **Re-tune for D5 and D6 together**, on hardware, once the boards run. D5's
-   fix alone is a 3.21× authority increase — this is the step that matters
-   most now, not a formality.
-5. **Record a real baseline on `roboticsgg-almondmatcha/main`** (§1.4) if
-   criterion 2 is to ever close — that remote is the ROS 2 fallback; this
-   repository's `origin` has no `main`.
+Updated after the 2026-10-26 bench session; the rover is still on its rig.
 
-`docs/FIELD_TEST.md` is the end-to-end procedure once steps 1–3 are done.
+1. **Steering and motors on blocks.** With the wheels still off the ground,
+   command a small steer and a low throttle (`ground-station`, or a mission
+   with a low speed limit) and confirm: steer > 0 turns the wheels **right**
+   (§1.3), both motors spin **forward**, and the left motor works at all
+   (TIM1, §3 item 5). Read `speed_loop_debug.csv` for the measured tick rates.
+2. **Watchdog and IWDG on blocks** (§6 criteria 3-4): with the wheels turning
+   slowly, pull the chassis Ethernet cable — the throttle must ramp to zero
+   over 300 ms and the board must report `watchdog_tripped`.
+3. **The gyro z sign** (§3 item 8): turn the rover counter-clockwise by hand,
+   z must read positive. Sixty seconds.
+4. **Fix the speed estimate at rest** (§9) before trusting `RoverState` or
+   `rover-doctor`'s estimator check.
+5. **Re-tune for D5 and D6 together**, on hardware, once it can roll. D5's
+   fix alone is a 3.21× authority increase.
+6. **Procedure B** once the rover can roll, to confirm `metres_per_tick`.
+7. **Record a real baseline on `roboticsgg-almondmatcha/main`** (§1.4) if
+   criterion 2 is to ever close.
+
+`docs/FIELD_TEST.md` is the end-to-end procedure; its deployment section now
+records how the RPi and Jetson were actually deployed.
 
 ---
 
@@ -380,3 +380,37 @@ bench session; all are worth knowing before trusting a result.
 
 The toolchain, which this list used to include, is pinned: `rust-toolchain.toml`
 says `1.99.1`, and the size figures in `STATUS_DONE.md` are measured under it.
+
+---
+
+## 9. Found on the 2026-10-26 bench, still open
+
+`STATUS_DONE.md` §9 has what the session verified and fixed. These it found and
+did not close:
+
+- **The speed state is unobservable at rest.** While the rover is stationary
+  `Ekf::correct_wheel_sensors` runs only the zero-rate gyro-bias update, never
+  an odometry update, so `v` random-walks: `RoverState.speed_mps` read 0.45 m/s
+  with the wheels still, its variance growing. Within minutes the health word
+  gained `ESTIMATOR_DIVERGED`. Drive control is unaffected (the speed PID uses
+  ticks), but `speed_mps` and `rover-doctor`'s "estimator converged" check
+  mean nothing at rest until a zero-speed update joins the zero-rate one.
+  (Bench lane "detections" of clutter also feed the filter; that part goes
+  away on a real track.)
+- **The Spresense backup receiver has no fix.** It is alive and
+  `rover-navigation` parses its JSON correctly, but it reports 0-1 satellites
+  and `"fix":false` where the u-blox sees 12 — so `BACKUP_GNSS_STALE` stays
+  set. Most likely antenna placement; recheck with sky view. **Opening its port
+  resets the board** (DTR/RTS on open), so every `rover-navigation` restart
+  cold-starts it and costs minutes to first fix.
+- **No RTCM source**, so the u-blox stops at DGPS (h_acc ~2.9 m) and
+  `rover-doctor`'s RTK check is NO-GO. Expected until the 433 MHz link exists.
+- **Procedure B and `track_width_m`.** `metres_per_tick` is diameter-derived
+  (§1.1).
+- **`python3-venv` is missing** on the base PC and the Jetson (`ensurepip`
+  unavailable). Worked around without sudo — `FIELD_TEST.md` has how — but
+  `sudo apt install python3.10-venv` would make the documented commands work
+  as written.
+- **ST-Link firmware `V2J39M27`** on both boards needs `--speed 1000` for
+  probe-rs. Updating it (STSW-LINK007) would probably remove that.
+

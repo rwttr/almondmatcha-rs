@@ -25,7 +25,7 @@ Exception: the pin tables, which live only in the two firmware crates'
 | Estimation + control | Raspberry Pi 4B | Cortex-A72 ×4, 4–8 GB, 64 GB SD | 192.168.1.1 | `curry@` |
 | Chassis firmware | NUCLEO-F767ZI | Cortex-M7 @ 216 MHz, 512 KB SRAM, 2 MB flash | 192.168.1.2 | SWD only |
 | Sensors firmware | NUCLEO-F767ZI | Cortex-M7 @ 216 MHz, 512 KB SRAM, 2 MB flash | 192.168.1.6 | SWD only |
-| Base station | PC | — | 192.168.1.10 | `yupi@` |
+| Base station | PC (x86_64) | — | 192.168.1.10 (netplan, `enp0s31f6`) | `yupi@` |
 
 All five on one gigabit switch, `192.168.1.0/24`, static addresses, no DHCP and
 no discovery protocol of any kind. The two NUCLEOs negotiate 100 Mbps.
@@ -44,14 +44,19 @@ which becomes load-bearing once the base moves to the LoRa link.
 
 | Device | Measures | Bus | Attached to |
 |---|---|---|---|
-| Intel RealSense D415 | RGB 1280×720 @ 30 FPS | USB 3 | Jetson |
+| Intel RealSense D415 (`806312060441`) | RGB 1280×720 @ 30 FPS | USB 3 | Jetson |
+| Intel RealSense D405 (`218622277831`) | — not used by this stack | USB 3 | Jetson |
 | LSM6DSV16X (X-NUCLEO-IKS4A1) | 3-axis accel + 3-axis gyro | I²C1 | Chassis NUCLEO |
 | Wheel encoders ×2 | Quadrature, both drive wheels | GPIO + EXTI | Sensors NUCLEO |
 | INA226 | Bus voltage, current | I²C1, addr `0x40` | Sensors NUCLEO |
-| u-blox simpleRTK2b | RTK GNSS, cm-class | USB serial | RPi |
-| Sony Spresense | GNSS, ~10 Hz, uncorrected | USB serial | RPi |
-| ESP32 LoRa 433 MHz | RTCM downlink, base → rover | USB serial | RPi |
-| ESP32 LoRa 923 MHz | Telemetry uplink, rover → base | USB serial | RPi |
+| u-blox simpleRTK2b | RTK GNSS, cm-class | USB CDC, `/dev/ttyACM0`, 460800 | RPi |
+| Sony Spresense | GNSS, ~10 Hz, uncorrected; **JSON lines**, not NMEA | CP2102N, `/dev/ttyUSB0`, 115200 | RPi |
+| ESP32 LoRa 433 MHz | RTCM downlink, base → rover | CP2102 (`ttyUSB1`/`ttyUSB2`, which is which unconfirmed) | RPi |
+| ESP32 LoRa 923 MHz | Telemetry uplink, rover → base | CP2102 (as above) | RPi |
+
+(USB serial assignments as observed on 2026-10-26. They are enumeration order,
+not fixed: `/dev/serial/by-id/` names the u-blox and the CP2102N, but the two
+ESP32 CP2102s share the serial `0001` and cannot be told apart that way.)
 
 Notes that cost a field session to rediscover:
 
@@ -62,6 +67,13 @@ Notes that cost a field session to rediscover:
   no compass on this rover today. `[estimator] use_magnetometer = false` is
   the right setting regardless: the drive motors would distort it under load,
   and a stationary calibration would not hold (plan §2.5).
+- **Two RealSense cameras on the Jetson.** Only the D415 is the lane camera;
+  `[perception] d415_serial` pins it. Without that, perception takes whichever
+  device pyrealsense2 lists first — which may be the D405.
+- **The Spresense resets whenever its port is opened** (DTR/RTS on open — the
+  Arduino-style auto-reset). Every `rover-navigation` start therefore
+  cold-starts it, and a first fix takes minutes. On the 2026-10-26 bench it
+  saw 0-1 satellites where the u-blox saw 12: check its antenna's sky view.
 - **Both GNSS receivers moved to the RPi.** The ROS 2 sensors firmware read NMEA
   over UART; the Rust firmware deliberately does not — serial parsing on an MCU
   bought nothing `rover-navigation` can't do with a real allocator and parser.

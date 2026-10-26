@@ -70,15 +70,9 @@ was always flashed there as "the default ST-LINK", with no serial ever
 written down in-repo — `066AFF3932504E3043101915` above comes from the
 user's local `flash_chassis` alias instead, not from this repo's history.
 
-If the bench session hasn't confirmed it yet, treat the chassis row as
-unverified and capture it directly the first time both boards are on the
-bench together, as a sanity check against the alias value:
-
-```sh
-# Unplug the sensors board (or note both serials and match by elimination).
-# With ONLY the chassis board's USB cable connected:
-probe-rs list
-```
+**Both rows confirmed on the 2026-10-26 bench**: `probe-rs list` showed exactly
+these two serials, and the chassis serial flashed the board that then reported
+its IMU (`imu: LSM6DSV16X id=0x70 ready`) — only the chassis board has one.
 
 Everything below that flashes "the chassis board" should name the serial
 explicitly with `--probe`, for the same reason the sensors board's serial

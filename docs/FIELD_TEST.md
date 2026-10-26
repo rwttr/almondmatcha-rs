@@ -55,24 +55,54 @@ is what the RPi launch script tells you to run when it finds a binary missing.
 
 ### Getting the code onto the machines
 
-**There is no established deployment story in this repo, and this document is
-not going to invent one.** What is true today:
+Established on the 2026-10-26 bench session (`STATUS_DONE.md` §9). All three
+rover machines also have Wi-Fi with internet access, but nothing below needs
+it.
 
-- The three rover machines are on a closed `192.168.1.0/24` with **no internet**
-  (`docs/HARDWARE.md` §1), so `cargo build` on those machines only works if the
-  Cargo registry cache is already warm or a crates mirror is reachable. All
-  three `Cargo.lock` files are committed, so the dependency set is at least
-  pinned and reproducible.
-- **Binaries cannot simply be copied from a development Mac.** The RPi and the
-  Jetson are `aarch64-unknown-linux-gnu`; an Apple-silicon laptop builds
-  `aarch64-apple-darwin`. Same word size, different platform — the binary will
-  not run. Cross-compiling to the Pi is possible but is not set up here.
-- The realistic path today is **a git clone on each machine, built there**,
-  with the network brought up long enough to fetch crates, or a pre-warmed
-  `~/.cargo` copied across.
+**RPi — cross-compile on the base PC, copy static binaries.** The base PC
+(x86_64) has `aarch64-linux-gnu-gcc`; static musl binaries run regardless of
+the RPi's glibc, and the RPi needs no Rust toolchain:
 
-If you establish a better answer during a real bring-up, record it here — this
-section is a description of an unsolved problem, not a procedure.
+```sh
+# on the base PC, repo root, once:
+rustup target add aarch64-unknown-linux-musl
+
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
+  cargo build --release --target aarch64-unknown-linux-musl \
+  -p rover-control -p rover-navigation -p rover-telemetry -p rover-tap
+
+# ship the exact committed tree (no git credentials needed on the rover),
+# then the binaries where tools/launch_rover_tmux.sh looks for them:
+git archive HEAD | ssh curry@192.168.1.1 \
+  'mkdir -p ~/almondmatcha-rs && tar -x -C ~/almondmatcha-rs && mkdir -p ~/almondmatcha-rs/target/release'
+git rev-parse --short HEAD | ssh curry@192.168.1.1 'cat > ~/almondmatcha-rs/DEPLOYED_COMMIT'
+scp target/aarch64-unknown-linux-musl/release/rover-{control,navigation,telemetry,tap} \
+  curry@192.168.1.1:almondmatcha-rs/target/release/
+```
+
+**Jetson — same tree, a venv that sees the system packages.** The Jetson's
+OpenCV (JetPack build), numpy and CUDA PyTorch are global; a plain
+`pip install -e .` would pull generic PyPI wheels over them. So the venv is
+created with `--system-site-packages` and the package installed `--no-deps` —
+the only thing inside the venv is the editable `rover-perception` link, which
+`tools/launch_jetson_tmux.sh` needs at `perception/.venv/bin/rover-perception`.
+The Jetson (like the base PC) lacks `python3-venv`, so the venv is made without
+pip and driven by the user's pip (`pip --python`), which needs no sudo:
+
+```sh
+git archive HEAD | ssh yupi@192.168.1.5 'mkdir -p ~/almondmatcha-rs && tar -x -C ~/almondmatcha-rs'
+ssh yupi@192.168.1.5 'cd ~/almondmatcha-rs/perception &&
+  python3 -m venv --system-site-packages --without-pip .venv &&
+  python3 -m pip --python .venv/bin/python install --no-deps -e . &&
+  .venv/bin/python -m pytest tests/ -q'      # 127 passed on the Jetson
+```
+
+Perception's `pyproject.toml` asks for OpenCV ≥ 4.8; the Jetson has 4.5.4,
+and the full suite — including the frozen-oracle parity tests — passes on it.
+
+Both machines need the base PC's SSH key (`ssh-copy-id curry@192.168.1.1`,
+`ssh-copy-id yupi@192.168.1.5`). `DEPLOYED_COMMIT` on each says what is
+running.
 
 ---
 
@@ -84,36 +114,25 @@ current status of all of them is `docs/STATUS_OPEN.md` §1.
 
 ### 0.1 Drivetrain calibration — blocks everything metric
 
-`ticks_per_rev`, `metres_per_tick` and `track_width_m` in `config/rover.toml`
-are all `0.0`. Until they are measured there is **no metric speed anywhere in
-the system**: the estimator disables odometry rather than dividing by zero,
-and every `speed_mps` in every log is meaningless.
+**Done on the bench, 2026-10-26**, with one caveat. Procedure A (`docs/CALIBRATION.md`)
+gave **~1,396 ticks/rev at 4× decoding** on both wheels — six 10-turn runs,
+13,913-13,969 counts. The rover was on a bench rig and could not be rolled,
+so `metres_per_tick = 0.0002813` is π × the measured 0.125 m wheel / 1396,
+**not** Procedure B. `docs/HARDWARE.md` §3 has the runs.
 
-Run both procedures in `docs/CALIBRATION.md` — about twenty minutes with a
-tape measure (`docs/RUST_REWRITE_PLAN.md` §2.6 is the reasoning behind them,
-not the steps). Procedure A gives ticks per revolution; Procedure B gives
-metres per tick on the actual field surface, and B is the one that goes into
-production.
+Before a field run that depends on absolute speed, **run Procedure B** on the
+actual surface (`docs/RUST_REWRITE_PLAN.md` §2.6 is the reasoning): it
+includes tyre compression and slip, which a diameter does not, and it is the
+authoritative number. `track_width_m` is still `0.0` (optional — a second yaw
+estimate).
 
 > ⚠️ **Calibrate against the decoding mode the firmware actually uses.** The
-> `sensors` firmware does 4× decoding. The old mbed firmware did 2×. A
+> `sensors` firmware does 4× decoding; the old mbed firmware did 2×. A
 > constant measured against the wrong one makes the rover run at half or
-> double the commanded speed. Record which mode the number belongs to in
-> `config/rover.toml` next to the value.
+> double the commanded speed. For a re-check: ten hand turns should read
+> **~13,960**; ~7,000 means the board is decoding at 2×.
 
-**Expect roughly 15,000 counts for ten hand turns** (~1500 ticks/rev at this
-firmware's 4× decoding). That expectation comes from a recollection of the
-ROS 2 system, not a measurement — `docs/HARDWARE.md` §3 records where it came
-from and how much to trust it. Use it as a check, not as a value to type in:
-
-- ~15,000 → decoding and wiring confirmed, take the measured number.
-- ~7,500 → the board is still decoding at 2×. Stop and fix that first; this
-  is exactly the failure the warning above describes, and you have caught it
-  in one minute instead of after a run at double the intended speed.
-- anything else → find out why before driving.
-
-`rover-doctor` (§3) fails loudly while this is outstanding. That failure is
-correct. Do not skip it.
+`rover-doctor` (§3) reports the drivetrain GO on the calibrated config.
 
 ### 0.2 Servo direction, and the D5 re-tune — 60 seconds on blocks
 
@@ -149,11 +168,10 @@ against gains that have never run with a correctly-signed heading term.
 
 ### 0.3 Flashing
 
-As of 2026-10-17 nothing in `firmware/` has ever met silicon. First flash is a bench activity,
-not a field one — do it before you pack. `docs/RUST_REWRITE_PLAN.md` §13.4 has
-the full hardware-verification debt list in risk order; the Ethernet PHY is
-the hard gate, and §13.4a explains what the firmware can and cannot tell you
-about it.
+Both boards were first flashed on the 2026-10-26 bench session and passed the
+PHY gate (`STATUS_DONE.md` §9). Flash is a bench activity, not a field one —
+do it before you pack. `docs/RUST_REWRITE_PLAN.md` §13.4 has the remaining
+hardware-verification debt.
 
 `docs/CALIBRATION.md` §§1–3 is the full procedure — probe-rs install, the udev
 rule, identifying the two boards by ST-Link serial, and the exact flash
@@ -170,20 +188,25 @@ chassis board and spend an hour on it.
 | Sensors | `192.168.1.6` | `066DFF3932504E3043014542` |
 | Chassis | `192.168.1.2` | `066AFF3932504E3043101915` |
 
-The chassis serial comes from the old OpenOCD flashing aliases, not from a
-`probe-rs list` capture — `docs/CALIBRATION.md` §1 has the provenance. If a
-flash lands on the wrong board, re-capture both with `probe-rs list` and
-correct §1's table.
+Both serials were confirmed on the 2026-10-26 bench (`probe-rs list`, and the
+chassis serial flashed the board that then reported its IMU).
+
+⚠️ **Always add `--speed 1000`.** Both ST-Links run firmware `V2J39M27`; at
+probe-rs's default SWD clock the attach times out.
 
 ```sh
 cd firmware/sensors && cargo build --release
-probe-rs run --chip STM32F767ZITx --probe 0483:374b:066DFF3932504E3043014542 \
+probe-rs run --chip STM32F767ZITx --speed 1000 --probe 0483:374b:066DFF3932504E3043014542 \
     target/thumbv7em-none-eabihf/release/sensors-fw
 
 cd ../chassis && cargo build --release
-probe-rs run --chip STM32F767ZITx --probe 0483:374b:066AFF3932504E3043101915 \
+probe-rs run --chip STM32F767ZITx --speed 1000 --probe 0483:374b:066AFF3932504E3043101915 \
     target/thumbv7em-none-eabihf/release/chassis-fw
 ```
+
+A healthy boot, as seen on the bench: `net: link up` about 2 s in (POST waits
+for auto-negotiation), then `ready` — the chassis adds `imu: LSM6DSV16X
+id=0x70 ready` and `motors held stopped until a zero-throttle command`.
 
 ⚠️ **Flash the sensors board WITHOUT `--features calibration`.** That feature
 adds a 1 Hz `defmt` tick readout which exists for `docs/CALIBRATION.md`'s
@@ -365,6 +388,12 @@ Perception sends from its own `[services] perception` address — the RPi's
 processes drop datagrams from any other source — so on a dev machine that does
 not own `192.168.1.5` it needs `--bind-any`.
 
+⚠️ **The Jetson has two RealSense cameras** — the lane D415 (`806312060441`)
+and a D405 (`218622277831`). Perception opens the one named by
+`[perception] d415_serial` and logs `D415 serial: … ([perception]
+d415_serial)` at startup; without a serial it would take whichever
+pyrealsense2 lists first.
+
 Field defaults are CSV logging **on** (a run you cannot analyse afterwards was
 a wasted drive), no preview window, and the throttled heartbeat rather than
 per-frame logging. Overrides, all environment variables:
@@ -373,7 +402,7 @@ per-frame logging. Overrides, all environment variables:
 |---|---|
 | `PERCEPTION_PREVIEW=1` | Debug preview window. Bench only — it costs frame rate and fails on a headless box. |
 | `PERCEPTION_VIDEO=PATH` | Replay a video file instead of the D415. How you test without a camera. |
-| `PERCEPTION_SERIAL=...` | Pick a specific D415 by serial. |
+| `PERCEPTION_SERIAL=...` | Override the camera serial. Normally unnecessary: `[perception] d415_serial` in `config/rover.toml` pins the D415 (`806312060441`). |
 | `PERCEPTION_WIDTH` / `_HEIGHT` / `_FPS` | Capture overrides. |
 | `PERCEPTION_CSV=PATH` | Move the frame log; defaults to `$ROVER_RUN_DIR/lane_detection.csv`. |
 | `PERCEPTION_VERBOSE=1` | Log every frame rather than a heartbeat. |
@@ -437,6 +466,8 @@ ground. It must be the base PC: it binds the `doctor` service,
 `192.168.1.10:7031`, and on a machine without that address it exits with status
 2 and a bind error before printing a single check. It does not conflict with
 `ground-station` — they bind different ports — so leave the dashboard up.
+(The bench base PC was `192.168.1.4` until 2026-10-26; it is now `.10`, set in
+`/etc/netplan/01-netcfg.yaml` and applied with `sudo netplan apply`.)
 
 ```sh
 cargo run --release -p rover-doctor
@@ -623,11 +654,13 @@ event is long over.
 Kept short on purpose; `docs/STATUS_OPEN.md` is authoritative and this list
 will rot before that one does.
 
-1. Drivetrain calibration is `0.0` (§0.1).
-2. Nothing has been flashed, as of 2026-10-17 (§0.3); the LAN8742A PHY is the
-   hard gate.
-3. Servo direction unverified, and the D5 re-tune (§0.2). The sign itself is
-   fixed.
+1. Drivetrain calibrated from Procedure A + wheel diameter; Procedure B still
+   owed (§0.1).
+2. Boards flashed and the stack deployed on the bench, 2026-10-26 (§0.3,
+   `STATUS_DONE.md` §9) — but nothing has driven: motors, servo and the
+   watchdog are unexercised.
+3. Servo direction unverified, and the D5/D6 re-tune (§0.2). The sign itself
+   is fixed.
 4. Replay parity is against a synthetic trace only. No recorded ROS 2 run
    exists in this repository and none ever did; producing a real baseline
    means checking out `main` in the ROS 2 fallback repository,

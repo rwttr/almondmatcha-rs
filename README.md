@@ -16,7 +16,9 @@ two of them bare-metal microcontrollers.
 
 The entire ROS 2 / DDS / mROS 2 stack, replaced with one Rust workspace, two
 Rust firmware crates and one Python process for perception. **As of
-2026-10-17 nothing here has ever been flashed to a board.**
+2026-10-26 the whole stack runs on the rover's hardware on a bench — both
+boards flashed, RPi and Jetson deployed, every feed reaching the base station
+— and nothing has driven yet** (`docs/STATUS_DONE.md` §9).
 
 **There is no middleware.** Messages are plain UDP datagrams on a static LAN,
 routed from a table in `config/rover.toml`. No discovery, no QoS negotiation,
@@ -235,22 +237,25 @@ address.
 
 **`firmware/chassis`** (STM32 `.2`) — motor PWM, steering servo, LSM6DSV16X IMU
 at 100 Hz, command watchdog (boots tripped, re-armed by `rover-control`).
-69,976 B flash (3.3 %), 19,316 B RAM (3.7 %).
+71,144 B flash (3.4 %), 19,324 B RAM (3.7 %).
 
 **`firmware/sensors`** (STM32 `.6`) — wheel encoders via software 4× quadrature
 decode over EXTI (hardware quadrature is impossible on this harness — see
 `HARDWARE.md`), INA226 power monitor, link watchdog (an LED, no actuation).
-57,476 B flash (2.7 %), 19,360 B RAM (3.7 %).
+58,920 B flash (2.8 %), 19,368 B RAM (3.7 %).
 
 Both run a power-on self-test and report it, with reset cause and PHY link
 state, over `BoardDiagnostics`.
 
-Sizes are `cargo size --release` under the pinned rustc 1.99.1: flash is
-`text + data`, RAM is `data + bss`, against 2 MB / 512 KB. (Method and the
-`calibration` feature's +656 B / +80 B: `docs/STATUS_DONE.md` §1.)
+Sizes are text/data/bss from `llvm-size` (what `cargo size --release` prints)
+under the pinned rustc 1.99.1: flash is `text + data`, RAM is `data + bss`,
+against 2 MB / 512 KB; re-measured 2026-10-26, after `rt` added the vector
+table. (Method: `docs/STATUS_DONE.md` §1.)
 
-⚠️ **As of 2026-10-17 neither image has ever run on real hardware.** Both build
-and are clippy clean; that is all anyone knows about them.
+**Both images run on their boards** (2026-10-26 bench): POST passes, 100 Mb/s
+full-duplex link, the chassis IMU and the sensors encoders and INA226 all
+read. Flash with `--probe` **and** `--speed 1000` (`docs/CALIBRATION.md`
+§3.1). Motors, servo and the watchdog under load have **not** run yet.
 
 ### Everything else
 
@@ -291,7 +296,7 @@ commit turns the lateral controller into positive feedback.
 
 ```bash
 # Rust workspace — host binaries and tools (13 packages: 12 crates + tools/replay)
-cargo test --workspace                      # 438 tests
+cargo test --workspace                      # 440 tests
 cargo clippy --workspace --all-targets      # clean
 cargo fmt --all --check
 
@@ -305,7 +310,7 @@ cargo build --release -p rover-control      # also: -p rover-navigation,
 # Perception (first time: create the venv the tests expect)
 cd perception
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/ -q        # 124 tests
+.venv/bin/python -m pytest tests/ -q        # 127 tests
 
 # The parity gate — `run` needs a trace; `synthetic` makes one
 cargo run -p replay -- synthetic --out /tmp/trace.csv
@@ -324,15 +329,17 @@ Docker, no CMake, no mbed.
       comes from the measured 0.125 m wheel, not a rolled distance — re-check
       with Procedure B (`docs/CALIBRATION.md`) once the rover can roll.
       `track_width_m` is still `0.0`.
-- [ ] **Bench bring-up in progress** (2026-10-26). The sensors board runs
-      and passed its PHY gate, after two firmware fixes the bench found
-      (missing interrupt vector table on both boards; swapped encoder
-      sides). The chassis board is not yet flashed. The LAN8742A PHY against
-      Embassy's `GenericPhy` is the hard gate that decides whether any of the
-      firmware is real — plan §13.4 lists the rest of the hardware-verification
-      debt, and `docs/STATUS_OPEN.md` §3 the checks the 2026-10-17 audit added
-      (gyro z sign, motor enable pins before `Motors::new`, encoder decode
-      latency).
+- [x] **Bench bring-up** (2026-10-26, `docs/STATUS_DONE.md` §9). Both
+      boards flashed, PHY gate passed, POST passes, RPi and Jetson deployed,
+      `rover-doctor` 7/9 GO. Four defects found and fixed (plan §13.3b
+      D7-D10): no interrupt vector table, swapped encoder sides, every board
+      datagram dropped by the hosts, POST racing the link.
+- [ ] **Steering, motors and watchdog on blocks** — never commanded yet.
+      `docs/STATUS_OPEN.md` §7 has the order; also the gyro z sign and the
+      motor-enable pins before `Motors::new` (§3).
+- [ ] **Speed estimate drifts at rest** — the EKF has no zero-speed update,
+      so `speed_mps` wanders while stopped and the estimator check means
+      little (`docs/STATUS_OPEN.md` §9).
 - [x] **`heading_err_rad` sign fixed** (plan §13.3b D5). The detector now
       matches the model its output feeds. Regression-tested against the
       geometry, not against its own assumption.

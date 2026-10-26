@@ -1079,8 +1079,9 @@ none ever did** — §12 criterion 2 has what producing one would take, and
 
 ### 13.3b Open design defects found during implementation
 
-Six real flaws, surfaced by building against this plan and then by auditing
-what was built. **D1-D3 are implemented** — D1 as `[services]` in
+Ten real flaws: D1-D6 surfaced by building against this plan and then by
+auditing what was built, D7-D10 by the first bench session (2026-10-26) — the
+kind only hardware shows. D7-D10 are all fixed. **D1-D3 are implemented** — D1 as `[services]` in
 `config/rover.toml`, D2 as `GnssSource` / `GnssFix.source`, D3 as
 `select_navigation_fix` in `crates/rover-navigation/src/mission.rs` (with
 passing tests). **D4 is half-implemented**: perception's `--csv` flag is off by
@@ -1095,7 +1096,7 @@ can be switched off (`lane_latency_compensation`) to compare.
 **D5 was the only one that could make the rover steer the wrong way**, which is
 why its sign was settled before anything is flashed (the detector now negates
 `theta`; the D5 section has the account). D6 is a systematic lag the system
-cannot currently even measure.
+could not then even measure (it now can: 59 ms median, `STATUS_OPEN.md` §5.1).
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
 
@@ -1401,23 +1402,88 @@ Both halves, plus the queue depth:
 so the parity gate is unaffected. Still unverified on hardware: the D415
 timestamp domain, and the real size of the lag.
 
+#### D7 — no device vector table: both boards hung at the first interrupt
+
+**Found 2026-10-26, first flash. Fixed (`953810d`).** Both firmware crates set
+`default-features = false` on `embassy-stm32` to choose features explicitly,
+which silently dropped `rt` — its *only* default feature, and the one that
+provides the device vector table (`rt = ["stm32-metapac/rt"]`). With no table,
+every peripheral IRQ — the TIM5 time driver, ETH, EXTI — vectored to
+cortex-m-rt's `DefaultHandler`, an infinite loop. The sensors board logged
+`net: link up` and its PHY straps, then went silent for good: halting the core
+showed the PC in `DefaultHandler` with IPSR = exception 66 (IRQ 50, TIM5), and
+the ELF had no `TIM5`/`ETH`/`EXTI*` symbols at all. The IWDG had not yet been
+started, so nothing ever reset it. The chassis had the identical feature list.
+
+The lesson: a dependency's default features are part of its contract.
+`default-features = false` needs every default re-listed deliberately, and a
+vector-table check (`llvm-nm` for the handler symbols) is worth a CI step.
+
+#### D8 — encoder sides swapped
+
+**Found 2026-10-26, Procedure A. Fixed (`9beb1d3`).** Turning the rover's
+right wheel counted on `ticks_left`. The pin pairs came from the ROS 2
+firmware, which called `PA15`/`PB5` `encoder_a` = left (`app.cpp`:
+`mt_lf_encode_msg = enc_A`); on this harness that pair is the right wheel.
+`encoders::init` now maps by the measurement. Both wheels count up turning
+forward, so no sign changed. Average speed is unaffected; per-wheel labels,
+track-width and odometry yaw would all have been backwards.
+
+#### D9 — every board datagram dropped by every host process
+
+**Found 2026-10-26, first `rover-doctor` run. Fixed (`eb67653`).**
+`rover_link::UdpLink` attributed an inbound datagram to a peer only on an exact
+`ip:port` match with `[services]`, and dropped the rest. The boards' transmit
+sockets (`tx_socket!`) bind port 0, so they send from ephemeral ports — and
+`tx_socket!`'s own comment called the port "irrelevant" because nothing sends
+*to* those sockets. Both halves were reasonable alone; together, `ImuSample`,
+`WheelSensors`, `ChassisStatus`, `PowerSample` and `BoardDiagnostics` never
+reached any host process. `rover-control` would never have seen the IMU, so
+its drive gate would never have opened. No host test could catch it: every
+host test binds both ends itself.
+
+Fixed on the host: `peer_of` falls back to the **sole** configured service at
+the source IP. Each board is alone on its IP; the RPi (three services) and base
+PC (two) still need the exact port — D1's reason for `[services]` stands.
+Moving the boards' sends onto `SELF_PORT` was rejected: smoltcp delivers an
+inbound datagram to the first socket bound to its port, so a transmit-only
+socket could swallow chassis commands. Consequence to keep: **never give a
+board's IP a second `[services]` entry.**
+
+#### D10 — POST read the PHY before the link existed
+
+**Found 2026-10-26, `rover-doctor`. Fixed (`eb67653`).** `main` ran POST right
+after `net::wait_up`, which awaited `wait_config_up` — and `main`'s comment
+assumed embassy-net gates static-config application on link state. It does
+not: with a static IP, config is "up" at once (~10 ms), while auto-negotiation
+took ~1.7-2 s. POST read zeroed `PhyStatus` and both boards reported
+`PHY_ID | LINK` failed for the life of the boot, over a live link that was a
+clean 100 Mb/s full duplex. `wait_up` now also awaits `wait_link_up` and a
+cached negotiated speed, bounded at 5 s so a board with no cable still finishes
+POST (recording the failure) and boots.
+
 ### 13.4 Hardware-verification debt
 
-Nothing in `firmware/` has met silicon. In rough order of risk:
+Written before anything had met silicon. **The 2026-10-26 bench session closed
+items 1-3** (`STATUS_DONE.md` §9.1) and found D7-D10 (§13.3b); items 4-7 need a
+driving rover. Kept in the original order:
 
-1. **LAN8742A PHY against `GenericPhy`** — §9 step 4, still the hard gate.
+1. **LAN8742A PHY against `GenericPhy`** — **passed on both boards,
+   2026-10-26** (100 Mb/s full duplex, straps `MODE[2:0]=111`). Was §9 step 4,
+   the hard gate.
    Standard clause-22 part, but unproven here. See §13.4a: bring-up is left
    exactly as Embassy ships it, and the diagnostic gap around it has been
    closed separately.
 2. **I2C1 on PB8/PB9** — inherited from the mbed target's generic
    `I2C_SDA`/`I2C_SCL` names for `NUCLEO_F767ZI`. Standard Nucleo-144 Arduino
-   bus, not confirmed against the physical board.
+   bus. **Confirmed 2026-10-26**: the LSM6DSV16X and INA226 both answer.
 3. **Encoder sign convention** — the quadrature table's forward direction was
    defined from first principles and cannot be checked without turning a wheel
    by hand and watching `ticks_left`/`ticks_right`. If it counts backwards,
    flip that wheel's sign inside the decode (`QuadChannel::new` — the pin
    arguments to `init` are typed per physical pin and cannot be swapped in
-   code), or swap the two channel wires at the connector.
+   code), or swap the two channel wires at the connector. **Verified
+   2026-10-26**: both count up turning forward; the sides were swapped (D8).
 4. **Software decode under load** — an EXTI decode, unlike a timer peripheral,
    can in principle miss edges while competing with UDP and I2C interrupts.
    Unmeasured.

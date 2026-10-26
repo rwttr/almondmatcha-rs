@@ -5,15 +5,20 @@ what remains and what to worry about; this document names, for every claim,
 the thing that would have failed if it were false. `RUST_REWRITE_PLAN.md`
 §13 is the detailed design record; this file does not depend on it.
 
-**As of 2026-10-17, nothing in `firmware/` has ever run on a real board, and
-neither the perception pipeline nor the control law has ever driven the actual
-rover.** (A bench session pencilled in for 2026-09-21 did not happen.) Every
-result below came from a developer laptop. The Raspberry Pi, both
-NUCLEO-F767ZI boards, the Jetson and the drivetrain are all still running
-whatever the ROS 2 `main` was running last — that branch now lives only in
-`RoboticsGG/almondmatcha`, not in this repository — nothing from this branch
-has been flashed or deployed. The rover is not ready to drive, and nothing
-below changes that. §8 records what the 2026-10-17 audit found and fixed in the
+**Update, 2026-10-26: the first bench session happened** — §9. Both boards are
+flashed and running, the full stack is deployed and running on the RPi and
+the Jetson, every feed reaches the base station, and the drivetrain is
+calibrated. The session found and fixed four defects only hardware could show
+(§9.2). **Nothing has driven yet**: the rover sat on a bench rig throughout,
+and steering, the motors under load, the watchdog and a mission are all still
+unexercised. Sections 1-8 below were written before that session and describe
+laptop-only evidence; where §9 supersedes one of them it says so.
+
+**As of 2026-10-17** (the state §§1-8 describe), nothing in `firmware/` had
+ever run on a real board, and neither the perception pipeline nor the control
+law had ever driven the actual rover. Every result in §§1-8 came from a
+developer laptop. The ROS 2 `main` now lives only in `RoboticsGG/almondmatcha`,
+not in this repository. §8 records what the 2026-10-17 audit found and fixed in the
 software; it makes the code more correct, not any more proven.
 
 Three kinds of confidence appear below and must not be blurred: **proven**
@@ -36,7 +41,9 @@ The host workspace — 12 crates (`ground-station`, `rover-bus`,
 `rover-telemetry`) plus `tools/replay`, 13 packages in all — is
 clippy/rustfmt clean, and `cargo test --workspace` passes **434 tests**, 0
 failed. Perception passes **122** Python tests. (2026-10-26, after the D6
-fix: **438** and **124** — the 4 Rust and 2 Python tests it added.) `testdata/` holds **26**
+fix and the bench session: **440** and **127** — D6 added 4 Rust and 2 Python
+tests, the bench fixes 2 Rust (`rover-link`) and 3 Python (the D415 serial);
+§9.) `testdata/` holds **26**
 golden wire fixtures: 18 message types, `FrameHeader`, and seven variants.
 Both firmware images build for `thumbv7em-none-eabihf` and pass clippy —
 sizes and **never run on the boards they target** in §2's table. The
@@ -73,8 +80,8 @@ or artefact that backs it, not just an assertion that it exists.
 | `perception/rover_perception/wire.py` | **done** | 79 golden-fixture tests green against the Rust fixtures — the two languages provably agree on every byte. |
 | `perception/rover_perception/lane.py` | **done** | behaviour-preserving port, **parity proven** — see §3. |
 | `perception/rover_perception/{camera,bus,main}.py` | **done** | one process replacing `camera_stream_node` + `lane_detection_node`. End-to-end verified: 20 frames in, 20 `LaneMeasurement` out, seq monotonic, decoded by `wire.py`, clean exit. |
-| `firmware/chassis` | **builds** | 69,976 B flash (3.3%), 19,316 B RAM (3.7%) — text 69,888 / data 88 / bss 19,228. Clippy clean. POST + reset cause + PHY diagnostics incl. ANAR/strap check. Boots tripped; command freshness, source filtering and deadline rules in plan §5.2. **Never run on hardware.** |
-| `firmware/sensors` | **builds** | 57,476 B flash (2.7%), 19,360 B RAM (3.7%) — text 57,396 / data 80 / bss 19,280; with `--features calibration`, 58,132 B / 19,440 B (+656 B / +80 B). Clippy clean. POST + reset cause + PHY diagnostics incl. ANAR/strap check. **Never run on hardware.** |
+| `firmware/chassis` | **runs on the board** (2026-10-26, §9) | 71,144 B flash (3.4%), 19,324 B RAM (3.7%) — text 71,056 / data 88 / bss 19,236 (grew with the `rt` vector table, §9.2). Clippy clean. Boots to `ready` with PHY link, LSM6DSV16X `id=0x70`, motors held stopped and tripped; POST passes; re-armed by `rover-control` over the LAN. Motors, servo and the watchdog under load are **not yet exercised**. |
+| `firmware/sensors` | **runs on the board** (2026-10-26, §9) | 58,920 B flash (2.8%), 19,368 B RAM (3.7%) — text 58,840 / data 80 / bss 19,288. Clippy clean. Boots to `ready`; POST passes; encoders verified by hand (4× decode, ~1,396 ticks/rev, both wheels count up forward, sides fixed — §9.2); INA226 reads 28.5 V / 0.82 A at the base station. |
 
 ---
 
@@ -214,13 +221,13 @@ lives in `STATUS_OPEN.md` §6; this is the verdict.
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | `cargo test --workspace` green, fixtures cross-checked against Python | **Met.** 438 Rust tests, 124 Python tests, 26 fixtures — §1, §4. |
+| 1 | `cargo test --workspace` green, fixtures cross-checked against Python | **Met.** 440 Rust tests, 127 Python tests, 26 fixtures — §1, §4. |
 | 2 | `tools/replay` reproduces recorded ROS 2 steering | **Not met — cannot be attempted.** No recorded ROS 2 run ever existed; replay proves internal consistency against a frozen oracle (§2, §3), not field parity. `STATUS_OPEN.md` §1.4. |
 | 3 | Watchdog: Ethernet pulled while driving → ramp-to-zero | **Not met** — never run on hardware. `STATUS_OPEN.md` §1.2. |
 | 4 | IWDG: hung control task → board resets | **Not met** — same. `STATUS_OPEN.md` §1.2. |
 | 5 | E-stop end to end, `cmd_seq` echoed | **Not met** — protocol is unit-tested (`rover-bus`) but never run on real firmware. `STATUS_OPEN.md` §1.2. |
-| 6 | 0.20 m/s commanded → 0.20 ± 0.02 m/s measured | **Not met** — no metric speed exists yet; `rover-doctor`'s drivetrain check is a hard NO-GO (§5). `STATUS_OPEN.md` §1.1. |
-| 7 | 100 Hz IMU at the estimator, latency measured | **Not met** — never run on hardware. `STATUS_OPEN.md` §1.2, §5.1. |
+| 6 | 0.20 m/s commanded → 0.20 ± 0.02 m/s measured | **Not met, now attemptable** — the drivetrain is calibrated (§9.1; diameter-derived, Procedure B still owed), so metric speed exists, but nothing has been driven. `STATUS_OPEN.md` §1.1. |
+| 7 | 100 Hz IMU at the estimator, latency measured | **Not met** — `rover-control` receives the chassis IMU over the LAN (§9), but neither its rate at the estimator nor its latency has been measured. `STATUS_OPEN.md` §1.2, §5.1. |
 | 8 | EKF coasts a ≥3 s lane dropout without divergence | **Partially met.** `rover-estimator/tests/ekf.rs::lane_dropout_coasts_without_diverging` proves it at unit level — 300 steps (3 s at 100 Hz) of invalid lane feed, covariance provably growing, state finite and bounded (`< 0.5` cross-track/heading error). Not a demonstration on the integrated pipeline or a real occluded camera. |
 | 9 | One full field circuit at parity, CSVs compared | **Not met — cannot be attempted.** Requires a driving rover. `STATUS_OPEN.md` §1.4, §6. |
 | 10 | `main` still builds and drives | **Not independently re-verified for this document.** `STATUS_OPEN.md` §6. |
@@ -348,6 +355,60 @@ left open is in `STATUS_OPEN.md` (§3 for bench checks, §8 for the rest).
 Final counts at `c3824e9`, re-measured when this section was written: 434
 Rust tests, 122 Python tests, 18 `TYPE_ID`s, 26 fixtures, both firmware images
 build.
+
+---
+
+## 9. The 2026-10-26 bench session
+
+The first time any of this branch met hardware. Rover on a bench rig with the
+drive wheels off the ground, both NUCLEOs on USB to the base PC, all five
+machines on the LAN. **Everything here is proven in the strongest sense this
+document uses — observed on the real boards — but only on a bench**: nothing
+drove, and the motors and servo were never commanded.
+
+### 9.1 What was verified
+
+| Area | Result | How |
+|---|---|---|
+| Probes | Both ST-Links identified: sensors `066DFF3932504E3043014542`, chassis `066AFF3932504E3043101915` — the chassis value, previously unconfirmed, is right | `probe-rs list`; the chassis serial flashed the board that then reported its IMU |
+| Chips | Both `DBGMCU_IDCODE = 0x10016451` (F76x/77x), 3.24-3.26 V | OpenOCD, read-only |
+| PHY gate (plan §13.4 item 1) | **Passed on both boards.** `ANAR=0x01e1`, `MODE[2:0]=111` — the healthy strap case, so `STATUS_OPEN.md` §3.1's failure mode did not occur. 100 Mb/s full duplex, zero symbol errors | `defmt` boot log; `BoardDiagnostics` at the base |
+| POST | Passes on both boards (after the fix in §9.2) | `rover-doctor` |
+| I2C1 on PB8/PB9 (§13.4 item 2) | Confirmed on both boards: LSM6DSV16X answers `id=0x70` on chassis, INA226 reads on sensors | boot log; `Telemetry.power` = 28.5 V / 0.82 A |
+| Encoders (§13.4 item 3) | 4× decode, **~1,396 ticks/rev**; both wheels count **up** when turned forward; no counts at rest | Procedure A, calibration image: 13,960 / 13,962 / 13,963 / 13,969 on one wheel, 13,913 / 13,954 on the other, 10 hand turns each |
+| Drivetrain calibration | `ticks_per_rev = 1396`, `metres_per_tick = 0.0002813` (π × measured 0.125 m / 1396) in `config/rover.toml` | Procedure A + measured diameter. **Procedure B not run** — the rover could not be rolled |
+| LAN, board → host | Every board message type reaches its host consumer (after the fix in §9.2) | `rover-control` logs `IMU feed live`; `rover-doctor` sees both boards |
+| Chassis arming | `rover-control` re-arms the tripped chassis with zero throttle over the LAN | `rover-control` logs `chassis armed` |
+| Deployment | RPi and Jetson run commit `575f028` (binaries cross-compiled on the base PC); perception's 124 tests pass on the Jetson against its system numpy 1.26.4 / OpenCV 4.5.4 / CUDA PyTorch | `FIELD_TEST.md` "Getting the code onto the machines" |
+| D415 + D6 | Frames stamped from the D415's own `global_time` timestamp; **capture-to-publish median 59 ms** (54-62 ms, p95 61 ms), 0 dropped frames over 617, at 29.8 fps | `lane_detection.csv` `capture_age_ms` — with no lane in view, so detection may run longer on a real track |
+| u-blox GNSS | DGPS, 12 satellites, h_acc 2.85 m | `Telemetry.rtk` |
+| Preflight | `rover-doctor`: 7 of 9 GO. NO-GO on RTK (no RTCM source exists yet — expected) and health bits (`BACKUP_GNSS_STALE`; later also `LANE_STALE`, `ESTIMATOR_DIVERGED` — see `STATUS_OPEN.md` §9) | `rover-doctor` |
+
+### 9.2 Defects found and fixed
+
+Each was reachable only on hardware; each has its own commit and a design
+record in plan §13.3b (D7-D10).
+
+| | Defect | Fix |
+|---|---|---|
+| D7 | **Both boards hung ~10 ms after boot.** `default-features = false` on `embassy-stm32` dropped its `rt` feature and with it the device vector table; the first TIM5 (time-driver) interrupt fell into `DefaultHandler`'s infinite loop, before the IWDG was ever started. | `rt` enabled (`953810d`); verified by halting the core (PC in `DefaultHandler`, IPSR = IRQ 50) before, and by the vector table after |
+| D8 | **Encoder sides swapped.** The rover's right wheel counted on the pins the ROS 2 firmware called left. | `PA15`/`PB5` → right, `PB3`/`PB4` → left (`9beb1d3`); re-verified by hand |
+| D9 | **Every board datagram dropped by every host process.** Hosts identify a sender by exact `ip:port`; the boards send from ephemeral ports. The rover could never have driven: `rover-control` would never have seen the IMU. | `rover-link` falls back to the sole configured service at the source IP (`eb67653`); 2 tests |
+| D10 | **POST raced the link.** With a static IP `wait_config_up` resolves before auto-negotiation (~1.7-2 s), so POST read zeroed PHY status and both boards reported `PHY_ID \| LINK` failed on a clean link. | `net::wait_up` also waits for the link and a cached speed, bounded at 5 s (`eb67653`) |
+
+Plus two configuration changes the session forced: the D415 serial is now
+pinned in `[perception] d415_serial` (the Jetson has a D405 too, and
+"first device found" could pick it — `575f028`), and every `probe-rs` command
+on this bench needs `--speed 1000` (ST-Link firmware `V2J39M27`;
+`CALIBRATION.md` §3.1).
+
+### 9.3 Not verified — still open
+
+Steering direction, motors and TIM1 under PWM, the watchdog end to end, the
+gyro z sign, encoder decode at high wheel speed, IMU rate and latency at the
+estimator, Procedure B, `track_width_m`, the Spresense (no fix, see
+`STATUS_OPEN.md` §9), and anything that moves. `STATUS_OPEN.md` §7 is the
+order to take them in.
 
 ---
 

@@ -7,10 +7,12 @@ evidence, see [STATUS_DONE.md](STATUS_DONE.md) and
 [STATUS_OPEN.md](STATUS_OPEN.md) — this document covers architecture and
 rationale, not day-to-day state.
 
-**Status:** complete as software, unproven as a rover. **As of 2026-10-17
-nothing has been flashed to a board, and the drivetrain is uncalibrated.**
-Those two facts govern everything below; `STATUS_OPEN.md` has the full
-accounting. A 2026-10-17 audit fixed a long list of software faults
+**Status:** complete as software, running on the rover's hardware on a bench,
+not yet driven. **As of 2026-10-26** both boards are flashed and pass POST, the
+RPi and Jetson run the stack, and the drivetrain is calibrated — after a first
+bench session that found and fixed four defects no laptop could have
+(`STATUS_DONE.md` §9). `STATUS_OPEN.md` has what is left: everything that
+moves. A 2026-10-17 audit fixed a long list of software faults
 (`STATUS_DONE.md` §8) — including a sign error in the estimator that its own
 tests shared — which is a reason to trust the code more and the absence of
 bench time no less.
@@ -227,19 +229,22 @@ the document now carries a banner saying so.
 `STATUS_DONE.md` is authoritative on what is built and its evidence;
 `STATUS_OPEN.md` on what remains and what to worry about. In short: all
 twelve crates, both firmware images, the perception process and the replay
-gate are done and tested — 438 Rust tests, 124 Python tests, clippy/rustfmt
-clean, toolchain pinned to rustc 1.99.1. Board self-diagnostics landed most recently: both boards run a
-power-on self-test and report it, along with reset cause and Ethernet link
-state, and `rover-doctor` turns that into a preflight GO/NO-GO. None of it
-has met silicon.
+gate are done and tested — 440 Rust tests, 127 Python tests, clippy/rustfmt
+clean, toolchain pinned to rustc 1.99.1. Both boards run a power-on self-test
+and report it, with reset cause and Ethernet link state, and `rover-doctor`
+turns that into a preflight GO/NO-GO.
 
-**Blocking field use — neither is a coding task:** calibrating the
-drivetrain (`ticks_per_rev`, `metres_per_tick`, `track_width_m` are all `0.0`
-in `config/rover.toml`) and flashing the boards for the first time, past the
-LAN8742A PHY gate. `docs/CALIBRATION.md` is the calibration procedure
-(plan §2.6 is the reasoning), `STATUS_OPEN.md` §1.1–§1.2 the order of
-operations for the first bench session; `docs/FIELD_TEST.md` is the end-to-end
-procedure once they're done.
+**The first bench session (2026-10-26) put all of it on the hardware**: both
+boards flashed and past the PHY gate, the drivetrain calibrated (~1,396
+ticks/rev; Procedure B still owed), the RPi and Jetson deployed, every feed
+reaching the base station, camera latency measured at 59 ms. It found four
+defects only hardware could show (plan §13.3b D7-D10), all fixed.
+`STATUS_DONE.md` §9 is the record.
+
+**Blocking field use:** nothing has moved yet — steering, motors, the
+watchdog and the D5/D6 re-tune, in the order `STATUS_OPEN.md` §7 gives, plus
+the speed-at-rest drift (`STATUS_OPEN.md` §9). `docs/FIELD_TEST.md` is the
+end-to-end procedure.
 
 **Deferred by choice:** the two ESP32 LoRa links (out of scope by
 instruction, but the reason there is no TCP anywhere), and the LQR and MPC
