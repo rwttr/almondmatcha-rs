@@ -53,6 +53,12 @@ embassy-net = { version = "=0.9.1", features = ["defmt", "udp", "medium-ethernet
 # reading a register is unsafe or unreliable - the version is pinned exactly
 # (`=0.6.0`) precisely so that risk is fixed for the life of this Cargo.lock.
 embassy-stm32 = { version = "=0.6.0", default-features = false, features = [
+    # `rt` is embassy-stm32's only default feature, so `default-features =
+    # false` silently drops it -- and with it the device vector table. Every
+    # peripheral IRQ (the TIM5 time driver, ETH, EXTI) then lands in
+    # cortex-m-rt's DefaultHandler infinite loop: found on the first bench
+    # flash, 2026-10-26, a board that logged "link up" and then hung for good.
+    "rt",
     "defmt",
     "stm32f767zi",
     "memory-x",

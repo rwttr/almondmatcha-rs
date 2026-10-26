@@ -1071,6 +1071,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e74b78632cea498cfb28386a29f8bfae7476d6570a78733eb5fecbee66c2f4ce"
 dependencies = [
  "cortex-m",
+ "cortex-m-rt",
  "defmt 0.3.100",
 ]
 
