@@ -69,18 +69,18 @@
 //! decode work per edge is a handful of instructions. It is the best option
 //! available on this pin assignment, not a silent downgrade to "good enough."
 //!
-//! # Sign convention - needs bench verification
+//! # Sign convention and side - bench-verified 2026-10-26
 //!
 //! The decode counts `A rising while B is high` as +1 (`00 -> 01 -> 11 -> 10
 //! -> 00` counts up in the `(a << 1) | b` state encoding below), which matches
 //! the old `encoder_control.cpp` handlers (the ROS 2 comment there says the
-//! sign was "inverted to match physical mounting"). That is a transcription
-//! from source, not a measurement: whether +1 is physical *forward* for each
-//! wheel still needs a bench check. Spin each wheel forward by hand and
-//! confirm `ticks_left`/`ticks_right` increase; if one counts backwards, flip
-//! its sign inside [`QuadChannel::new`] / the decode (e.g. swap which channel
-//! is treated as `a`) - the pin arguments to [`init`] are typed per physical
-//! pin and cannot be swapped between channels.
+//! sign was "inverted to match physical mounting"). On the bench each wheel,
+//! turned forward by hand ten times, counted **up** (~13,960 counts, ~1,396
+//! per revolution at 4x), so +1 is physical forward on both.
+//!
+//! The same session found the **sides** swapped: the rover's right wheel
+//! (seen from above, nose up) counted on the pins the ROS 2 firmware called
+//! left. [`init`] maps them by that measurement, not by the old naming.
 use core::future::poll_fn;
 use core::sync::atomic::{AtomicI32, Ordering};
 use core::task::Poll;
@@ -111,9 +111,9 @@ bind_interrupts!(pub struct Irqs {
 /// encoder's counting task) and one reader (the publish task below), so a
 /// plain atomic is enough — no multi-field invariant to protect with a mutex.
 ///
-/// `encoder_a` in the ROS 2 firmware is the **left** wheel
-/// (`app.cpp`: `mt_lf_encode_msg = enc_A`); `encoder_b` is the **right**
-/// wheel (`mt_rt_encode_msg = enc_B`).
+/// The ROS 2 firmware called `encoder_a` (`PA_15`/`PB_5`) the left wheel
+/// (`app.cpp`: `mt_lf_encode_msg = enc_A`). On this harness it is the
+/// **right** one — see the module doc and [`init`].
 static TICKS_LEFT: AtomicI32 = AtomicI32::new(0);
 static TICKS_RIGHT: AtomicI32 = AtomicI32::new(0);
 
@@ -242,9 +242,11 @@ impl Encoders {
 
 /// Wire up both encoders' four GPIO lines as EXTI inputs.
 ///
-/// Pin/timer pairing per encoder, from `encoder_control.h`:
-/// left = channel A on `PA_15`, channel B on `PB_5`;
-/// right = channel A on `PB_3`, channel B on `PB_4`.
+/// Pin pairing per encoder, from `encoder_control.h`; which pair is which
+/// side is from the 2026-10-26 bench check, which **contradicts** the ROS 2
+/// naming (that firmware labelled the `PA_15`/`PB_5` pair "left"):
+/// right = channel A on `PA_15`, channel B on `PB_5`;
+/// left = channel A on `PB_3`, channel B on `PB_4`.
 /// See the module doc comment for why these are read as GPIO+EXTI rather
 /// than through a timer's hardware encoder mode.
 #[allow(clippy::too_many_arguments)]
@@ -261,10 +263,10 @@ pub fn init(
     // No pull resistors: these are driven push-pull outputs from the encoder
     // modules themselves (matching the ROS 2 firmware, which used
     // `InterruptIn` at its default floating configuration).
-    let left_ch_a = ExtiInput::new(pa15, exti15, Pull::None, Irqs);
-    let left_ch_b = ExtiInput::new(pb5, exti5, Pull::None, Irqs);
-    let right_ch_a = ExtiInput::new(pb3, exti3, Pull::None, Irqs);
-    let right_ch_b = ExtiInput::new(pb4, exti4, Pull::None, Irqs);
+    let right_ch_a = ExtiInput::new(pa15, exti15, Pull::None, Irqs);
+    let right_ch_b = ExtiInput::new(pb5, exti5, Pull::None, Irqs);
+    let left_ch_a = ExtiInput::new(pb3, exti3, Pull::None, Irqs);
+    let left_ch_b = ExtiInput::new(pb4, exti4, Pull::None, Irqs);
 
     Encoders {
         left: QuadChannel::new(left_ch_a, left_ch_b),

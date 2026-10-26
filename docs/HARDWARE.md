@@ -115,6 +115,13 @@ disagrees loudly.
 (Wheel circumference `π × 0.125 = 0.39270 m`; `metres_per_tick = 0.39270 /
 ticks_per_rev`.)
 
+**Procedure A, measured 2026-10-26** (first bench session, calibration image):
+ten hand turns gave 13,960 / 13,962 / 13,963 / 13,969 counts on one wheel and
+13,913 / 13,954 on the other — **~1,396 ticks/rev at 4× decoding**, so
+`metres_per_tick ≈ 0.39270 / 1396 ≈ 0.0002813`. Below the ~1,500 expected:
+the recalled 750 was a little high (the true 2× figure is ~698). Not yet in
+`config/rover.toml`: Procedure B (rolled distance) is the authoritative number.
+
 **How to use it.** Procedure A turns the wheel ten times by hand. Expect
 roughly **15,000 counts**. If you get roughly **7,500**, the board is still
 decoding at 2× — which is precisely the failure the warning above describes,
@@ -172,16 +179,19 @@ Source: `firmware/sensors/src/encoders.rs` module docs, `firmware/sensors/src/co
 
 | Function | Pin | Peripheral |
 |---|---|---|
-| Left encoder channel A | `PA15` | EXTI15 |
-| Left encoder channel B | `PB5` | EXTI5 |
-| Right encoder channel A | `PB3` | EXTI3 |
-| Right encoder channel B | `PB4` | EXTI4 |
+| Right encoder channel A | `PA15` | EXTI15 |
+| Right encoder channel B | `PB5` | EXTI5 |
+| Left encoder channel A | `PB3` | EXTI3 |
+| Left encoder channel B | `PB4` | EXTI4 |
 | INA226 | `PB8` / `PB9` | I²C1, addr `0x40`, 0.1 Ω shunt |
 | Link-loss indicator LED | `PB0` | GPIO out |
 | Ethernet RMII | `PA1 PA2 PA7 PC1 PC4 PC5 PB13 PG11 PG13` | ETH + LAN8742A |
 
-Left/right mapping is inherited from the ROS 2 firmware, where `encoder_a` was
-the left wheel (`app.cpp`: `mt_lf_encode_msg = enc_A`).
+Left/right is **bench-verified (2026-10-26)**, and it is the opposite of the
+ROS 2 firmware's naming: that firmware called the `PA15`/`PB5` pair
+`encoder_a`, the left wheel (`app.cpp`: `mt_lf_encode_msg = enc_A`), but turning
+the rover's right wheel (seen from above, nose up) counts on exactly those
+pins. Both wheels count up when turned forward.
 
 ### ⚠️ Hardware quadrature is impossible on this harness
 
@@ -191,10 +201,10 @@ F767ZI — not a datasheet skim:
 
 | Pin | Only timer-capable alternate function |
 |---|---|
-| `PA15` (left ch A) | TIM2_CH1 |
-| `PB5` (left ch B) | TIM3_CH2 |
-| `PB3` (right ch A) | TIM2_CH2 |
-| `PB4` (right ch B) | TIM3_CH1 |
+| `PA15` (right ch A) | TIM2_CH1 |
+| `PB5` (right ch B) | TIM3_CH2 |
+| `PB3` (left ch A) | TIM2_CH2 |
+| `PB4` (left ch B) | TIM3_CH1 |
 
 Each encoder's own A/B pair **straddles two timers**. `{PA15, PB3}` would be a
 valid TIM2 pair and `{PB4, PB5}` a valid TIM3 pair — but those pair the two
