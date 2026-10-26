@@ -169,7 +169,7 @@ b_g_dot    =  0 + w_b            (random walk)
 > §8.1). `rover-model` carries the derivation in its comments, and its tests
 > and the EKF's no longer assume the old sign. The EKF now also depends
 > explicitly on the gyro being z-up, counter-clockwise positive, which has not
-> been checked on the board — `STATUS_OPEN.md` §3 item 8.
+> been checked on the board — `STATUS_OPEN.md` §3 item 1.
 
 **Camera** (~30 Hz, `valid` only), `L_a = 1.22 m`. Linear under small-angle:
 
@@ -627,7 +627,7 @@ against a dead *peer*. The hardware independent watchdog protects against a dead
 ~500 ms and pet it only from the control task, so a hang in that task resets the
 board (which drops PWM to a safe state on reset). The ROS 2 firmware had neither
 layer; the Rust firmware wires both. (A reset leaves the motor enable pins
-floating until `Motors::new` runs — `STATUS_OPEN.md` §3 item 9.)
+floating until `Motors::new` runs — `STATUS_OPEN.md` §3 item 2.)
 
 **Acceptance test (§12 criterion 3):** rover on blocks, driving; pull the
 chassis's Ethernet cable (or kill `rover-control`). Motors must ramp to zero
@@ -1096,7 +1096,7 @@ can be switched off (`lane_latency_compensation`) to compare.
 **D5 was the only one that could make the rover steer the wrong way**, which is
 why its sign was settled before anything is flashed (the detector now negates
 `theta`; the D5 section has the account). D6 is a systematic lag the system
-could not then even measure (it now can: 59 ms median, `STATUS_OPEN.md` §5.1).
+could not then even measure (it now can: 59 ms median, `STATUS_DONE.md` §9.1).
 
 #### D1 — `PeerId` addresses machines, but the bus must address processes
 

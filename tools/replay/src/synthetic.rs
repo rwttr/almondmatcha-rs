@@ -61,8 +61,8 @@ pub fn generate(scenario: Scenario, duration_s: f32, legacy_cfg: LegacyConfig) -
     let mut ticks_right: i32 = 0;
     // A speed and a wheel/gyro relationship consistent enough to be a sane
     // synthetic input, not a calibrated constant: metres_per_tick is
-    // deliberately never assumed here (matching this rover's own
-    // uncalibrated standing state, docs/STATUS_OPEN.md §1.1) — ticks are advanced at a
+    // deliberately never assumed here (replay must not depend on the rover's
+    // calibration, which is still provisional, docs/STATUS_OPEN.md §1.1) — ticks are advanced at a
     // fixed, made-up rate purely so `WheelSensors` corrections have
     // something nonzero to act on.
     const SYNTHETIC_TICKS_PER_SEC: f32 = 200.0;

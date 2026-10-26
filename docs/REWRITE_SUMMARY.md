@@ -190,9 +190,10 @@ sign. This is field-derived. "Correcting" it to ISO 8855 without inverting
 every consumer in the same commit turns the lateral controller into positive
 feedback. **This is the convention as designed — it is not a claim that
 `heading_err_rad`'s implementation matched it.** It didn't: see D5 in
-`STATUS_OPEN.md` §1.3, where the detector's sign disagreed with this model
-until it was fixed, and where the pre-existing framing of this note is named
-as part of how that bug hid.
+`RUST_REWRITE_PLAN.md` §13.3b, where the detector's sign disagreed with this
+model until it was fixed, and where the pre-existing framing of this note is
+named as part of how that bug hid (`STATUS_OPEN.md` §1.3 has the re-tune that
+remains).
 
 **Tick counts doubled.** The old firmware interrupted on encoder channel A
 only — 2× decoding. The Rust firmware decodes both channels on every edge —
@@ -206,7 +207,7 @@ term backwards (`e_psi_dot = (gyro - b_g) - v*kappa`; the right-hand-positive
 convention makes it `+ v*kappa`). The model's tests had been written from the
 same wrong equation, so they passed. Plan §2.2 has the dated note and the
 derivation; the gyro's own z-up, counter-clockwise-positive assumption is the
-remaining unchecked link (`STATUS_OPEN.md` §3 item 8).
+remaining unchecked link (`STATUS_OPEN.md` §3 item 1).
 
 **Hardware quadrature is impossible on this harness.** STM32 timer encoder
 mode needs both channels of one encoder on the same timer. Verified

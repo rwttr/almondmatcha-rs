@@ -181,7 +181,7 @@ Servo: centre `100.0°`, duty band `0.05`–`0.10`, steering limit `±45°`.
 `Motors::new` runs** — the first thing `main` does, before Ethernet bring-up,
 and it drives all four low with every PWM at 0 %. Software cannot close the
 window before that call; hardware pull-downs on the four enable lines would
-(`STATUS_OPEN.md` §3 item 9).
+(`STATUS_OPEN.md` §3 item 2).
 
 ---
 

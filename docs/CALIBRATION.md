@@ -80,9 +80,9 @@ matters: with both boards plugged in, `probe-rs run` with no `--probe` picks
 whichever one it enumerates first, and that is not guaranteed to be stable
 across replugging — so never run it without `--probe` on this bench, and treat
 the `cargo run --release` shortcut in §3.1 as single-board only. The order of
-operations for a first bench session (toolchain, identify probes, sensors
-image and Procedure A, then chassis and the PHY strap warning) is
-`docs/STATUS_OPEN.md` §1.2.
+operations the first bench session followed (toolchain, identify probes,
+sensors image and Procedure A, then chassis and the PHY strap warning), and
+what it found, is `docs/STATUS_DONE.md` §9.
 
 > Footnote for anyone cross-referencing the old OpenOCD-era notes: OpenOCD
 > renamed this option between versions — `hla_serial` in older notes,
@@ -314,7 +314,7 @@ and cannot be swapped in code.)
 
 **Speed check, also here.** Decode runs in the executor, not an interrupt
 handler, so a second edge arriving before the task samples the pins decodes as
-a diagonal jump and counts as zero (`docs/STATUS_OPEN.md` §3 item 10). Repeat
+a diagonal jump and counts as zero (`docs/STATUS_OPEN.md` §3 item 5). Repeat
 the ten turns once slowly and once as fast as you can spin the wheel by hand:
 the two totals should agree. If the fast spin comes up short, the decode needs
 to move into the interrupt or onto a timer.

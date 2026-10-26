@@ -263,7 +263,7 @@ with its command watchdog already **tripped**, so an unattended board sits at
 zero throttle rather than driving on the first command it hears — but that is a
 safety net, not a substitute for blocks. (The motor enable pins float for the
 instant between reset and the firmware taking them over — `STATUS_OPEN.md` §3
-item 9 — which is one more reason for blocks.)
+item 2 — which is one more reason for blocks.)
 
 **How the chassis gets armed.** It stays tripped until it receives a
 `ChassisCommand` with zero throttle from `rover-control` (`192.168.1.1:7001` —

@@ -372,7 +372,7 @@ drove, and the motors and servo were never commanded.
 |---|---|---|
 | Probes | Both ST-Links identified: sensors `066DFF3932504E3043014542`, chassis `066AFF3932504E3043101915` — the chassis value, previously unconfirmed, is right | `probe-rs list`; the chassis serial flashed the board that then reported its IMU |
 | Chips | Both `DBGMCU_IDCODE = 0x10016451` (F76x/77x), 3.24-3.26 V | OpenOCD, read-only |
-| PHY gate (plan §13.4 item 1) | **Passed on both boards.** `ANAR=0x01e1`, `MODE[2:0]=111` — the healthy strap case, so `STATUS_OPEN.md` §3.1's failure mode did not occur. 100 Mb/s full duplex, zero symbol errors | `defmt` boot log; `BoardDiagnostics` at the base |
+| PHY gate (plan §13.4 item 1) | **Passed on both boards.** `ANAR=0x01e1`, `MODE[2:0]=111` — the healthy strap case, so the `ANAR`/strap failure mode did not occur (§10). 100 Mb/s full duplex, zero symbol errors | `defmt` boot log; `BoardDiagnostics` at the base |
 | POST | Passes on both boards (after the fix in §9.2) | `rover-doctor` |
 | I2C1 on PB8/PB9 (§13.4 item 2) | Confirmed on both boards: LSM6DSV16X answers `id=0x70` on chassis, INA226 reads on sensors | boot log; `Telemetry.power` = 28.5 V / 0.82 A |
 | Encoders (§13.4 item 3) | 4× decode, **~1,396 ticks/rev**; both wheels count **up** when turned forward; no counts at rest | Procedure A, calibration image: 13,960 / 13,962 / 13,963 / 13,969 on one wheel, 13,913 / 13,954 on the other, 10 hand turns each |
@@ -409,6 +409,31 @@ gyro z sign, encoder decode at high wheel speed, IMU rate and latency at the
 estimator, Procedure B, `track_width_m`, the Spresense (no fix, see
 `STATUS_OPEN.md` §9), and anything that moves. `STATUS_OPEN.md` §7 is the
 order to take them in.
+
+---
+
+## 10. Closed — moved from `STATUS_OPEN.md`
+
+What used to be open and no longer is, compacted out of `STATUS_OPEN.md` on
+2026-10-26. Each line points at its evidence.
+
+| Item | Closed by | Evidence |
+|---|---|---|
+| Nothing had ever been flashed | Both boards flashed and running, 2026-10-26 | §9 |
+| **PHY bring-up on F767ZI** (the hard gate, §11 risk; plan §13.4 item 1) | Passed on both boards: 100 Mb/s full duplex, zero symbol errors | §9.1 |
+| `ANAR` / strap gap (`GenericPhy` never writes `ANAR`; a `MODE[2:0]` of `100`/`101` would advertise half duplex) | Did not occur: `ANAR=0x01e1`, `MODE[2:0]=111` on both boards. `ANAR` stays unwritten; plan §13.4a has the reasoning | §9.1 |
+| I2C1 on PB8/PB9 (plan §13.4 item 2) | LSM6DSV16X and INA226 both answer | §9.1 |
+| Encoder sign convention (plan §13.4 item 3) | Both wheels count up turning forward; the sides were swapped, fixed as D8 | §9.1, §9.2 |
+| **Encoder constant wrong after 2×→4×** (§11 risk) | Measured ~1,396 ticks/rev at 4×; the recalled ~1,500 was ~7 % high | §9.1, `HARDWARE.md` §3 |
+| Drivetrain uncalibrated (`0.0` everywhere) | `ticks_per_rev` and `metres_per_tick` set; `rover-doctor` GO. Procedure B still open | §9.1 |
+| **Jetson Python bus drifts from Rust** (§11 risk) | Golden-byte fixtures checked from both languages, both directions | §4 |
+| D1 `PeerId` addressed machines, not processes | `[services]` in `config/rover.toml` | §2 |
+| D2 `GnssFix` could not name its receiver | `GnssSource` / `GnssFix.source` | §2 |
+| D3 Mission monitor navigated on the uncorrected receiver | `select_navigation_fix`, tested | §2 |
+| D6 Camera measurement timestamped after detection | Stamped at capture from the D415's `global_time` clock; `capture_age_us` + `frames_dropped` on the wire; EKF compensates and gates at `lane_max_age_ms`; measured 59 ms median. Re-tune open with D5 | plan §13.3b D6, §9.1 |
+| librealsense queue depth not pinned | `camera.py` drains to the newest frame on every read; drops are counted | plan §13.3b D6 |
+| D7-D10 (vector table, encoder sides, host drops board datagrams, POST races the link) | Fixed on the bench | §9.2 |
+| Toolchain floating on `stable` | `rust-toolchain.toml` pins `1.99.1` | §1 |
 
 ---
 
