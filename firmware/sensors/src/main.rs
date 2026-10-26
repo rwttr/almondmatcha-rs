@@ -84,11 +84,9 @@ async fn main(spawner: Spawner) {
     );
     net::wait_up(stack).await;
 
-    // By the time `wait_config_up` resolves, `Lan8742a::poll_link` has
-    // already run at least once with the link reported up (see
-    // `net::Lan8742a`'s doc comment and `embassy-net`'s own static-config
-    // application, which is gated on link state) — so the PHY address scan
-    // and register reads it does inline have already happened.
+    // `net::wait_up` returns once the link is up and `Lan8742a` has cached a
+    // negotiated speed (or after its timeout) — `wait_config_up` alone does
+    // not wait for the link with a static IP; see `net::wait_up`.
     let phy = net::phy_status();
     post.record(PostBits::PHY_ID, diag::check_phy_id(phy.phy_id));
     post.record(

@@ -42,7 +42,7 @@ use embassy_stm32::eth::{
 use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::{InterruptHandler as RngInterruptHandler, Rng};
 use embassy_stm32::{bind_interrupts, Peri};
-use embassy_time::{Duration, Instant};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use static_cell::StaticCell;
 
 use crate::config::{MAC_ADDR, SELF_IP};
@@ -540,10 +540,40 @@ pub fn init(
 /// Wait for the link and static-IP configuration to come up, then log it.
 /// Since there is no DHCP handshake to wait for, this mostly waits for the
 /// PHY to report a carrier - i.e. the Ethernet cable being plugged in.
+///
+/// With a static IP, `wait_config_up` resolves at once, link or no link, so
+/// it is not enough on its own: POST reads [`phy_status`] right after this
+/// returns. The first bench session (2026-10-26) caught exactly that: POST ran
+/// ~1.7 s before the link negotiated, recorded zeros, and both boards reported
+/// `PHY_ID | LINK` failed for good while the live link was a clean 100 Mb/s
+/// full duplex. So also wait for the link and for `Lan8742a` to have cached a
+/// negotiated speed - bounded, because a board with no cable must still finish
+/// POST (recording the failure) and boot, not hang before its IWDG is started.
 pub async fn wait_up(stack: Stack<'static>) {
     stack.wait_config_up().await;
-    info!("net: link up, ip={}", SELF_IP.octets());
+    let linked = with_timeout(LINK_WAIT, async {
+        stack.wait_link_up().await;
+        while phy_status().link_speed_mbps == 0 {
+            Timer::after_millis(10).await;
+        }
+    })
+    .await
+    .is_ok();
+    if linked {
+        info!("net: link up, ip={}", SELF_IP.octets());
+    } else {
+        warn!(
+            "net: no link after {} ms, ip={} - continuing; POST will record it",
+            LINK_WAIT.as_millis(),
+            SELF_IP.octets()
+        );
+    }
 }
+
+/// Longest [`wait_up`] waits for a negotiated link before POST runs anyway.
+/// Auto-negotiation took ~1.7 s on the bench; 5 s leaves margin without
+/// delaying a cable-less boot much.
+const LINK_WAIT: Duration = Duration::from_secs(5);
 
 /// The one socket bound to `config::SELF_PORT` — inbound commands.
 /// Transmit-only tasks use [`tx_socket!`] instead.
@@ -583,9 +613,14 @@ pub fn make_rx_socket(stack: Stack<'static>) -> UdpSocket<'static> {
 ///
 /// `embassy_net::UdpSocket` is not `Sync`, so tasks cannot share one without
 /// a mutex on the path that would least tolerate waiting. Port 0 lets the
-/// stack choose: nothing ever originates a datagram *to* these sockets, so
-/// their port numbers are irrelevant, and a fixed one would be another
-/// value to keep in step with `config/rover.toml` for no benefit.
+/// stack choose: nothing ever originates a datagram *to* these sockets. The
+/// source port is NOT irrelevant to receivers, though - host links identify
+/// a sender by `ip:port`, and accept this board's ephemeral port only because
+/// it is the sole service at its IP (`rover_link::UdpLink::peer_of`; found on
+/// the 2026-10-26 bench, where every board datagram was being dropped). Do
+/// not give this board's IP a second `[services]` entry. Binding these
+/// sockets to `SELF_PORT` instead would let smoltcp deliver inbound commands
+/// to a transmit-only socket.
 ///
 /// Each use costs one slot in [`SOCKET_COUNT`] — raise it when you add one.
 #[macro_export]

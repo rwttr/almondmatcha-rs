@@ -38,7 +38,7 @@ use embassy_stm32::eth::{
 use embassy_stm32::peripherals::{ETH, ETH_SMA, RNG};
 use embassy_stm32::rng::{InterruptHandler as RngInterruptHandler, Rng};
 use embassy_stm32::{bind_interrupts, Peri};
-use embassy_time::{Duration, Instant};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use static_cell::StaticCell;
 
 use crate::config::{MAC_ADDR, SELF_IP};
@@ -531,10 +531,40 @@ pub fn init(
 }
 
 /// Wait for the link and static-IP configuration to come up, then log it.
+///
+/// With a static IP, `wait_config_up` resolves at once, link or no link, so
+/// it is not enough on its own: POST reads [`phy_status`] right after this
+/// returns. The first bench session (2026-10-26) caught exactly that: POST ran
+/// ~1.7 s before the link negotiated, recorded zeros, and both boards reported
+/// `PHY_ID | LINK` failed for good while the live link was a clean 100 Mb/s
+/// full duplex. So also wait for the link and for `Lan8742a` to have cached a
+/// negotiated speed - bounded, because a board with no cable must still finish
+/// POST (recording the failure) and boot, not hang before its IWDG is started.
 pub async fn wait_up(stack: Stack<'static>) {
     stack.wait_config_up().await;
-    info!("net: link up, ip={}", SELF_IP.octets());
+    let linked = with_timeout(LINK_WAIT, async {
+        stack.wait_link_up().await;
+        while phy_status().link_speed_mbps == 0 {
+            Timer::after_millis(10).await;
+        }
+    })
+    .await
+    .is_ok();
+    if linked {
+        info!("net: link up, ip={}", SELF_IP.octets());
+    } else {
+        warn!(
+            "net: no link after {} ms, ip={} - continuing; POST will record it",
+            LINK_WAIT.as_millis(),
+            SELF_IP.octets()
+        );
+    }
 }
+
+/// Longest [`wait_up`] waits for a negotiated link before POST runs anyway.
+/// Auto-negotiation took ~1.7 s on the bench; 5 s leaves margin without
+/// delaying a cable-less boot much.
+const LINK_WAIT: Duration = Duration::from_secs(5);
 
 /// The one socket bound to `config::SELF_PORT` — used by the link watchdog to
 /// notice inbound traffic from the RPi. Transmit-only tasks use
@@ -562,7 +592,8 @@ pub fn make_rx_socket(stack: Stack<'static>) -> UdpSocket<'static> {
 /// Allocate a transmit-only UDP socket, bound to an ephemeral port. Identical
 /// macro to `firmware/chassis::net::tx_socket!` - see its doc comment for why
 /// this is a macro (each call site needs its own `StaticCell` storage) rather
-/// than a function.
+/// than a function, and why the ephemeral source port only works because this
+/// board is the sole `[services]` entry at its IP.
 ///
 /// Each use costs one slot in [`SOCKET_COUNT`] - raise it when you add one.
 #[macro_export]

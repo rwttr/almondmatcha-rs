@@ -78,14 +78,31 @@ impl UdpLink {
 
     /// Look up which configured peer a datagram's source address belongs to.
     ///
+    /// An exact `ip:port` match first. Failing that, the datagram is
+    /// attributed to the **only** configured peer at its source IP, if there
+    /// is exactly one: the two STM32 boards transmit from ephemeral ports
+    /// (`firmware/*/src/net.rs`'s `tx_socket!` binds port 0, and moving their
+    /// sends onto the service port would let smoltcp hand inbound commands to
+    /// a transmit-only socket), but each is the sole service on its own IP, so
+    /// the IP alone names it. Where several services share an IP — the RPi's
+    /// three processes, the base PC's two — the port is still required, which
+    /// is the whole reason `[services]` maps a process rather than a machine
+    /// (plan §13.3b D1). Found on the first bench session, 2026-10-26: every
+    /// board-originated datagram was being dropped by every host process.
+    ///
     /// A linear scan over a handful of entries (one per [`PeerId`]); a `HashMap<SocketAddr, PeerId>` would
     /// be the "correct" reverse index for a bigger table, but at this size it
     /// would just be a second collection to keep in sync with `peers`.
     fn peer_of(&self, addr: SocketAddr) -> Option<PeerId> {
-        self.peers
-            .iter()
-            .find(|&(_, &a)| a == addr)
-            .map(|(&p, _)| p)
+        if let Some((&p, _)) = self.peers.iter().find(|&(_, &a)| a == addr) {
+            return Some(p);
+        }
+        let mut at_ip = self.peers.iter().filter(|&(_, a)| a.ip() == addr.ip());
+        let (&only, _) = at_ip.next()?;
+        if at_ip.next().is_some() {
+            return None;
+        }
+        Some(only)
     }
 
     /// Shared by [`Link::send`] and [`Link::send_to_addr`]: the MTU check and
@@ -249,6 +266,57 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(seq, Some(3), "frame behind the runt was never returned");
+    }
+
+    /// Poll `link` for up to a second; the peer the first frame came from.
+    fn recv_peer(link: &mut UdpLink) -> Option<PeerId> {
+        for _ in 0..200 {
+            if let Some((peer, _)) = link.recv() {
+                return Some(peer);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    }
+
+    fn imu_frame(buf: &mut [u8]) -> usize {
+        let msg = ImuSample {
+            accel_mps2: [0.0; 3],
+            gyro_radps: [0.0; 3],
+            t_us: 1,
+        };
+        encode_frame(&msg, 1, buf)
+    }
+
+    /// The bench failure: a board sends from an ephemeral port, but it is the
+    /// only service at its IP, so it must still be recognised.
+    #[test]
+    fn sole_peer_at_an_ip_is_recognised_from_any_source_port() {
+        let mut rx = UdpLink::bind(PeerId::Control, "127.0.0.1:0", HashMap::new()).unwrap();
+        // Chassis is configured at 127.0.0.2:7010, but transmits from
+        // whatever port its stack picks.
+        rx.set_peer(PeerId::Chassis, "127.0.0.2:7010".parse().unwrap());
+        let board = UdpSocket::bind("127.0.0.2:0").unwrap();
+        let mut buf = [0u8; rover_msgs::frame::MAX_FRAME_LEN];
+        let n = imu_frame(&mut buf);
+        board.send_to(&buf[..n], rx.local_addr().unwrap()).unwrap();
+        assert_eq!(recv_peer(&mut rx), Some(PeerId::Chassis));
+    }
+
+    /// Where services share an IP (the RPi, the base PC), the port is what
+    /// tells them apart — an unmatched port must not be guessed at.
+    #[test]
+    fn shared_ip_still_requires_the_exact_port() {
+        let mut rx = UdpLink::bind(PeerId::Chassis, "127.0.0.1:0", HashMap::new()).unwrap();
+        rx.set_peer(PeerId::Control, "127.0.0.3:7001".parse().unwrap());
+        rx.set_peer(PeerId::Navigation, "127.0.0.3:7002".parse().unwrap());
+        let stranger = UdpSocket::bind("127.0.0.3:0").unwrap();
+        let mut buf = [0u8; rover_msgs::frame::MAX_FRAME_LEN];
+        let n = imu_frame(&mut buf);
+        stranger
+            .send_to(&buf[..n], rx.local_addr().unwrap())
+            .unwrap();
+        assert_eq!(recv_peer(&mut rx), None);
     }
 
     #[test]
