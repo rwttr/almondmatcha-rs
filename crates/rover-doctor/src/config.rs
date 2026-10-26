@@ -112,10 +112,8 @@ mod tests {
         let cfg = DoctorConfig::load(path).expect("config/rover.toml must parse");
         assert_eq!(cfg.lane_stale_ms, 500);
         assert!(cfg.source.ends_with("config/rover.toml"), "{}", cfg.source);
-        // The real config is genuinely uncalibrated today -- see
-        // `verdict.rs`'s `drivetrain_check` doc comment. If this ever
-        // starts failing because someone calibrated the rover, that is
-        // good news and this assertion should be updated to reflect it.
-        assert_eq!(cfg.drivetrain.metres_per_tick, 0.0);
+        // Calibrated 2026-10-26 (Procedure A + measured diameter), so the
+        // drivetrain check now passes on the shipped config.
+        assert!(cfg.drivetrain.metres_per_tick > 0.0);
     }
 }

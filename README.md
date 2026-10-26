@@ -319,13 +319,15 @@ Docker, no CMake, no mbed.
 
 ## Before this drives
 
-- [ ] **Calibrate the drivetrain.** `ticks_per_rev`, `metres_per_tick` and
-      `track_width_m` are all `0.0`. There is no metric speed in the system
-      until they are measured — `docs/CALIBRATION.md` (plan §2.6 is the
-      reasoning), about twenty minutes with a tape measure. Measure against the **4× decoding** Rust firmware, not the old
-      2× firmware, or every speed reads double.
-- [ ] **Nothing has met silicon** (as of 2026-10-17; the bench session once
-      pencilled in for 2026-09-21 did not happen). The LAN8742A PHY against
+- [x] **Calibrate the drivetrain** (2026-10-26, bench). Procedure A gave
+      `ticks_per_rev = 1396` at 4× decoding; `metres_per_tick = 0.0002813`
+      comes from the measured 0.125 m wheel, not a rolled distance — re-check
+      with Procedure B (`docs/CALIBRATION.md`) once the rover can roll.
+      `track_width_m` is still `0.0`.
+- [ ] **Bench bring-up in progress** (2026-10-26). The sensors board runs
+      and passed its PHY gate, after two firmware fixes the bench found
+      (missing interrupt vector table on both boards; swapped encoder
+      sides). The chassis board is not yet flashed. The LAN8742A PHY against
       Embassy's `GenericPhy` is the hard gate that decides whether any of the
       firmware is real — plan §13.4 lists the rest of the hardware-verification
       debt, and `docs/STATUS_OPEN.md` §3 the checks the 2026-10-17 audit added

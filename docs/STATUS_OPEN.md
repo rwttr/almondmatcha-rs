@@ -25,6 +25,13 @@ them.
 
 ### 1.1 The drivetrain is uncalibrated
 
+> **Mostly resolved 2026-10-26.** Procedure A on the bench: ~1,396 ticks/rev at
+> 4× on both wheels (`docs/HARDWARE.md` §3). `metres_per_tick = 0.0002813` is
+> π × the measured 0.125 m diameter / 1396 — the rover was on a bench rig and
+> could not be rolled, so Procedure B is still owed and remains authoritative.
+> `track_width_m` is still `0.0`. The rest of this section describes the state
+> before that session.
+
 `ticks_per_rev`, `metres_per_tick` and `track_width_m` in `config/rover.toml`
 are all `0.0`. There is **no metric speed anywhere in the system** until they
 are measured. The estimator disables odometry rather than divide by zero, and

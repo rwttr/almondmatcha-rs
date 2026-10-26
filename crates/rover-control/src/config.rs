@@ -552,7 +552,14 @@ mod tests {
                 k_head_deg_per_deg: 2.024,
             })
         );
-        // Shipped standing blocker (docs/STATUS_OPEN.md §1.1): still uncalibrated.
-        assert_eq!(cfg.metres_per_tick, 0.0);
+        // Calibrated 2026-10-26 from Procedure A and the measured wheel
+        // diameter (docs/STATUS_OPEN.md §1.1): the shipped value must agree
+        // with pi * 0.125 m / 1396 ticks, so a typo in either is caught here.
+        let expected = core::f32::consts::PI * 0.125 / 1396.0;
+        assert!(
+            (cfg.metres_per_tick - expected).abs() / expected < 1e-3,
+            "metres_per_tick = {} disagrees with pi*d/ticks_per_rev = {expected}",
+            cfg.metres_per_tick
+        );
     }
 }

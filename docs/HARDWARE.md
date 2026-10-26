@@ -79,8 +79,8 @@ Notes that cost a field session to rediscover:
 | Drive wheel diameter | 0.125 m | measured |
 | Wheelbase | 0.4875 m | measured, carried from the ROS 2 system |
 | Track width | ⚠️ **unmeasured** | `[drivetrain] track_width_m = 0.0` |
-| Encoder ticks/rev | ⚠️ **unmeasured** (expected ~1500, see below) | `[drivetrain] ticks_per_rev = 0.0` |
-| Metres per tick | ⚠️ **unmeasured** (expected ~0.000262) | `[drivetrain] metres_per_tick = 0.0` |
+| Encoder ticks/rev | **1396** (Procedure A, 2026-10-26, see below) | `[drivetrain] ticks_per_rev` |
+| Metres per tick | **0.0002813** — π × diameter / ticks; Procedure B not yet run | `[drivetrain] metres_per_tick` |
 
 **Until those three are measured there is no metric speed anywhere in the
 system.** The step-by-step for both procedures — which ST-Link goes to which

@@ -120,10 +120,14 @@ BoardDiagnostics = ["telemetry", "base", "doctor"]
 # ---------------------------------------------------------------------------
 # Drivetrain
 #
-# ⚠️  NOT YET CALIBRATED. The ROS 2 system had no metric speed anywhere and no
-#     record of encoder counts per revolution. Run both procedures in
-#     docs/CALIBRATION.md before trusting speed_mps — docs/RUST_REWRITE_PLAN.md
-#     §2.6 has the reasoning behind them.
+# Calibrated 2026-10-26 on the bench, from Procedure A plus the measured wheel
+# diameter -- NOT Procedure B. The rover sits on a bench rig with wiring
+# attached, so it could not be rolled; metres_per_tick below is
+# pi * wheel_diameter_m / ticks_per_rev. That omits whatever tyre compression
+# and slip a rolled distance would include (typically a few percent, reading
+# fast). Re-check with Procedure B (docs/CALIBRATION.md) once the rover can
+# roll -- that remains the authoritative number. docs/RUST_REWRITE_PLAN.md
+# §2.6 has the reasoning.
 #
 # ⚠️  `decoding` MUST match the firmware. The mbed firmware attached interrupts
 #     to channel A only (rise + fall), giving 2x counts. This firmware decodes
@@ -134,10 +138,10 @@ BoardDiagnostics = ["telemetry", "base", "doctor"]
 #     §5.4 -- so there is no mode to choose, only the one to calibrate against.)
 # ---------------------------------------------------------------------------
 [drivetrain]
-wheel_diameter_m = 0.125      # measured
+wheel_diameter_m = 0.125      # measured, all wheels (re-measured 2026-10-26)
 decoding         = "quadrature_4x"
-ticks_per_rev    = 0.0        # TODO: docs/CALIBRATION.md Procedure A
-metres_per_tick  = 0.0        # TODO: docs/CALIBRATION.md Procedure B — authoritative
+ticks_per_rev    = 1396.0     # Procedure A, 2026-10-26: 6 runs of 10 turns, both wheels (docs/HARDWARE.md §3)
+metres_per_tick  = 0.0002813  # pi * 0.125 / 1396 -- diameter-derived; Procedure B not yet run
 track_width_m    = 0.0        # TODO: measure; gives a second yaw-rate estimate
 wheelbase_m      = 0.4875     # measured, carried over from the ROS 2 system
 

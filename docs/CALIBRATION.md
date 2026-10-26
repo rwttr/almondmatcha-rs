@@ -190,6 +190,13 @@ feature** — `calibration` only adds a log line, it doesn't touch
 `encoders.rs`'s decode table — so a constant measured on the calibration
 image is valid for the field image with no conversion.
 
+> ⚠️ **Add `--speed 1000` to every `probe-rs` command on this bench**
+> (found 2026-10-26). Both on-board ST-Links run firmware `V2J39M27`, and at
+> probe-rs's default SWD clock the attach times out ("Connecting to the chip
+> was unsuccessful … timeout"); at 1000 kHz (probe-rs settles on 950) it
+> works every time. `--connect-under-reset` does not help. Updating the
+> ST-Link firmware (STSW-LINK007) would probably remove the need.
+
 Build and flash it:
 
 ```sh
@@ -200,7 +207,7 @@ cargo build --release --features calibration
 # VID:PID; the trailing field is the serial from §1. `--features` is a
 # cargo flag, not a probe-rs one: it already did its job at build time, so
 # `probe-rs run` here just takes the resulting ELF and flashes it.
-probe-rs run --chip STM32F767ZITx \
+probe-rs run --chip STM32F767ZITx --speed 1000 \
     --probe 0483:374b:066DFF3932504E3043014542 \
     target/thumbv7em-none-eabihf/release/sensors-fw
 ```
@@ -232,7 +239,7 @@ When you're done, reflash without the feature so the board doesn't carry a
 
 ```sh
 cargo build --release
-probe-rs run --chip STM32F767ZITx \
+probe-rs run --chip STM32F767ZITx --speed 1000 \
     --probe 0483:374b:066DFF3932504E3043014542 \
     target/thumbv7em-none-eabihf/release/sensors-fw
 ```
