@@ -227,7 +227,7 @@ the document now carries a banner saying so.
 `STATUS_DONE.md` is authoritative on what is built and its evidence;
 `STATUS_OPEN.md` on what remains and what to worry about. In short: all
 twelve crates, both firmware images, the perception process and the replay
-gate are done and tested — 434 Rust tests, 122 Python tests, clippy/rustfmt
+gate are done and tested — 438 Rust tests, 124 Python tests, clippy/rustfmt
 clean, toolchain pinned to rustc 1.99.1. Board self-diagnostics landed most recently: both boards run a
 power-on self-test and report it, along with reset cause and Ethernet link
 state, and `rover-doctor` turns that into a preflight GO/NO-GO. None of it

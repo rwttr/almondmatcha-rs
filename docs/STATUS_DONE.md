@@ -35,7 +35,8 @@ The host workspace — 12 crates (`ground-station`, `rover-bus`,
 `rover-model`, `rover-msgs`, `rover-navigation`, `rover-runs`, `rover-tap`,
 `rover-telemetry`) plus `tools/replay`, 13 packages in all — is
 clippy/rustfmt clean, and `cargo test --workspace` passes **434 tests**, 0
-failed. Perception passes **122** Python tests. `testdata/` holds **26**
+failed. Perception passes **122** Python tests. (2026-10-26, after the D6
+fix: **438** and **124** — the 4 Rust and 2 Python tests it added.) `testdata/` holds **26**
 golden wire fixtures: 18 message types, `FrameHeader`, and seven variants.
 Both firmware images build for `thumbv7em-none-eabihf` and pass clippy —
 sizes and **never run on the boards they target** in §2's table. The
@@ -213,7 +214,7 @@ lives in `STATUS_OPEN.md` §6; this is the verdict.
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | `cargo test --workspace` green, fixtures cross-checked against Python | **Met.** 434 Rust tests, 122 Python tests, 26 fixtures — §1, §4. |
+| 1 | `cargo test --workspace` green, fixtures cross-checked against Python | **Met.** 438 Rust tests, 124 Python tests, 26 fixtures — §1, §4. |
 | 2 | `tools/replay` reproduces recorded ROS 2 steering | **Not met — cannot be attempted.** No recorded ROS 2 run ever existed; replay proves internal consistency against a frozen oracle (§2, §3), not field parity. `STATUS_OPEN.md` §1.4. |
 | 3 | Watchdog: Ethernet pulled while driving → ramp-to-zero | **Not met** — never run on hardware. `STATUS_OPEN.md` §1.2. |
 | 4 | IWDG: hung control task → board resets | **Not met** — same. `STATUS_OPEN.md` §1.2. |

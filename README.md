@@ -291,7 +291,7 @@ commit turns the lateral controller into positive feedback.
 
 ```bash
 # Rust workspace — host binaries and tools (13 packages: 12 crates + tools/replay)
-cargo test --workspace                      # 434 tests
+cargo test --workspace                      # 438 tests
 cargo clippy --workspace --all-targets      # clean
 cargo fmt --all --check
 
@@ -305,7 +305,7 @@ cargo build --release -p rover-control      # also: -p rover-navigation,
 # Perception (first time: create the venv the tests expect)
 cd perception
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest tests/ -q        # 122 tests
+.venv/bin/python -m pytest tests/ -q        # 124 tests
 
 # The parity gate — `run` needs a trace; `synthetic` makes one
 cargo run -p replay -- synthetic --out /tmp/trace.csv
@@ -337,10 +337,11 @@ Docker, no CMake, no mbed.
 - [ ] **Re-tune after D5.** The fix is a 3.21× increase in straight-line
       steering authority against gains that have never run with a correctly
       signed heading term. Start slow; `config/rover.toml` has the bracket.
-- [ ] **Camera measurements carry no capture time** (plan §13.3b D6). `t_us` is
-      stamped after lane detection rather than at capture, and the EKF ignores
-      it, so a ~100 ms lag is applied as though it were current — and nothing
-      logs enough to measure it. Take it together with D5's re-tune.
+- [x] **Camera latency compensated** (plan §13.3b D6). Each `LaneMeasurement`
+      carries its capture time and capture-to-publish age; the EKF compares it
+      with its belief at capture time and ignores frames older than
+      `lane_max_age_ms`. `lane_detection.csv` logs the age and dropped
+      frames. Re-tune with it on (`lane_latency_compensation`), alongside D5.
 - [ ] **Replay parity is against synthetic traces only.** No recorded ROS 2
       field data exists in this repository and none ever did, so the gate
       compares against a hand-rolled oracle of the old law rather than the

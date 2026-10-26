@@ -41,10 +41,10 @@ changing it here.
   because the camera and detector were two ROS processes connected by a
   queued topic, so a frame already in flight could go stale before this
   node acted on it. Camera capture and detection now run in the same loop
-  iteration of one process (see `docs/RUST_REWRITE_PLAN.md` §1.1) — there is
-  no queue and nothing for a frame to go stale in. This is a consequence of
-  the architecture change, not a relaxation of the detector's tolerance for
-  bad input.
+  iteration of one process (see `docs/RUST_REWRITE_PLAN.md` §1.1), so that
+  queue is gone. A frame still ages between capture and publish; that age is
+  published with the measurement and judged by the EKF (`main.py`'s module
+  docstring, plan §13.3b D6), not here.
 
 # The two deliberate behaviour changes
 

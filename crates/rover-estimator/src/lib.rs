@@ -91,14 +91,32 @@ pub use config::{EstimatorConfig, LaneNoise, ProcessNoise};
 /// below the time the filter could be trusted to coast on.
 pub const MAX_SAMPLE_GAP_US: u32 = 500_000;
 
+/// Predict steps remembered for latency-compensated camera updates: 640 ms at
+/// the 100 Hz predict rate, comfortably more than any frame young enough to
+/// pass [`EstimatorConfig::lane_max_age_s`].
+pub const LANE_HISTORY_LEN: usize = 64;
+
+/// One predict step's elapsed time and the change it made to the mean.
+#[derive(Debug, Clone, Copy)]
+struct PredictStep {
+    dt_s: f32,
+    dx: StateVector,
+}
+
 /// The filter. Owns its belief (`x`, `P`) and just enough bookkeeping
-/// (previous wheel sample, a one-shot warning flag) to make its updates
-/// well-defined; nothing here touches a clock, a socket, or a file.
+/// (previous wheel sample, recent predict steps, one-shot warning flags) to
+/// make its updates well-defined; nothing here touches a clock, a socket, or
+/// a file.
 #[derive(Debug, Clone)]
 pub struct Ekf {
     x: StateVector,
     p: StateMatrix,
     params: VehicleParams,
+    /// Ring buffer of the most recent predict steps, newest at
+    /// `history_head - 1`. See [`Ekf::state_at_age`].
+    history: [PredictStep; LANE_HISTORY_LEN],
+    history_head: usize,
+    history_len: usize,
     /// Milliseconds since the last *accepted* camera update (a gated or
     /// invalid frame does not reset it — see the module docs). Starts at
     /// `u16::MAX`: before any camera frame has ever been accepted the filter
@@ -128,6 +146,12 @@ impl Ekf {
             x: initial_state,
             p,
             params,
+            history: [PredictStep {
+                dt_s: 0.0,
+                dx: StateVector::zeros(),
+            }; LANE_HISTORY_LEN],
+            history_head: 0,
+            history_len: 0,
             lane_age_ms: u16::MAX,
             last_wheel: None,
             odometry_disabled_warned: false,
@@ -161,8 +185,13 @@ impl Ekf {
         let f_c = process_jacobian(&self.x);
         let f_d = discretize(&f_c, dt_s);
 
-        let dx = process_derivative(&self.x, gyro_radps);
-        self.x += dx * dt_s;
+        let dx = process_derivative(&self.x, gyro_radps) * dt_s;
+        self.x += dx;
+        if dt_s > 0.0 {
+            self.history[self.history_head] = PredictStep { dt_s, dx };
+            self.history_head = (self.history_head + 1) % LANE_HISTORY_LEN;
+            self.history_len = (self.history_len + 1).min(LANE_HISTORY_LEN);
+        }
 
         // Q is a continuous-time spectral density, so it is scaled by dt.
         // The predict step is driven by IMU packet arrival over UDP, not a
@@ -195,6 +224,27 @@ impl Ekf {
     /// stop, no `EkfDebug` emitted (see the module docs). Returns
     /// `Some(EkfDebug)` for every measurement that *was* received, whether
     /// the chi-square gate then accepted it or rejected it as an outlier.
+    ///
+    /// # Measurement age (plan §13.3b D6)
+    ///
+    /// A frame describes the rover `meas.capture_age_us` before it arrived,
+    /// and the caller feeds messages in arrival order, so the filter has
+    /// already predicted roughly that far past the frame. With
+    /// `cfg.lane_latency_compensation`, the innovation is taken against
+    /// [`Self::state_at_age`] — the belief at capture time — and the
+    /// resulting correction is applied to the current state. Comparing a
+    /// ~100 ms-old observation with the current state instead would be a
+    /// systematic phase lag that grows with speed and inflates the NIS on
+    /// exactly the tight curves where the camera matters most.
+    ///
+    /// This is the standard cheap form of a delayed update: the gain comes
+    /// from the current `P`, not one propagated from capture time, so the
+    /// covariance update is slightly optimistic for old frames. At these
+    /// delays (a few predict steps of a slowly varying model) that is far
+    /// smaller than the bias it removes.
+    ///
+    /// A frame older than `cfg.lane_max_age_s` is not used at all: reported
+    /// `gated` with an infinite NIS, `lane_age_ms` keeps growing.
     pub fn correct_camera(
         &mut self,
         meas: &LaneMeasurement,
@@ -203,6 +253,7 @@ impl Ekf {
         if !meas.valid {
             return None;
         }
+        let age_s = meas.capture_age_us as f32 * 1e-6;
         let l_a = self.params.lookahead_m;
         let l_a2 = l_a * l_a;
 
@@ -219,7 +270,21 @@ impl Ekf {
             meas.heading_err_rad,
             meas.curvature_inv_m,
         );
-        let y = z - h * self.x;
+
+        if age_s > cfg.lane_max_age_s {
+            let y = z - h * self.x;
+            return Some(EkfDebug {
+                innovation: [y[0], y[1], y[2]],
+                nis: f32::INFINITY,
+                gated: true,
+            });
+        }
+        let x_at_capture = if cfg.lane_latency_compensation {
+            self.state_at_age(age_s)
+        } else {
+            self.x
+        };
+        let y = z - h * x_at_capture;
 
         let r = SMatrix::<f32, 3, 3>::from_diagonal(&SVector::<f32, 3>::new(
             cfg.r_lane.cross_track,
@@ -272,6 +337,34 @@ impl Ekf {
             nis,
             gated,
         })
+    }
+
+    /// The filter's belief `age_s` ago: the current mean with the most recent
+    /// predict steps' increments taken back off, the oldest one pro rata.
+    ///
+    /// Only *predict* increments are undone. A correction applied since then
+    /// is information the filter has gained about the past too, so it stays
+    /// in — which is also what stops two overlapping late frames from
+    /// correcting the same error twice. Past the recorded history (just after
+    /// startup) this returns the oldest belief it can reconstruct.
+    pub fn state_at_age(&self, age_s: f32) -> StateVector {
+        let mut x = self.x;
+        let mut remaining = age_s;
+        for i in 0..self.history_len {
+            if remaining <= 0.0 {
+                break;
+            }
+            let idx = (self.history_head + LANE_HISTORY_LEN - 1 - i) % LANE_HISTORY_LEN;
+            let step = self.history[idx];
+            if remaining >= step.dt_s {
+                x -= step.dx;
+                remaining -= step.dt_s;
+            } else {
+                x -= step.dx * (remaining / step.dt_s);
+                remaining = 0.0;
+            }
+        }
+        x
     }
 
     /// Wheel-tick correction, at the 10 Hz `WheelSensors` rate.

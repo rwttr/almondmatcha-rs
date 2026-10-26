@@ -102,6 +102,8 @@ macro_rules! all_types {
             cross_track_m: 0.142,
             valid: true,
             t_us: 314_159,
+            capture_age_us: 87_654,
+            frames_dropped: 3,
         });
         $mac!(RoverState {
             cross_track_m: 0.0731,
@@ -341,6 +343,8 @@ fn variant_bytes_match_committed_fixtures() {
             cross_track_m: 0.0,
             valid: false,
             t_us: 271_828,
+            capture_age_us: 41_421,
+            frames_dropped: 0,
         },
     );
 }

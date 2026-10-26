@@ -155,6 +155,8 @@ impl AppConfig {
             nis_gate: raw.estimator.nis_gate,
             metres_per_tick: raw.drivetrain.metres_per_tick,
             zero_rate_max_ticks: raw.estimator.zero_rate_max_ticks,
+            lane_max_age_s: raw.estimator.lane_max_age_ms / 1000.0,
+            lane_latency_compensation: raw.estimator.lane_latency_compensation,
         };
 
         let cfg = Self {
@@ -224,6 +226,20 @@ impl AppConfig {
         non_negative("speed.sensor_timeout_s", self.speed.sensor_timeout_s)?;
         positive("drivetrain.wheelbase_m", self.vehicle.wheelbase_m)?;
         non_negative("drivetrain.metres_per_tick", self.metres_per_tick)?;
+        positive("estimator.lane_max_age_ms", self.estimator.lane_max_age_s)?;
+        // The filter can only look back as far as it remembers predict steps;
+        // a frame accepted beyond that would be compared with the wrong past.
+        let history_s = rover_estimator::LANE_HISTORY_LEN as f32 / self.predict_hz;
+        if self.estimator.lane_max_age_s > history_s {
+            return Err(ConfigError::Invalid(format!(
+                "estimator.lane_max_age_ms = {} exceeds the {:.0} ms of predict history the \
+                 filter keeps ({} steps at predict_hz = {})",
+                self.estimator.lane_max_age_s * 1000.0,
+                history_s * 1000.0,
+                rover_estimator::LANE_HISTORY_LEN,
+                self.predict_hz
+            )));
+        }
         Ok(())
     }
 }
@@ -304,6 +320,8 @@ struct RawEstimator {
     nis_gate: f32,
     #[serde(default)]
     zero_rate_max_ticks: i32,
+    lane_max_age_ms: f32,
+    lane_latency_compensation: bool,
     q: RawQ,
     r: RawR,
 }
@@ -425,6 +443,8 @@ mod tests {
         lane_stale_ms = 500
         use_magnetometer = false
         zero_rate_max_ticks = 0
+        lane_max_age_ms = 250
+        lane_latency_compensation = true
 
         [estimator.q]
         cross_track = 1e-2

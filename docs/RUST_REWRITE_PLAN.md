@@ -1087,10 +1087,10 @@ passing tests). **D4 is half-implemented**: perception's `--csv` flag is off by
 default as decided, but the base station only half-follows that decision — see
 D4.
 
-**D5's sign is fixed; D5's gain re-tune and D6 are open**, deferred for the same
-reason: each changes closed-loop behaviour against gains tuned around the
-current behaviour, so neither should be taken without a re-tune on hardware.
-They should be taken together.
+**D5's sign is fixed, and so is D6 (2026-10-26); the re-tune is open.** Both
+change closed-loop behaviour against gains tuned around the old behaviour, so
+the gains need a re-tune on hardware with both in place — D6's compensation
+can be switched off (`lane_latency_compensation`) to compare.
 
 **D5 was the only one that could make the rover steer the wrong way**, which is
 why its sign was settled before anything is flashed (the detector now negates
@@ -1372,6 +1372,34 @@ behaviour-neutral, and would at least turn the estimates above into numbers.
 `camera.py` never sets the librealsense frame-queue depth explicitly, so
 whether a slow detector drops frames or accumulates latency rests on a library
 default this code does not pin. Worth pinning deliberately when D6 is taken.
+
+##### Fixed — 2026-10-26
+
+Both halves, plus the queue depth:
+
+- **Measurement.** `LaneMeasurement` gained `capture_age_us: u32` and
+  `frames_dropped: u16` (17 → 23 bytes; both lane fixtures regenerated).
+  `t_us` is now the capture time. `camera.py` maps the D415's
+  `global_time`/`system_time` frame timestamp onto `time.monotonic_ns()`,
+  falling back to frame arrival (logged once) in `hardware_clock`; the age is
+  measured after detection on the same clock, so the RPi needs no clock sync.
+  The video backend stamps at read, so a replay's age is detection time.
+- **Compensation.** `rover-control` drains inbound messages in arrival order,
+  so when a frame is processed the filter has predicted to roughly its
+  arrival. `Ekf` keeps the last `LANE_HISTORY_LEN` (64) predict increments;
+  `state_at_age` subtracts them to recover its belief at capture time, and
+  the innovation is taken against that. Corrections since then are kept, so
+  overlapping late frames do not correct the same error twice. The gain uses
+  the current `P` — the usual cheap delayed update, slightly optimistic for
+  old frames. Frames older than `[estimator] lane_max_age_ms` (250) are gated
+  with infinite NIS. `lane_latency_compensation = false` restores the old
+  behaviour for A/B comparison.
+- **Queue depth.** The D415 backend drains librealsense's queue to the newest
+  frame on every read; skipped frames show up in `frames_dropped`.
+
+`tools/replay` sends every frame with age 0, where compensation is a no-op,
+so the parity gate is unaffected. Still unverified on hardware: the D415
+timestamp domain, and the real size of the lag.
 
 ### 13.4 Hardware-verification debt
 

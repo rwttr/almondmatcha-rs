@@ -141,6 +141,8 @@ mod tests {
             nis_gate: 11.34,
             zero_rate_max_ticks: 0,
             metres_per_tick: 0.0,
+            lane_max_age_s: 0.25,
+            lane_latency_compensation: true,
         }
     }
 
@@ -226,6 +228,8 @@ mod tests {
             cross_track_m: 0.02,
             valid: true,
             t_us: 10_000,
+            capture_age_us: 0,
+            frames_dropped: 0,
         });
         assert!(dbg.is_some());
 

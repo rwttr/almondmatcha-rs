@@ -635,12 +635,26 @@ pub struct LaneMeasurement {
     /// False when the detector found no usable lane this frame. The estimator
     /// skips its camera update and coasts; it does not hold the last value.
     pub valid: bool,
+    /// When the frame was **captured**, on the Jetson's own free-running
+    /// microsecond clock (wraps like every other `t_us`). Only deltas within
+    /// this one stream mean anything; the RPi cannot compare it with its own
+    /// clock — that is what `capture_age_us` is for.
     pub t_us: u32,
+    /// Capture-to-publish time for this frame, microseconds: sensor readout,
+    /// USB, any wait in the capture queue, and lane detection. Measured on
+    /// one clock (the Jetson's), so it needs no clock sync to use: the
+    /// receiver treats the frame as describing the rover this long before it
+    /// arrived. Plan §13.3b D6.
+    pub capture_age_us: u32,
+    /// Camera frames that were captured but never detected on since the
+    /// previous `LaneMeasurement` — the detector falling behind the sensor.
+    /// Saturates.
+    pub frames_dropped: u16,
 }
 
 impl Wire for LaneMeasurement {
     const TYPE_ID: u16 = 0x0501;
-    const WIRE_LEN: usize = 17;
+    const WIRE_LEN: usize = 23;
     const NAME: &'static str = "LaneMeasurement";
 
     fn encode(&self, buf: &mut [u8]) -> usize {
@@ -650,6 +664,8 @@ impl Wire for LaneMeasurement {
         w.f32(self.cross_track_m);
         w.bool(self.valid);
         w.u32(self.t_us);
+        w.u32(self.capture_age_us);
+        w.u16(self.frames_dropped);
         w.len()
     }
 
@@ -662,6 +678,8 @@ impl Wire for LaneMeasurement {
             cross_track_m: r.f32(),
             valid: r.bool(),
             t_us: r.u32(),
+            capture_age_us: r.u32(),
+            frames_dropped: r.u16(),
         })
     }
 }

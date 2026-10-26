@@ -262,6 +262,20 @@ use_magnetometer      = false  # see §2.5 — motors distort it under load
 # how long the rover can coast on a lost lane.
 zero_rate_max_ticks = 0
 
+# Camera latency (plan §13.3b D6). Every LaneMeasurement carries its own
+# capture-to-publish age, measured on the Jetson; the EKF compares it with
+# where it believed the rover was at capture time rather than now. Expected
+# age is ~70-110 ms (D415 readout + USB + detection) -- lane_detection.csv's
+# capture_age_ms column is the measured figure.
+#   lane_max_age_ms: frames older than this are ignored (reported gated). Must
+#     fit inside the 64 predict steps of history the filter keeps (640 ms at
+#     predict_hz = 100). Well under lane_stale_ms, which is about a camera that
+#     has gone quiet, not one that is late.
+#   lane_latency_compensation: false treats every frame as current, as before
+#     D6 was fixed -- kept for A/B comparison during the D5/D6 re-tune.
+lane_max_age_ms           = 250
+lane_latency_compensation = true
+
 # Process noise, as a continuous-time spectral density PER SECOND.
 # The filter applies P += Q*dt, not P += Q, because predict is driven by IMU
 # packet arrival rather than a hardware timer: dt jitters, and a dropped packet

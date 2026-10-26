@@ -244,7 +244,7 @@ Narratives live in `RUST_REWRITE_PLAN.md` §13.3b. Status only:
 | D3 | Mission monitor navigated on the uncorrected receiver | **Done** — `select_navigation_fix`, tested |
 | D4 | Base-station CSV contradicts `CSV_LOGGING.md` | **Half implemented.** Perception's `--csv` is opt-in as decided. `ground-station` creates its run directory lazily, so a base that receives nothing leaves nothing — but any run that receives anything logs, with no flag to decline. (Plan §13.3b's intro lists D1-D3 as implemented and D4 as the half-implemented one; this table agrees.) |
 | D5 | `heading_err_rad`'s sign disagreed with its consumer | **Sign fixed; re-tune outstanding.** §1.3 |
-| D6 | Camera measurement timestamped after detection | **Open.** §5.1 |
+| D6 | Camera measurement timestamped after detection | **Fixed 2026-10-26; re-tune with D5.** §5.1 |
 
 ---
 
@@ -252,21 +252,25 @@ Narratives live in `RUST_REWRITE_PLAN.md` §13.3b. Status only:
 
 ### 5.1 D6 — the camera pipeline's latency is invisible
 
-Plan §13.3b D6 has the full write-up. `perception` stamps `t_us` *after* lane
-detection returns rather than at capture, discarding the D415's hardware
-timestamp, and `correct_lane` ignores `t_us` entirely — so the EKF treats a
-~100 ms-old observation as current.
+**Fixed 2026-10-26** (plan §13.3b D6 has the original write-up and the fix).
+`perception` now stamps `t_us` at capture — from the D415's own timestamp when
+its domain is host-comparable — and publishes `capture_age_us` (capture to
+publish, one clock, no sync needed) and `frames_dropped` with every
+`LaneMeasurement`. `Ekf::correct_camera` takes the innovation against its
+belief at capture time and ignores frames older than `lane_max_age_ms`.
+`lane_detection.csv` logs both new figures, so the lag is now measurable from
+a field run.
 
-Not a staleness problem (`lane_stale_ms` is 500 ms; nothing trips). It is
-phase lag in a closed loop, it grows with speed, and it can push innovations
-into the `nis_gate = 11.34` rejection region in the tight curves where the
-camera matters most.
+**Still open, and hardware-only:**
 
-**The part that should bother you: none of it is measurable from a field log.**
-`achieved_fps` is loop rate, not latency; there is no dropped-frame counter and
-no capture-to-publish figure. The ~100 ms is reasoned from `HARDWARE.md` §7's
-ROS 2 baseline, not measured on this stack. Adding the measurement half alone
-is behaviour-neutral; the compensation half belongs with the D5 re-tune.
+- The ~100 ms is still reasoning, not a measurement. The first run with
+  `--csv` replaces it with `capture_age_ms`.
+- The D415 timestamp mapping (`camera.py`'s `_capture_ns`) is unverified on
+  hardware. If the camera reports `hardware_clock`, perception logs that it
+  fell back to arrival time and reported ages are underestimates.
+- Compensation changes closed-loop behaviour, so it belongs in the D5
+  re-tune. `lane_latency_compensation = false` restores the old behaviour for
+  an A/B comparison.
 
 ### 5.2 Merging camera and lane detection was right — and was a trade
 
@@ -284,9 +288,10 @@ Probably still a large net win, since `wait_for_frames` usually returns an
 already-queued frame rather than blocking. **But end-to-end latency has never
 been measured on this stack** — reasoning, not a result.
 
-Related: `camera.py` never pins the librealsense frame-queue depth, so whether
-a slow detector drops frames or accumulates latency rests on a library default
-this code does not set.
+Related, and closed with D6: `camera.py` now drains librealsense's queue to
+the newest frame on every read, so a slow detector drops frames (counted in
+`frames_dropped`) rather than accumulating latency, whatever the library's
+default queue depth.
 
 ---
 

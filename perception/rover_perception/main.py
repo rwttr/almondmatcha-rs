@@ -48,8 +48,12 @@ plumbing around it.
   queued DDS topic, so a frame already in flight when something hiccuped
   could go stale before the detector acted on it. Camera capture and
   detection are now one loop iteration of one process (see `lane.py`'s
-  module docstring) -- there is no queue, and therefore nothing for a frame
-  to go stale *in*. A `None` from `camera.read()` here means either "no
+  module docstring), so that DDS queue is gone -- but a frame is still tens
+  of milliseconds old by the time detection finishes. Rather than drop
+  frames here against a threshold, each measurement carries its
+  `capture_age_us` and the RPi's EKF, which knows where the rover has been
+  since, decides what to do with it (plan §13.3b D6; `[estimator]
+  lane_max_age_ms`). A `None` from `camera.read()` here means either "no
   frame is available yet" (a D415 grab timeout -- try again) or "this
   source is exhausted or gone" (a non-looping video's end, or a D415 that
   dropped off USB) -- see `_MAX_CONSECUTIVE_NONE` below for how this loop
@@ -119,7 +123,16 @@ _REOPEN_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0)
 # on every frame would otherwise write ~30 tracebacks a second.
 _FRAME_ERROR_LOG_INTERVAL_S = 5.0
 
-_CSV_COLUMNS = ("timestamp", "curvature", "theta", "b", "detected", "fps")
+# The last two are new on branch `rs` (plan §13.3b D6), appended so the
+# ROS 2-era columns keep their positions.
+_CSV_COLUMNS = (
+    "timestamp", "curvature", "theta", "b", "detected", "fps",
+    "capture_age_ms", "frames_dropped",
+)
+
+# u32 microseconds / u16 frames on the wire; both saturate rather than wrap.
+_U32_MAX = 0xFFFFFFFF
+_U16_MAX = 0xFFFF
 
 # Sentinel telling the CSV writer thread to stop. `None` specifically (not
 # an arbitrary object()) per the porting brief -- there is nothing else that
@@ -171,11 +184,16 @@ class _CsvLogger:
         b_m: float,
         detected: bool,
         fps: float,
+        capture_age_ms: float,
+        frames_dropped: int,
     ) -> None:
         """Enqueue one row. Non-blocking -- `Queue.put` with no bound never
         waits, which is the entire point: a slow writer thread must fall
         behind in its own queue, not in this call."""
-        self._queue.put((timestamp, curvature_inv_m, theta_deg, b_m, detected, fps))
+        self._queue.put(
+            (timestamp, curvature_inv_m, theta_deg, b_m, detected, fps,
+             capture_age_ms, frames_dropped)
+        )
 
     def _run(self) -> None:
         file = None
@@ -349,6 +367,9 @@ def run(args: argparse.Namespace) -> int:
 
     frame_count = 0
     consecutive_none = 0
+    # Frames captured since the last published measurement that produced
+    # none: skipped by the camera backend, or lost to a per-frame exception.
+    pending_dropped = 0
     last_heartbeat = 0.0
     frame_errors = _RateLimitedErrorLog()
     exit_code = 0
@@ -356,13 +377,13 @@ def run(args: argparse.Namespace) -> int:
     try:
         while not shutdown:
             try:
-                frame = camera.read()
+                captured = camera.read()
             except Exception:
                 # A backend raising mid-stream (pyrealsense2 on a USB drop)
                 # is the same event as a dead source: count it as a miss.
                 frame_errors.log("camera.read() raised")
-                frame = None
-            if frame is None:
+                captured = None
+            if captured is None:
                 consecutive_none += 1
                 if consecutive_none >= _MAX_CONSECUTIVE_NONE:
                     if args.video and args.no_loop:
@@ -393,29 +414,43 @@ def run(args: argparse.Namespace) -> int:
                 time.sleep(0.01)
                 continue
             consecutive_none = 0
+            pending_dropped += captured.frames_dropped
 
             # One bad frame (a detector exception, a publish/pack error)
             # must not kill the process: log (rate-limited) and carry on with
             # the next frame.
+            published = False
             try:
-                result = detector.detect(frame)
+                result = detector.detect(captured.image)
 
-                # Free-running, wrapping u32 microsecond counter local to this
-                # publisher -- see wire.py's LaneMeasurement and the porting
-                # brief: consumers only ever take deltas within one publisher's
-                # own stream, so the epoch is arbitrary, but it must monotonic
-                # and must WRAP (not reset to 0) when it overflows, which is
-                # exactly what `& 0xFFFFFFFF` on an ever-increasing counter
-                # does.
-                t_us = time.monotonic_ns() // 1000 & 0xFFFFFFFF
+                # Free-running, wrapping u32 microsecond counters local to
+                # this publisher -- see wire.py's LaneMeasurement: consumers
+                # only ever take deltas within one publisher's own stream, so
+                # the epoch is arbitrary, but it must be monotonic and must
+                # WRAP (not reset to 0) when it overflows, which is exactly
+                # what `& 0xFFFFFFFF` on an ever-increasing counter does.
+                #
+                # `t_us` is the CAPTURE time, and the age is measured here,
+                # after detection, on the same clock -- so the receiver can
+                # place the frame in its own past without a shared clock.
+                # Stamping after detection, as an earlier version did, erased
+                # the whole capture-plus-detect latency (plan §13.3b D6).
+                capture_age_us = min(
+                    max(0, (time.monotonic_ns() - captured.capture_ns) // 1000), _U32_MAX
+                )
                 msg = LaneMeasurement(
                     curvature_inv_m=result.curvature_inv_m,
                     heading_err_rad=result.heading_err_rad,
                     cross_track_m=result.cross_track_m,
                     valid=result.valid,
-                    t_us=t_us,
+                    t_us=captured.capture_ns // 1000 & _U32_MAX,
+                    capture_age_us=capture_age_us,
+                    frames_dropped=min(pending_dropped, _U16_MAX),
                 )
                 bus.publish(msg)
+                published = True
+                dropped_in_msg = pending_dropped
+                pending_dropped = 0
 
                 achieved_fps = fps_counter.tick()
                 frame_count += 1
@@ -428,9 +463,15 @@ def run(args: argparse.Namespace) -> int:
                         result.cross_track_m,
                         result.valid,
                         achieved_fps,
+                        capture_age_us / 1000.0,
+                        dropped_in_msg,
                     )
             except Exception:
                 frame_errors.log("per-frame detect/publish failed; skipping frame")
+                # A frame that never reached the wire is a dropped frame too;
+                # one that did (and only CSV logging failed) is not.
+                if not published:
+                    pending_dropped += 1
                 continue
 
             now = time.monotonic()

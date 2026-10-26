@@ -319,7 +319,7 @@ class GnssFix:
 # 0x05xx -- perception (the type this process actually emits)
 # ===========================================================================
 
-_LANE_MEASUREMENT_STRUCT = struct.Struct("<fff?I")
+_LANE_MEASUREMENT_STRUCT = struct.Struct("<fff?IIH")
 
 
 @dataclass(frozen=True)
@@ -331,25 +331,29 @@ class LaneMeasurement:
     where the physics lives."""
 
     TYPE_ID: ClassVar[int] = 0x0501
-    WIRE_LEN: ClassVar[int] = 17
+    WIRE_LEN: ClassVar[int] = 23
     NAME: ClassVar[str] = "LaneMeasurement"
 
     curvature_inv_m: float
     heading_err_rad: float
     cross_track_m: float
     valid: bool
+    # Capture time on this process's monotonic clock, not publish time.
     t_us: int
+    # Capture-to-publish, so the RPi can age the frame without a shared clock.
+    capture_age_us: int
+    frames_dropped: int
 
     def encode(self) -> bytes:
         return _LANE_MEASUREMENT_STRUCT.pack(
             self.curvature_inv_m, self.heading_err_rad, self.cross_track_m, self.valid, self.t_us,
+            self.capture_age_us, self.frames_dropped,
         )
 
     @classmethod
     def decode(cls, buf: bytes) -> "LaneMeasurement":
         _check_len(buf, cls.WIRE_LEN, cls.NAME)
-        curvature, heading, cross_track, valid, t_us = _LANE_MEASUREMENT_STRUCT.unpack_from(buf, 0)
-        return cls(curvature, heading, cross_track, valid, t_us)
+        return cls(*_LANE_MEASUREMENT_STRUCT.unpack_from(buf, 0))
 
 
 # ===========================================================================

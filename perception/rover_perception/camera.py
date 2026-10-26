@@ -7,8 +7,20 @@ via `CvBridge`, and publish it on a QoS-`BEST_EFFORT` topic for
 `lane_detection_node` to subscribe to. See `rover_perception/__init__.py` and
 `lane.py`'s module docstring for why that hop is gone: camera and detector are
 now one loop iteration of one process (`main.py`), so this module's only job
-is `read() -> Optional[np.ndarray]` (BGR) — a plain blocking call, no
-publisher, no timer callback, no `rclpy`.
+is `read() -> Optional[CapturedFrame]` (BGR, plus when it was captured) — a
+plain blocking call, no publisher, no timer callback, no `rclpy`.
+
+# Capture time, and always the newest frame
+
+Merging the nodes removed the DDS queue, not the latency: a frame is still
+some tens of milliseconds old by the time the detector finishes with it
+(plan §13.3b D6). So every frame carries `capture_ns`, the moment it was
+captured on this process's `time.monotonic_ns()` clock, and `main.py`
+publishes the capture-to-publish age with each measurement.
+
+The D415 backend also drains librealsense's frame queue down to its newest
+frame on every read. Without that, how stale a frame a slow detector gets
+handed would rest on a library default queue depth this code never set.
 
 # Two backends, one interface
 
@@ -106,6 +118,21 @@ class CameraConfig:
     fallback_video: str = ""
 
 
+@dataclass(frozen=True)
+class CapturedFrame:
+    """One BGR frame and what is known about when it was taken."""
+
+    image: np.ndarray
+    # `time.monotonic_ns()` at capture: the D415's own frame timestamp mapped
+    # onto this clock when it is in a host-comparable domain, else the
+    # moment librealsense handed the frame over (later than true capture by
+    # readout + USB, so the age `main.py` reports is then an underestimate).
+    capture_ns: int
+    # Frames the source produced since the previous read that no read ever
+    # returned -- the detector falling behind the sensor.
+    frames_dropped: int
+
+
 class Camera:
     """A blocking BGR frame source, backed by either a RealSense D415 or a
     video file. `read()` returns `None` on end-of-stream (non-looping video)
@@ -142,8 +169,8 @@ class Camera:
             fallback_config = dataclasses.replace(config, video_path=config.fallback_video)
             return _VideoBackend(fallback_config)
 
-    def read(self) -> Optional[np.ndarray]:
-        """The next BGR frame, or `None` if none is available right now
+    def read(self) -> Optional[CapturedFrame]:
+        """The newest BGR frame, or `None` if none is available right now
         (see class docstring)."""
         return self._backend.read()
 
@@ -173,7 +200,7 @@ class Camera:
 # Not a formal ABC -- there are exactly two implementations, both private to
 # this module, and `Camera` is the only caller. A `typing.Protocol` would add
 # a name with no behaviour of its own; this comment is the interface
-# documentation instead: `read() -> Optional[np.ndarray]`, `fps: float`,
+# documentation instead: `read() -> Optional[CapturedFrame]`, `fps: float`,
 # `close() -> None`.
 
 
@@ -199,7 +226,7 @@ class _VideoBackend:
             # into the rolling-FPS-vs-configured-rate comparison in main.py.
             self.fps = file_fps if file_fps > 1e-3 else 30.0
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> Optional[CapturedFrame]:
         ok, frame = self._cap.read()
         if not ok:
             if not self._loop:
@@ -215,7 +242,9 @@ class _VideoBackend:
 
         if frame.shape[1] != self._width or frame.shape[0] != self._height:
             frame = cv2.resize(frame, (self._width, self._height))
-        return frame
+        # A file has no capture time; "now" makes the reported age the
+        # detector's own processing time, which is the part a replay measures.
+        return CapturedFrame(frame, time.monotonic_ns(), 0)
 
     def close(self) -> None:
         self._cap.release()
@@ -257,6 +286,8 @@ class _RealSenseBackend:
             self._load_advanced_mode_json(profile, rs_config, config.json_config_path)
 
         self.fps = float(fps)
+        self._last_frame_number: Optional[int] = None
+        self._stamp_source_logged = False
 
     def _load_advanced_mode_json(self, profile, rs_config, json_path: str) -> None:
         """Push a RealSense advanced-mode JSON (exposure/gain/etc. presets)
@@ -283,7 +314,7 @@ class _RealSenseBackend:
         with open(json_path, "r") as f:
             adv.load_json(f.read())
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> Optional[CapturedFrame]:
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=100)
         except RuntimeError:
@@ -292,10 +323,31 @@ class _RealSenseBackend:
             # level and must not crash the capture loop -- treated exactly
             # like the non-looping video backend's end-of-stream `None`.
             return None
+        arrived_ns = time.monotonic_ns()
+        arrived_wall_ms = time.time() * 1000.0
+
+        # If the detector fell behind, older frames are queued ahead of the
+        # newest one. Skip to the newest: an old frame is worse than none.
+        # The skipped ones are counted below, via the frame-number gap.
+        while True:
+            newer = self._pipeline.poll_for_frames()
+            if not newer:
+                break
+            frames = newer
+            arrived_ns = time.monotonic_ns()
+            arrived_wall_ms = time.time() * 1000.0
 
         color = frames.get_color_frame()
         if not color:
             return None
+
+        number = color.get_frame_number()
+        dropped = 0
+        if self._last_frame_number is not None:
+            dropped = max(0, number - self._last_frame_number - 1)
+        self._last_frame_number = number
+
+        capture_ns = self._capture_ns(color, arrived_ns, arrived_wall_ms)
         # `.copy()`, not a bare `np.asanyarray(...)`: `get_data()` exposes
         # the frame's own internal buffer through the Python buffer
         # protocol, valid only while `color`/`frames` stay alive. Both go
@@ -303,7 +355,41 @@ class _RealSenseBackend:
         # frame pool) the moment this function returns, so the caller must
         # not be handed a view onto memory this function no longer holds a
         # reference to.
-        return np.asanyarray(color.get_data()).copy()
+        image = np.asanyarray(color.get_data()).copy()
+        return CapturedFrame(image, capture_ns, dropped)
+
+    # Above this the D415 timestamp is treated as nonsense (a clock step on
+    # the host, a domain mapping not yet converged) rather than a real age.
+    _MAX_PLAUSIBLE_AGE_MS = 500.0
+
+    def _capture_ns(self, color, arrived_ns: int, arrived_wall_ms: float) -> int:
+        """Map the frame's sensor timestamp onto `time.monotonic_ns()`.
+
+        UNVERIFIED ON HARDWARE. In the `global_time` domain (the D400 default)
+        and `system_time`, `get_timestamp()` is milliseconds on the host's
+        wall clock, so `arrived_wall_ms - timestamp` is how long ago the
+        frame was taken, and subtracting that from `arrived_ns` lands it on
+        the monotonic clock without ever comparing the two clocks directly.
+        In `hardware_clock` the timestamp is the camera's own counter and says
+        nothing comparable; fall back to arrival time.
+        """
+        domain = color.get_frame_timestamp_domain()
+        source = "arrival"
+        capture_ns = arrived_ns
+        if domain in (rs.timestamp_domain.global_time, rs.timestamp_domain.system_time):
+            age_ms = arrived_wall_ms - color.get_timestamp()
+            if 0.0 <= age_ms <= self._MAX_PLAUSIBLE_AGE_MS:
+                source = "sensor"
+                capture_ns = arrived_ns - int(age_ms * 1_000_000)
+        if not self._stamp_source_logged:
+            logger.info(
+                "D415 timestamp domain %s: stamping frames from %s time%s",
+                domain,
+                source,
+                "" if source == "sensor" else " (reported ages will be underestimates)",
+            )
+            self._stamp_source_logged = True
+        return capture_ns
 
     def close(self) -> None:
         self._pipeline.stop()

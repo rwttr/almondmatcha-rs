@@ -22,7 +22,7 @@ data as a ROS 2 one, they're paired here; where it doesn't, that's noted too:
 | `chassis_imu.csv` | *(none — `ImuSample` routes only to `control`; raw IMU isn't captured)* |
 | `chassis_cmd.csv` | *(none — motor commands aren't logged on this branch)* |
 | — | `rover_state.csv`, `chassis_status.csv`, `board_diagnostics.csv` — new on `rs`, no ROS 2 equivalent |
-| *(Jetson)* `ws_jetson_lane_detection_TIMESTAMP.csv` | `lane_detection.csv` in the Jetson's own `run_NNN_<stamp>/` — written by `perception` when `--csv` is given (the launch script passes it) |
+| *(Jetson)* `ws_jetson_lane_detection_TIMESTAMP.csv` | `lane_detection.csv` in the Jetson's own `run_NNN_<stamp>/` — written by `perception` when `--csv` is given (the launch script passes it). The six columns below plus `capture_age_ms` and `frames_dropped` (plan §13.3b D6) |
 | *(base)* none — the base was display-only | `ground_station_telemetry.csv` — new on `rs`; header `Timestamp_us,Seq,Rtk_Lat,Rtk_Lon,Rtk_Fix,Rtk_Sats,Backup_Lat,Backup_Lon,Backup_Fix,Speed_mps,Mission_State,Mission_Active,Distance_Remaining_m,Bus_Volts,Current_A,Last_Cmd_Session,Last_Cmd_Seq,Health_Bits` |
 
 **`speed_loop_debug.csv` header on `rs`:**

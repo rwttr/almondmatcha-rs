@@ -26,6 +26,8 @@ fn cfg(metres_per_tick: f32) -> EstimatorConfig {
         nis_gate: 11.34,
         zero_rate_max_ticks: 0,
         metres_per_tick,
+        lane_max_age_s: 0.25,
+        lane_latency_compensation: true,
     }
 }
 
@@ -41,6 +43,8 @@ fn lane_measurement(
         cross_track_m,
         valid: true,
         t_us,
+        capture_age_us: 0,
+        frames_dropped: 0,
     }
 }
 
@@ -573,4 +577,86 @@ fn wheel_t_us_discontinuity_is_skipped_and_reanchors() {
     // * 1 mm / 0.1 s = 0.2 m/s measured -> speed moves toward it.
     ekf.correct_wheel_sensors(&w(120, 4_100_000), 0.5, 0.0, &cfg);
     assert!(ekf.state().speed_mps > 0.1, "got {}", ekf.state().speed_mps);
+}
+
+// ---------------------------------------------------------------------------
+// Camera latency (plan §13.3b D6).
+// ---------------------------------------------------------------------------
+
+/// A stationary rover yawing at a constant rate: `e_psi` grows by exactly
+/// `gyro * t`, `e_y` and `kappa` stay zero, so the belief at any past instant
+/// is known in closed form.
+fn yawing_filter(gyro: f32, steps: usize) -> Ekf {
+    let cfg = cfg(0.0);
+    let mut ekf = Ekf::at_rest(params(), [1e-2; 5]);
+    for _ in 0..steps {
+        ekf.predict(gyro, DT, &cfg);
+    }
+    ekf
+}
+
+/// What a perfect camera saw when the rover's heading error was `e_psi`.
+fn lane_seen_at(e_psi: f32, capture_age_us: u32) -> LaneMeasurement {
+    let l_a = params().lookahead_m;
+    LaneMeasurement {
+        capture_age_us,
+        ..lane_measurement(l_a * e_psi, e_psi, 0.0, 0)
+    }
+}
+
+#[test]
+fn state_at_age_undoes_recent_predict_steps() {
+    let gyro = 0.5;
+    let ekf = yawing_filter(gyro, 20); // e_psi = 0.1 rad now
+    let now = ekf.state().heading_err_rad;
+    assert!((now - 0.1).abs() < 1e-5);
+
+    let idx = rover_msgs::state_idx::HEADING_ERR;
+    assert!((ekf.state_at_age(0.0)[idx] - now).abs() < 1e-7);
+    assert!((ekf.state_at_age(0.1)[idx] - 0.05).abs() < 1e-5);
+    // Pro rata within one 10 ms step.
+    assert!((ekf.state_at_age(0.105)[idx] - 0.0475).abs() < 1e-5);
+    // Past the 200 ms of history this filter has: the oldest belief, at rest.
+    assert!(ekf.state_at_age(5.0)[idx].abs() < 1e-6);
+}
+
+#[test]
+fn late_frame_is_compared_with_the_state_at_capture_time() {
+    let gyro = 0.5;
+    // Exactly what the camera saw 100 ms ago, delivered now.
+    let meas = lane_seen_at(0.05, 100_000);
+
+    let mut compensated = yawing_filter(gyro, 20);
+    let dbg = compensated.correct_camera(&meas, &cfg(0.0)).unwrap();
+    assert!(!dbg.gated);
+    for v in dbg.innovation {
+        assert!(
+            v.abs() < 1e-4,
+            "a frame matching its own past must not innovate: {dbg:?}"
+        );
+    }
+
+    // The pre-D6 behaviour, kept behind the flag: the same frame read as
+    // current drags heading back toward where the rover was 100 ms ago.
+    let mut uncompensated = yawing_filter(gyro, 20);
+    let off = EstimatorConfig {
+        lane_latency_compensation: false,
+        ..cfg(0.0)
+    };
+    let before = uncompensated.state().heading_err_rad;
+    let dbg = uncompensated.correct_camera(&meas, &off).unwrap();
+    assert!((dbg.innovation[1] + 0.05).abs() < 1e-4, "{dbg:?}");
+    assert!(uncompensated.state().heading_err_rad < before);
+}
+
+#[test]
+fn frame_older_than_lane_max_age_is_gated_and_does_not_refresh_lane_age() {
+    let mut ekf = yawing_filter(0.0, 30);
+    let before = ekf.state();
+    let dbg = ekf
+        .correct_camera(&lane_seen_at(0.2, 300_000), &cfg(0.0))
+        .unwrap();
+    assert!(dbg.gated);
+    assert!(dbg.nis.is_infinite());
+    assert_eq!(ekf.state(), before, "an expired frame must change nothing");
 }

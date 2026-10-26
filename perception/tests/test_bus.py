@@ -34,10 +34,11 @@ wheel_diameter_m = 0.125
 def _lane_measurement(t_us: int = 1) -> LaneMeasurement:
     # Exactly representable in float32 (powers of two / simple binary
     # fractions) so the byte-exact assertions below don't have to account
-    # for f64->f32 round-off on the wire -- see wire.py's WIRE_LEN=17 pack
-    # ("<fff?I"), which stores these as f32.
+    # for f64->f32 round-off on the wire -- see wire.py's WIRE_LEN=23 pack
+    # ("<fff?IIH"), which stores these as f32.
     return LaneMeasurement(
-        curvature_inv_m=0.5, heading_err_rad=-0.25, cross_track_m=0.125, valid=True, t_us=t_us
+        curvature_inv_m=0.5, heading_err_rad=-0.25, cross_track_m=0.125, valid=True, t_us=t_us,
+        capture_age_us=40_000, frames_dropped=0,
     )
 
 

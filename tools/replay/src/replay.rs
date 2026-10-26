@@ -112,6 +112,11 @@ pub fn run(
                 cross_track_m: row.cross_track_m,
                 valid: true,
                 t_us: row.t_us as u32,
+                // Traces carry no camera latency yet: every frame is
+                // replayed as current, so the parity gate is unaffected by
+                // the D6 compensation (it is a no-op at age 0).
+                capture_age_us: 0,
+                frames_dropped: 0,
             };
             estimator.correct_lane(&meas);
             last_state = estimator.state();
@@ -207,6 +212,8 @@ mod tests {
             nis_gate: 11.34,
             zero_rate_max_ticks: 0,
             metres_per_tick: 0.0,
+            lane_max_age_s: 0.25,
+            lane_latency_compensation: true,
         }
     }
 

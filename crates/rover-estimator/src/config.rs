@@ -107,6 +107,19 @@ pub struct EstimatorConfig {
     /// observability is the thing that bounds how long the rover can coast on
     /// a lost lane. Start at 0 and raise it only if bench data shows dither.
     pub zero_rate_max_ticks: i32,
+    /// Oldest camera frame, by `LaneMeasurement::capture_age_us`, the filter
+    /// will still use, seconds. Older ones are reported gated and ignored: a
+    /// perception process that has stalled for a quarter of a second is
+    /// describing a rover that is no longer there. `config/rover.toml`:
+    /// `estimator.lane_max_age_ms`. Must fit inside
+    /// [`crate::LANE_HISTORY_LEN`] predict steps.
+    pub lane_max_age_s: f32,
+    /// Compute the camera innovation against where the filter believed the
+    /// rover was when the frame was **captured**, not where it is now (plan
+    /// §13.3b D6). `false` restores the old behaviour — every frame treated
+    /// as current — for A/B comparison while re-tuning.
+    /// `config/rover.toml`: `estimator.lane_latency_compensation`.
+    pub lane_latency_compensation: bool,
 }
 
 impl EstimatorConfig {

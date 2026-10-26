@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 import signal
+import time
 
 import numpy as np
 import pytest
 
 from rover_perception import main as pmain
-from rover_perception.camera import CameraError
+from rover_perception.camera import CameraError, CapturedFrame
 from rover_perception.lane import LaneConfig, LaneDetector, LaneResult
 from rover_perception.wire import LaneMeasurement
 
@@ -51,6 +52,13 @@ def _patch(monkeypatch, camera_factory, detector):
     monkeypatch.setattr(pmain.time, "sleep", lambda s: None)
 
 
+def _frame(age_ns=0, dropped=0):
+    """A factory for a fresh `CapturedFrame` stamped `age_ns` in the past."""
+    return lambda: CapturedFrame(
+        np.zeros((4, 4, 3), np.uint8), time.monotonic_ns() - age_ns, dropped
+    )
+
+
 class Detector:
     def __init__(self, fail_first=0):
         self.calls = 0
@@ -67,7 +75,7 @@ class Detector:
 
 
 def test_frame_exception_is_logged_and_loop_continues_then_camera_loss_exits_nonzero(monkeypatch):
-    frame = np.zeros((4, 4, 3), np.uint8)
+    frame = _frame()
     opens = {"n": 0}
 
     class Cam:
@@ -80,7 +88,7 @@ def test_frame_exception_is_logged_and_loop_continues_then_camera_loss_exits_non
         def read(self):
             if self.left:
                 self.left -= 1
-                return frame
+                return frame()
             return None
 
         def close(self):
@@ -95,7 +103,7 @@ def test_frame_exception_is_logged_and_loop_continues_then_camera_loss_exits_non
 
 
 def test_camera_reopen_success_resumes_publishing(monkeypatch):
-    frame = np.zeros((4, 4, 3), np.uint8)
+    frame = _frame()
     cams = []
 
     class Cam:
@@ -107,7 +115,7 @@ def test_camera_reopen_success_resumes_publishing(monkeypatch):
         def read(self):
             if self.left:
                 self.left -= 1
-                return frame
+                return frame()
             if self.id >= 1:
                 # second camera: ask the loop to stop after its frames
                 import os
@@ -135,5 +143,46 @@ def test_non_finite_or_huge_geometry_becomes_valid_false(monkeypatch):
         res = det.detect(np.zeros((4, 4, 3), np.uint8))
         assert res.valid is False
         # Must be packable: this is what used to raise OverflowError.
-        LaneMeasurement(res.curvature_inv_m, res.heading_err_rad, res.cross_track_m, res.valid, 0).encode()
+        LaneMeasurement(res.curvature_inv_m, res.heading_err_rad, res.cross_track_m, res.valid, 0, 0, 0).encode()
         assert det._search_center is None
+
+
+def _one_shot_camera(frames):
+    """A camera yielding `frames` (factories) in order, then SIGINT."""
+
+    class Cam:
+        def __init__(self, cfg):
+            self.frames = list(frames)
+
+        def read(self):
+            if self.frames:
+                return self.frames.pop(0)()
+            import os
+            os.kill(os.getpid(), signal.SIGINT)
+            return None
+
+        def close(self):
+            pass
+
+    return Cam
+
+
+def test_t_us_is_capture_time_and_age_spans_capture_to_publish(monkeypatch):
+    # Captured 80 ms before the loop sees it: the age must include that,
+    # and t_us must be the capture instant, not publish (plan §13.3b D6).
+    capture_ns = time.monotonic_ns() - 80_000_000
+    frame = lambda: CapturedFrame(np.zeros((4, 4, 3), np.uint8), capture_ns, 0)
+    _patch(monkeypatch, _one_shot_camera([frame]), Detector())
+    assert pmain.run(_args()) == 0
+    (msg,) = FakeBus.published
+    assert msg.t_us == capture_ns // 1000 & 0xFFFFFFFF
+    assert 80_000 <= msg.capture_age_us < 1_000_000
+
+
+def test_frames_dropped_counts_skipped_frames_and_failed_detections(monkeypatch):
+    frames = [_frame(dropped=2), _frame(dropped=1), _frame(dropped=0)]
+    # The first detection raises: its frame (and the 2 skipped before it)
+    # never reach the wire, so they are carried into the next message.
+    _patch(monkeypatch, _one_shot_camera(frames), Detector(fail_first=1))
+    assert pmain.run(_args()) == 0
+    assert [m.frames_dropped for m in FakeBus.published] == [2 + 1 + 1, 0]
