@@ -87,7 +87,14 @@ from typing import Deque, Optional, Sequence
 
 import cv2
 
-from .bus import Bus, BusBindError, BusConfig, ConfigError
+# Same fallback as bus.py: stdlib from 3.11, the `tomli` backport on the
+# Jetson's 3.10.
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
+from .bus import Bus, BusBindError, BusConfig, ConfigError, find_config_path
 from .camera import Camera, CameraConfig, CameraError
 from .lane import LaneDetector, LaneResult
 from .wire import LaneMeasurement
@@ -271,14 +278,35 @@ def _draw_preview(frame, result: LaneResult, achieved_fps: float) -> bool:
     return key not in (27, ord("q"))  # 27 == ESC
 
 
-def _camera_config_from_args(args: argparse.Namespace) -> CameraConfig:
+def _configured_d415_serial(config_path: Optional[Path]) -> str:
+    """`[perception] d415_serial` from the config, or `""` if unset.
+
+    Read here rather than in `BusConfig`, which deliberately knows only the
+    bus tables. A wrong type is a `ConfigError`, not a silent "no serial":
+    falling back to "first device found" is exactly the failure this key
+    exists to prevent on a Jetson with two RealSense cameras.
+    """
+    path = Path(config_path) if config_path is not None else find_config_path()
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"reading [perception] from {path}: {exc}") from exc
+    serial = raw.get("perception", {}).get("d415_serial", "")
+    if not isinstance(serial, str):
+        raise ConfigError(f"[perception] d415_serial must be a string, got {serial!r}")
+    return serial.strip()
+
+
+def _camera_config_from_args(args: argparse.Namespace, config_serial: str = "") -> CameraConfig:
     return CameraConfig(
         width=args.width,
         height=args.height,
         fps=args.fps,
         video_path=args.video or "",
         loop_video=not args.no_loop,
-        serial=args.serial or "",
+        # `--serial` wins over the config, so a one-off bench run can pick a
+        # different camera without editing rover.toml.
+        serial=args.serial or config_serial,
         json_config_path=args.realsense_json or "",
         fallback_video=args.fallback_video or "",
     )
@@ -337,12 +365,22 @@ def run(args: argparse.Namespace) -> int:
     try:
         config_path = Path(args.config) if args.config else None
         bus_config = BusConfig.load(config_path)
+        config_serial = _configured_d415_serial(config_path)
     except ConfigError as exc:
         logger.error("failed to load bus config: %s", exc)
         return 1
 
+    camera_config = _camera_config_from_args(args, config_serial)
+    if not camera_config.video_path:
+        logger.info(
+            "D415 serial: %s",
+            camera_config.serial + (" (--serial)" if args.serial else " ([perception] d415_serial)")
+            if camera_config.serial
+            else "none configured",
+        )
+
     try:
-        camera = Camera(_camera_config_from_args(args))
+        camera = Camera(camera_config)
     except CameraError as exc:
         logger.error("failed to open camera: %s", exc)
         return 1
@@ -524,7 +562,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     source.add_argument(
         "--serial",
         metavar="SERIAL",
-        help="RealSense D415 serial number (grabs the first device found if omitted).",
+        help="RealSense D415 serial number. Overrides [perception] d415_serial in the "
+        "config; with neither, grabs the first device found.",
     )
     source.add_argument(
         "--fallback-video",

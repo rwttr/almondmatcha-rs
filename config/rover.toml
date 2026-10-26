@@ -155,6 +155,11 @@ lookahead_m    = 1.22         # ahead of the FRONT axle, set by the ROI geometry
 frame_width    = 1280
 frame_height   = 720
 fps            = 30
+# The lane camera, by serial. The Jetson has TWO RealSense cameras attached
+# (this D415, and a D405 = 218622277831), and without a serial perception
+# grabs whichever pyrealsense2 lists first. `--serial` on the command line
+# (or PERCEPTION_SERIAL for tools/launch_jetson_tmux.sh) overrides this.
+d415_serial    = "806312060441"
 
 # ---------------------------------------------------------------------------
 # Lateral control.

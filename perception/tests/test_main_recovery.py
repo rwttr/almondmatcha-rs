@@ -4,6 +4,7 @@ finiteness guard -- exercised with fake camera/detector/bus, no hardware."""
 from __future__ import annotations
 
 import argparse
+import pathlib
 import signal
 import time
 
@@ -45,6 +46,7 @@ def _patch(monkeypatch, camera_factory, detector):
     FakeBus.published = []
     monkeypatch.setattr(pmain, "Bus", FakeBus)
     monkeypatch.setattr(pmain.BusConfig, "load", classmethod(lambda cls, p=None: object()))
+    monkeypatch.setattr(pmain, "_configured_d415_serial", lambda p: "")
     monkeypatch.setattr(pmain, "Camera", camera_factory)
     monkeypatch.setattr(pmain, "LaneDetector", lambda: detector)
     monkeypatch.setattr(pmain, "_MAX_CONSECUTIVE_NONE", 3)
@@ -186,3 +188,33 @@ def test_frames_dropped_counts_skipped_frames_and_failed_detections(monkeypatch)
     _patch(monkeypatch, _one_shot_camera(frames), Detector(fail_first=1))
     assert pmain.run(_args()) == 0
     assert [m.frames_dropped for m in FakeBus.published] == [2 + 1 + 1, 0]
+
+
+def _cfg_file(tmp_path, body):
+    path = tmp_path / "rover.toml"
+    path.write_text(body)
+    return path
+
+
+def test_d415_serial_comes_from_config_and_cli_overrides_it(tmp_path):
+    path = _cfg_file(tmp_path, '[perception]\nd415_serial = "806312060441"\n')
+    serial = pmain._configured_d415_serial(path)
+    assert serial == "806312060441"
+
+    parse = pmain.build_arg_parser().parse_args
+    from_config = pmain._camera_config_from_args(parse(["--config", str(path)]), serial)
+    assert from_config.serial == "806312060441"
+    from_cli = pmain._camera_config_from_args(parse(["--serial", "218622277831"]), serial)
+    assert from_cli.serial == "218622277831"
+
+
+def test_d415_serial_absent_is_empty_and_wrong_type_is_an_error(tmp_path):
+    assert pmain._configured_d415_serial(_cfg_file(tmp_path, "[perception]\n")) == ""
+    with pytest.raises(pmain.ConfigError):
+        pmain._configured_d415_serial(_cfg_file(tmp_path, "[perception]\nd415_serial = 806312060441\n"))
+
+
+def test_shipped_config_pins_the_d415():
+    # Two RealSense cameras on the Jetson: "first found" may be the D405.
+    shipped = pathlib.Path(__file__).resolve().parents[2] / "config" / "rover.toml"
+    assert pmain._configured_d415_serial(shipped) == "806312060441"
