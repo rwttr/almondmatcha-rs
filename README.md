@@ -70,6 +70,68 @@ rover must complete a mission with **zero uplink**.
                  └──────────────────────┘
 ```
 
+The same system as a message graph — every edge is one row of
+`config/rover.toml`'s `[routes]` table, labelled with the message type, and
+every box is one entry of `[services]`. Dashed lines are the planned LoRa
+links.
+
+```mermaid
+flowchart LR
+    subgraph JETSON["Jetson Orin Nano · 192.168.1.5"]
+        perception["perception<br/>(Python) :7020<br/>D415 camera + lane detection"]
+    end
+
+    subgraph RPI["Raspberry Pi 4B · 192.168.1.1"]
+        control["rover-control :7001<br/>estimate (EKF) → guide → actuate"]
+        navigation["rover-navigation :7002<br/>GNSS + waypoint mission"]
+        telemetry["rover-telemetry :7003<br/>CSV logs + health + 5 Hz feed"]
+    end
+
+    subgraph MCU["STM32 NUCLEO-F767ZI · Embassy firmware"]
+        chassis["chassis-fw .2 :7010<br/>motors, servo, IMU, watchdog"]
+        sensors["sensors-fw .6 :7011<br/>encoders, INA226, link watchdog"]
+    end
+
+    subgraph BASE["Base station PC · 192.168.1.10"]
+        ground["ground-station :7030<br/>goals, limits, E-stop"]
+        doctor["rover-doctor :7031<br/>preflight GO/NO-GO"]
+    end
+
+    gnss[/"u-blox RTK + Spresense<br/>(USB serial)"/]
+    lora433[/"ESP32 433 MHz<br/>RTCM downlink"/]
+    lora923[/"ESP32 923 MHz<br/>telemetry uplink"/]
+
+    perception -- LaneMeasurement --> control
+    chassis -- "ImuSample, ChassisStatus" --> control
+    sensors -- WheelSensors --> control
+    navigation -- MissionStatus --> control
+    control -- ChassisCommand --> chassis
+
+    gnss --> navigation
+    navigation -- "GnssFix, MissionStatus, CommandAck" --> telemetry
+    control -- "RoverState, SpeedLoopDebug, CommandAck" --> telemetry
+    chassis -- "ChassisStatus, BoardDiagnostics" --> telemetry
+    sensors -- "PowerSample, BoardDiagnostics" --> telemetry
+
+    ground -- CommandFrame --> control
+    ground -- CommandFrame --> navigation
+    telemetry -- Telemetry --> ground
+    telemetry -- Telemetry --> doctor
+    telemetry -- "Telemetry (heartbeat)" --> sensors
+    chassis -- BoardDiagnostics --> ground
+    sensors -- BoardDiagnostics --> ground
+    chassis -- BoardDiagnostics --> doctor
+    sensors -- BoardDiagnostics --> doctor
+
+    lora433 -. RTCM .-> navigation
+    telemetry -. planned .-> lora923
+```
+
+Every arrow is a self-contained UDP datagram on the wired LAN, built from the
+shared `rover-msgs` crate; there is no broker in the middle. Commands are
+acknowledged end to end: each consumer's `CommandAck` is folded into
+`Telemetry`, and `ground-station` retransmits until it sees it there.
+
 Both LoRa links are **planned, not built** — out of scope on this branch, but
 the reason there is no TCP in the design. Machines, sensors, pin maps and
 calibration status: [`docs/HARDWARE.md`](docs/HARDWARE.md).
